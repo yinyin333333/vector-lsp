@@ -2,13 +2,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tower_lsp::lsp_types::*;
-use tower_lsp::{jsonrpc::Result as LspResult, Client, LanguageServer};
+use tower_lsp::{Client, LanguageServer, jsonrpc::Result as LspResult};
 
 use crate::diagnostics;
 use crate::document::DocumentData;
 use crate::plugin;
 use crate::runtime;
-use crate::schema::{find_loader, format_description, FieldTypeName};
+use crate::schema::{FieldTypeName, find_loader, format_description};
 use crate::settings::VectorLspSettings;
 use crate::workspace::Workspace;
 
@@ -37,6 +37,31 @@ impl Backend {
         self.settings.encoding.decode(&bytes)
     }
 
+    fn collect_workspace_files(
+        root: &std::path::Path,
+        ext: &str,
+    ) -> std::io::Result<Vec<std::path::PathBuf>> {
+        let mut files = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            let mut entries: Vec<_> = std::fs::read_dir(&dir)?.filter_map(|e| e.ok()).collect();
+            entries.sort_by_key(|e| e.path());
+
+            for entry in entries {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
+                    files.push(path);
+                }
+            }
+        }
+
+        files.sort();
+        Ok(files)
+    }
+
     /// Scan all data files in the workspace root, parse and index them.
     /// Called after the schema (and thus ref_targets) is ready.
     async fn scan_and_index_workspace(&self) {
@@ -49,11 +74,15 @@ impl Backend {
             )
         };
 
-        let Some(root_uri) = root_uri else { return; };
-        let Ok(root_path) = root_uri.to_file_path() else { return; };
+        let Some(root_uri) = root_uri else {
+            return;
+        };
+        let Ok(root_path) = root_uri.to_file_path() else {
+            return;
+        };
 
-        let mut read_dir = match tokio::fs::read_dir(&root_path).await {
-            Ok(d) => d,
+        let paths = match Self::collect_workspace_files(&root_path, &ext) {
+            Ok(paths) => paths,
             Err(e) => {
                 self.client
                     .log_message(MessageType::WARNING, format!("Workspace scan failed: {e}"))
@@ -64,12 +93,10 @@ impl Backend {
 
         // Collect directory entries before spawning so we can log errors on the main task.
         let mut entries: Vec<(Url, std::path::PathBuf, String)> = Vec::new();
-        while let Ok(Some(entry)) = read_dir.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some(ext.as_str()) {
+        for path in paths {
+            let Ok(uri) = Url::from_file_path(&path) else {
                 continue;
-            }
-            let Ok(uri) = Url::from_file_path(&path) else { continue };
+            };
             let stem = Self::file_stem(&uri);
             entries.push((uri, path, stem));
         }
@@ -120,7 +147,10 @@ impl Backend {
 
         let t_index = Instant::now();
         self.client
-            .log_message(MessageType::INFO, format!("Indexed {count} workspace files."))
+            .log_message(
+                MessageType::INFO,
+                format!("Indexed {count} workspace files."),
+            )
             .await;
 
         // Build workspace snapshot + index once for plugins; shared via Arc.
@@ -233,9 +263,18 @@ fn reconstruct_text(doc: &DocumentData, delimiter: char) -> String {
     let rows: Vec<String> = doc
         .rows
         .iter()
-        .map(|row| row.cells.iter().map(|c| c.value.as_str()).collect::<Vec<_>>().join(&delim_str))
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>()
+                .join(&delim_str)
+        })
         .collect();
-    std::iter::once(header).chain(rows).collect::<Vec<_>>().join("\n")
+    std::iter::once(header)
+        .chain(rows)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Apply a single LSP incremental content change to a lines buffer.
@@ -263,7 +302,10 @@ fn apply_change(lines: &mut Vec<String>, range: tower_lsp::lsp_types::Range, new
             for mid in &rest[..rest.len() - 1] {
                 v.push(mid.trim_end_matches('\r').to_string());
             }
-            v.push(format!("{}{suffix}", rest.last().unwrap().trim_end_matches('\r')));
+            v.push(format!(
+                "{}{suffix}",
+                rest.last().unwrap().trim_end_matches('\r')
+            ));
             v
         }
     };
@@ -309,8 +351,8 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        let has_schema = self.settings.schema_path.is_some()
-            || !self.settings.schema_variant.is_empty();
+        let has_schema =
+            self.settings.schema_path.is_some() || !self.settings.schema_variant.is_empty();
         if has_schema {
             let loader = match find_loader(
                 &self.settings.schema_loader,
@@ -319,15 +361,15 @@ impl LanguageServer for Backend {
             ) {
                 Ok(l) => l,
                 Err(e) => {
-                    self.client.log_message(MessageType::ERROR, format!("{e}")).await;
+                    self.client
+                        .log_message(MessageType::ERROR, format!("{e}"))
+                        .await;
                     return;
                 }
             };
             let schema_path = self.settings.schema_path.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                loader.load(schema_path.as_deref())
-            })
-            .await;
+            let result =
+                tokio::task::spawn_blocking(move || loader.load(schema_path.as_deref())).await;
 
             match result {
                 Ok(Ok(schema)) => {
@@ -366,7 +408,10 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
-        let doc = Arc::new(DocumentData::parse(&params.text_document.text, self.settings.delimiter_char()));
+        let doc = Arc::new(DocumentData::parse(
+            &params.text_document.text,
+            self.settings.delimiter_char(),
+        ));
         let stem = Self::file_stem(&uri);
 
         let (schema_diags, plugin_data) = {
@@ -374,9 +419,8 @@ impl LanguageServer for Backend {
             let ref_targets = ws.ref_targets.clone();
             ws.symbols.remove_file(&stem);
             ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
-            let schema_diags = diagnostics::validate_document(
-                &stem, &doc, ws.schema.as_deref(), &ws.symbols,
-            );
+            let schema_diags =
+                diagnostics::validate_document(&stem, &doc, ws.schema.as_deref(), &ws.symbols);
             ws.open_documents.insert(uri.clone(), Arc::clone(&doc));
             let plugin_data = self.plugin_host.as_ref().map(|_| {
                 let ctx = plugin::build_context(&stem, &doc);
@@ -425,9 +469,8 @@ impl LanguageServer for Backend {
             let ref_targets = ws.ref_targets.clone();
             ws.symbols.remove_file(&stem);
             ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
-            let schema_diags = diagnostics::validate_document(
-                &stem, &doc, ws.schema.as_deref(), &ws.symbols,
-            );
+            let schema_diags =
+                diagnostics::validate_document(&stem, &doc, ws.schema.as_deref(), &ws.symbols);
             ws.open_documents.insert(uri.clone(), Arc::clone(&doc));
             let plugin_data = self.plugin_host.as_ref().map(|_| {
                 let ctx = plugin::build_context(&stem, &doc);
@@ -468,10 +511,13 @@ impl LanguageServer for Backend {
         let (schema_loc, plugin_data) = {
             let ws = self.workspace.read().await;
 
-            let doc = ws.open_documents.get(uri).or_else(|| {
-                uri.to_file_path().ok().and_then(|p| ws.file_cache.get(&p))
-            });
-            let Some(doc) = doc else { return Ok(None); };
+            let doc = ws
+                .open_documents
+                .get(uri)
+                .or_else(|| uri.to_file_path().ok().and_then(|p| ws.file_cache.get(&p)));
+            let Some(doc) = doc else {
+                return Ok(None);
+            };
 
             let Some((col_index, cell)) = doc.cell_at(pos.line, pos.character) else {
                 return Ok(None);
@@ -491,16 +537,18 @@ impl LanguageServer for Backend {
                 .and_then(|ft| ft.file.as_ref().zip(ft.field.as_ref()))
                 .map(|(f, c)| (f.to_lowercase(), c.clone()));
 
-            let schema_loc = ref_target
-                .as_ref()
-                .and_then(|(ref_file, ref_col)| {
-                    ws.symbols.lookup(ref_file, ref_col, &cell_value).cloned()
-                });
+            let schema_loc = ref_target.as_ref().and_then(|(ref_file, ref_col)| {
+                ws.symbols.lookup(ref_file, ref_col, &cell_value).cloned()
+            });
 
             let plugin_data = if schema_loc.is_none() {
                 self.plugin_host.as_ref().map(|_| {
                     let ctx = plugin::build_hover_context(
-                        &file_stem, &col_name, &cell_value, pos.line, doc,
+                        &file_stem,
+                        &col_name,
+                        &cell_value,
+                        pos.line,
+                        doc,
                     );
                     let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
                     let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
@@ -550,7 +598,11 @@ impl LanguageServer for Backend {
             let Some(col_index) = doc.header_at(pos.character) else {
                 return Ok(None);
             };
-            let col_name = doc.headers.get(col_index).map(|s| s.as_str()).unwrap_or("unknown");
+            let col_name = doc
+                .headers
+                .get(col_index)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
 
             // Compute col_start for the range by summing preceding header lengths.
             let col_start = doc.headers[..col_index]
@@ -577,15 +629,21 @@ impl LanguageServer for Backend {
                     value: text,
                 }),
                 range: Some(Range {
-                    start: Position { line: 0, character: col_start },
-                    end: Position { line: 0, character: col_start + col_len },
+                    start: Position {
+                        line: 0,
+                        character: col_start,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: col_start + col_len,
+                    },
                 }),
             }));
         }
 
         // Data row hover: return the cell value plus any plugin-provided context.
         // Column documentation is intentionally omitted here — it belongs on the header.
-        let (cell_col_start, cell_len, col_name, cell_value, plugin_hover_data) = {
+        let (cell_col_start, cell_len, _col_name, cell_value, plugin_hover_data) = {
             let ws = self.workspace.read().await;
             let Some(doc) = ws.open_documents.get(uri) else {
                 return Ok(None);
@@ -594,21 +652,31 @@ impl LanguageServer for Backend {
                 return Ok(None);
             };
 
-            let col_name = doc.headers.get(col_index).map(|s| s.as_str()).unwrap_or("unknown").to_string();
+            let col_name = doc
+                .headers
+                .get(col_index)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_string();
             let cell_value = cell.value.clone();
             let cell_col_start = cell.col_start;
             let cell_len = cell.value.chars().count() as u32;
 
             let plugin_hover_data = self.plugin_host.as_ref().map(|_| {
-                let ctx = plugin::build_hover_context(
-                    &file_stem, &col_name, &cell_value, pos.line, doc,
-                );
+                let ctx =
+                    plugin::build_hover_context(&file_stem, &col_name, &cell_value, pos.line, doc);
                 let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
                 let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
                 (ctx, idx, snap)
             });
 
-            (cell_col_start, cell_len, col_name, cell_value, plugin_hover_data)
+            (
+                cell_col_start,
+                cell_len,
+                col_name,
+                cell_value,
+                plugin_hover_data,
+            )
         }; // read lock released here
 
         let plugin_content = match (plugin_hover_data, &self.plugin_host) {
@@ -628,8 +696,14 @@ impl LanguageServer for Backend {
                 value: combined,
             }),
             range: Some(Range {
-                start: Position { line: pos.line, character: cell_col_start },
-                end: Position { line: pos.line, character: cell_col_start + cell_len },
+                start: Position {
+                    line: pos.line,
+                    character: cell_col_start,
+                },
+                end: Position {
+                    line: pos.line,
+                    character: cell_col_start + cell_len,
+                },
             }),
         }))
     }

@@ -55,6 +55,16 @@ function validateModifiers(modsStr: string): string | null {
 
 // ─── validate ─────────────────────────────────────────────────────────────────
 
+function tcItemTargetsAvailable(): boolean {
+    return hasLookupTarget("weapons", "code")
+        && hasLookupTarget("armor", "code")
+        && hasLookupTarget("misc", "code")
+        && hasLookupTarget("itemtypes", "Code")
+        && hasLookupTarget("itemtypes", "TreasureClass")
+        && hasLookupTarget("uniqueitems", "index")
+        && hasLookupTarget("setitems", "index");
+}
+
 function validate(ctx: PluginContext): PluginDiagnostic[] {
     if (ctx.file !== "treasureclassex") return [];
 
@@ -72,21 +82,21 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
     }
 
     // ── Build set of auto-TC base codes from itemtypes where TreasureClass=1.
+    const canProveExternalItemInvalid = tcItemTargetsAvailable();
     const autoTcCodes = new Set(
-        getFilteredColumnValues("itemtypes", "Code", "TreasureClass", "1")
-            .map((c: string) => c.toLowerCase())
+        canProveExternalItemInvalid
+            ? getFilteredColumnValues("itemtypes", "Code", "TreasureClass", "1")
+                .map((c: string) => c.toLowerCase())
+            : []
     );
 
     // ── Determine which external workspace files are present (guard against
     // false positives when running on an incomplete workspace).
-    const hasWeapons    = hasFile("weapons");
-    const hasArmor      = hasFile("armor");
-    const hasMisc       = hasFile("misc");
-    const hasUnique     = hasFile("uniqueitems");
-    const hasSetitems   = hasFile("setitems");
-    const hasItemSource = hasWeapons || hasArmor || hasMisc
-                       || hasUnique  || hasSetitems
-                       || autoTcCodes.size > 0;
+    const hasWeapons    = hasLookupTarget("weapons", "code");
+    const hasArmor      = hasLookupTarget("armor", "code");
+    const hasMisc       = hasLookupTarget("misc", "code");
+    const hasUnique     = hasLookupTarget("uniqueitems", "index");
+    const hasSetitems   = hasLookupTarget("setitems", "index");
 
     // ── Expand Item# columns until the workspace says a column is absent.
     const cols: string[] = [];
@@ -106,7 +116,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
             const err = validateItem(
                 raw.trim(), row.__line,
                 tcLineMap, autoTcCodes,
-                hasWeapons, hasArmor, hasMisc, hasUnique, hasSetitems, hasItemSource,
+                hasWeapons, hasArmor, hasMisc, hasUnique, hasSetitems, canProveExternalItemInvalid,
             );
             if (err) {
                 const c = row.__colstarts[col] ?? 0;
@@ -134,7 +144,7 @@ function validateItem(
     hasMisc: boolean,
     hasUnique: boolean,
     hasSetitems: boolean,
-    hasItemSource: boolean,
+    canProveExternalItemInvalid: boolean,
 ): string | null {
     // Strip surrounding double-quotes — the game engine requires quotes around
     // entries that contain modifiers (e.g. `"gld,mul=1280"`).
@@ -190,7 +200,7 @@ function validateItem(
     // ── If no external item-source files are loaded at all we cannot determine
     // whether this is a valid item code or unique/set index, so skip rather than
     // emit a false positive.
-    if (!hasItemSource) return null;
+    if (!canProveExternalItemInvalid) return null;
 
     return `'${base}' is not a valid item code, treasure class, auto-TC, unique index, or set item index`;
 }

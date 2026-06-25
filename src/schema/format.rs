@@ -37,13 +37,13 @@ pub fn format_description(text: &str) -> String {
 fn push_cross_ref(content: &str, out: &mut String) {
     match content.find('#') {
         Some(i) => {
-            let file  = &content[..i];
+            let file = &content[..i];
             let field = &content[i + 1..];
             match (file.is_empty(), field.is_empty()) {
                 (false, false) => out.push_str(&format!("`{}` (in *{}*)", field, file)),
-                (false, true)  => out.push_str(&format!("*{}*", file)),
-                (true,  false) => out.push_str(&format!("`{}`", field)),
-                (true,  true)  => {}
+                (false, true) => out.push_str(&format!("*{}*", file)),
+                (true, false) => out.push_str(&format!("`{}`", field)),
+                (true, true) => {}
             }
         }
         None if !content.is_empty() => out.push_str(&format!("*{}*", content)),

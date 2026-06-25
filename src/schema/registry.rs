@@ -37,6 +37,10 @@ pub fn find_loader(
     let available: Vec<&str> = inventory::iter::<LoaderEntry>().map(|e| e.id).collect();
     anyhow::bail!(
         "unknown schema loader '{id}'. Available: {}",
-        if available.is_empty() { "none registered".to_string() } else { available.join(", ") }
+        if available.is_empty() {
+            "none registered".to_string()
+        } else {
+            available.join(", ")
+        }
     )
 }

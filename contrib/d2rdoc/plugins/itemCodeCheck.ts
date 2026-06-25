@@ -36,6 +36,12 @@ function isItemCodeCol(file: string, col: string): boolean {
     return false;
 }
 
+function itemCodeTargetsAvailable(): boolean {
+    return hasLookupTarget("weapons", "code")
+        && hasLookupTarget("armor", "code")
+        && hasLookupTarget("misc", "code");
+}
+
 function hover(ctx: HoverContext): HoverResult | null {
     if (!ctx.value) return null;
     if (!isItemCodeCol(ctx.file, ctx.col)) return null;
@@ -52,6 +58,7 @@ function hover(ctx: HoverContext): HoverResult | null {
 function validate(ctx: PluginContext): PluginDiagnostic[] {
     const fields = ITEM_CODE_FIELDS[ctx.file];
     if (!fields) return [];
+    if (!itemCodeTargetsAvailable()) return [];
 
     const diags: PluginDiagnostic[] = [];
 

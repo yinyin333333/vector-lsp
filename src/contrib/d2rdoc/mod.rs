@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::runtime::ScriptRuntime;
 use crate::schema::registry::LoaderEntry;
@@ -14,7 +14,10 @@ const RESERVED_VARIANT_NAMES: &[&str] = &["plugins"];
 // Self-register with the schema loader registry.
 inventory::submit!(LoaderEntry {
     id: "d2rdoc",
-    create: |variant, patches_dir| Box::new(D2rDocLoader { variant, patches_dir }),
+    create: |variant, patches_dir| Box::new(D2rDocLoader {
+        variant,
+        patches_dir
+    }),
 });
 
 /// Schema loader for the d2rdoc JavaScript schema format.
@@ -147,14 +150,18 @@ fn load_js(runtime: &mut ScriptRuntime, dir: &Path, patches_dir: Option<&Path>) 
     }
 
     let json = runtime.eval_json("files")?;
-    let map = json.as_object().ok_or_else(|| anyhow!("files is not an object"))?;
+    let map = json
+        .as_object()
+        .ok_or_else(|| anyhow!("files is not an object"))?;
     let mut files: HashMap<String, SchemaFile> = HashMap::new();
     for (key, val) in map {
         if val.is_null() {
             continue;
         }
         match serde_json::from_value::<SchemaFile>(val.clone()) {
-            Ok(sf) => { files.insert(key.clone(), sf); }
+            Ok(sf) => {
+                files.insert(key.clone(), sf);
+            }
             Err(e) => return Err(anyhow!("schema key '{}': {}", key, e)),
         }
     }

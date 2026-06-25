@@ -120,11 +120,19 @@ function resolveSource(base: string): InputSource | null {
 
 // ─── validate ─────────────────────────────────────────────────────────────────
 
+function cubeInputTargetsAvailable(): boolean {
+    return hasLookupTarget("weapons", "code")
+        && hasLookupTarget("armor", "code")
+        && hasLookupTarget("misc", "code")
+        && hasLookupTarget("itemtypes", "Code")
+        && hasLookupTarget("uniqueitems", "index")
+        && hasLookupTarget("setitems", "index");
+}
+
 function validate(ctx: PluginContext): PluginDiagnostic[] {
     if (ctx.file !== "cubemain") return [];
 
-    const hasAnySrc = hasFile("weapons") || hasFile("armor")  || hasFile("misc")
-                   || hasFile("itemtypes") || hasFile("uniqueitems") || hasFile("setitems");
+    const canProveBaseInvalid = cubeInputTargetsAvailable();
 
     const cols: string[] = [];
     for (let i = 1; ; i++) {
@@ -145,7 +153,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
 
             const c = row.__colstarts[col] ?? 0;
 
-            if (base.toLowerCase() !== "any" && hasAnySrc && resolveSource(base) === null) {
+            if (base.toLowerCase() !== "any" && canProveBaseInvalid && resolveSource(base) === null) {
                 diags.push({
                     line:     row.__line,
                     col:      c,

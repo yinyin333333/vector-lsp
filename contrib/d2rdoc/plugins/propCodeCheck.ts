@@ -25,9 +25,15 @@ const PROP_CODE_FIELDS: Record<string, FieldSpec> = {
     sets:         ["PCode#", "FCode#"],
 };
 
+function propTargetsAvailable(): boolean {
+    return hasLookupTarget("properties", "code")
+        && hasLookupTarget("propertygroups", "code");
+}
+
 function validate(ctx: PluginContext): PluginDiagnostic[] {
     const fields = PROP_CODE_FIELDS[ctx.file];
     if (!fields) return [];
+    if (!propTargetsAvailable()) return [];
 
     const diags: PluginDiagnostic[] = [];
 
@@ -66,7 +72,7 @@ function checkPropCode(
             col:      c,
             endCol:   c + val.length,
             severity: "error",
-            message:  `'${val}' is not a valid property code (not found in properties or propertygroups)`,
+            message:  `propCodeCheck: '${val}' is not a valid property code (not found in properties or propertygroups)`,
         });
     }
 }
