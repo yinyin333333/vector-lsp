@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Url};
 
@@ -35,11 +35,21 @@ impl RawDiag {
             "hint" => DiagnosticSeverity::HINT,
             _ => DiagnosticSeverity::WARNING,
         };
-        let end = if self.end_col > self.col { self.end_col } else { self.col };
+        let end = if self.end_col > self.col {
+            self.end_col
+        } else {
+            self.col
+        };
         Diagnostic {
             range: Range {
-                start: Position { line: self.line, character: self.col },
-                end: Position { line: self.line, character: end },
+                start: Position {
+                    line: self.line,
+                    character: self.col,
+                },
+                end: Position {
+                    line: self.line,
+                    character: end,
+                },
             },
             severity: Some(severity),
             source: Some("vector-lsp/plugin".into()),
@@ -143,6 +153,9 @@ impl PluginHost {
                  function hasFile(stem){\
                      return Deno.core.ops.op_has_file(stem);\
                  }\
+                 function hasLookupTarget(file,col){\
+                     return Deno.core.ops.op_has_lookup_target(file,col);\
+                 }\
                  function getColumnValues(stem,col){\
                      var k=stem+'|'+col;\
                      if(!(k in __cvCache)){__cvCache[k]=Deno.core.ops.op_get_column_values(stem,col);}\
@@ -173,7 +186,12 @@ impl PluginHost {
                     PluginRequest::SetSchema { schema } => {
                         rt.set_schema(schema);
                     }
-                    PluginRequest::Validate { ctx, index, snapshot, reply } => {
+                    PluginRequest::Validate {
+                        ctx,
+                        index,
+                        snapshot,
+                        reply,
+                    } => {
                         let ptr = Arc::as_ptr(&snapshot) as usize;
                         if ptr != last_snapshot_ptr {
                             let _ = rt.exec("__cache_reset__", "var __lookupCache={}; var __colCache={}; var __cvCache={}; var __filteredCvCache={};");
@@ -182,13 +200,26 @@ impl PluginHost {
                         rt.set_workspace_index(index);
                         rt.set_workspace_snapshot(snapshot);
                         rt.set_ctx_json(ctx);
+                        let debug = std::env::var("VLSP_DEBUG_LOGGING").is_ok();
+                        let expr = if debug {
+                            "(function(){\
+                             var __c__=JSON.parse(Deno.core.ops.op_get_ctx_json());\
+                             return \
+                             __plugins.flatMap(function(fn,i){\
+                                 try{return fn(__c__)||[];}catch(e){Deno.core.print('[validate-err-'+i+'] '+String(e)+'\\n',true);return []}\
+                             });\
+                             })()"
+                        } else {
+                            "(function(){\
+                             var __c__=JSON.parse(Deno.core.ops.op_get_ctx_json());\
+                             return \
+                             __plugins.flatMap(function(fn){\
+                                 try{return fn(__c__)||[];}catch(e){return []}\
+                             });\
+                             })()"
+                        };
                         let diags = rt
-                            .eval_json(
-                                "var __c__=JSON.parse(Deno.core.ops.op_get_ctx_json());\
-                                 __plugins.flatMap(function(fn){\
-                                     try{return fn(__c__)||[];}catch(e){return []}\
-                                 })",
-                            )
+                            .eval_json(expr)
                             .ok()
                             .and_then(|v| serde_json::from_value::<Vec<RawDiag>>(v).ok())
                             .into_iter()
@@ -197,7 +228,12 @@ impl PluginHost {
                             .collect();
                         let _ = reply.send(diags);
                     }
-                    PluginRequest::Hover { ctx, index, snapshot, reply } => {
+                    PluginRequest::Hover {
+                        ctx,
+                        index,
+                        snapshot,
+                        reply,
+                    } => {
                         rt.set_workspace_index(index);
                         rt.set_workspace_snapshot(snapshot);
                         let ctx_json = ctx.to_string();
@@ -205,7 +241,11 @@ impl PluginHost {
                         let debug = std::env::var("VLSP_DEBUG_LOGGING").is_ok();
                         if debug {
                             eprintln!("[hover-debug] ctx={ctx_json}");
-                            let len = rt.eval_json("__hovers.length").ok().and_then(|v| v.as_u64()).unwrap_or(0);
+                            let len = rt
+                                .eval_json("__hovers.length")
+                                .ok()
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
                             eprintln!("[hover-debug] __hovers.length={len}");
                         }
                         let expr = if debug {
@@ -229,7 +269,9 @@ impl PluginHost {
                             )
                         };
                         let raw = rt.eval_json(&expr);
-                        if debug { eprintln!("[hover-debug] raw={raw:?}"); }
+                        if debug {
+                            eprintln!("[hover-debug] raw={raw:?}");
+                        }
                         let result = raw.ok().and_then(|v| match v {
                             Value::Null => None,
                             // Plugin returned { content: "..." }
@@ -240,10 +282,17 @@ impl PluginHost {
                             Value::String(s) => Some(s),
                             _ => None,
                         });
-                        if debug { eprintln!("[hover-debug] result={result:?}"); }
+                        if debug {
+                            eprintln!("[hover-debug] result={result:?}");
+                        }
                         let _ = reply.send(result);
                     }
-                    PluginRequest::GotoDefinition { ctx, index, snapshot, reply } => {
+                    PluginRequest::GotoDefinition {
+                        ctx,
+                        index,
+                        snapshot,
+                        reply,
+                    } => {
                         rt.set_workspace_index(index);
                         rt.set_workspace_snapshot(snapshot);
                         let ctx_json = ctx.to_string();
@@ -289,7 +338,12 @@ impl PluginHost {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
-            .send(PluginRequest::Validate { ctx, index, snapshot, reply: reply_tx })
+            .send(PluginRequest::Validate {
+                ctx,
+                index,
+                snapshot,
+                reply: reply_tx,
+            })
             .await
             .is_err()
         {
@@ -307,7 +361,12 @@ impl PluginHost {
     ) -> Option<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(PluginRequest::Hover { ctx, index, snapshot, reply: reply_tx })
+            .send(PluginRequest::Hover {
+                ctx,
+                index,
+                snapshot,
+                reply: reply_tx,
+            })
             .await
             .ok()?;
         reply_rx.await.ok().flatten()
@@ -323,7 +382,12 @@ impl PluginHost {
     ) -> Option<(String, String, String)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(PluginRequest::GotoDefinition { ctx, index, snapshot, reply: reply_tx })
+            .send(PluginRequest::GotoDefinition {
+                ctx,
+                index,
+                snapshot,
+                reply: reply_tx,
+            })
             .await
             .ok()?;
         reply_rx.await.ok().flatten()
@@ -366,12 +430,26 @@ pub fn build_context(file_stem: &str, doc: &DocumentData) -> String {
     push_json_str(&mut s, file_stem);
     s.push_str(",\"headers\":[");
     for (i, h) in doc.headers.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         push_json_str(&mut s, h);
     }
     s.push_str("],\"rows\":[");
-    for (ri, row) in doc.rows.iter().enumerate() {
-        if ri > 0 { s.push(','); }
+    let mut emitted_rows = 0usize;
+    for row in &doc.rows {
+        if row
+            .cells
+            .first()
+            .map(|cell| cell.value.trim_start().starts_with('*'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if emitted_rows > 0 {
+            s.push(',');
+        }
+        emitted_rows += 1;
         s.push_str("{\"__line\":");
         s.push_str(&row.line.to_string());
         s.push_str(",\"__colstarts\":{");
@@ -379,7 +457,9 @@ pub fn build_context(file_stem: &str, doc: &DocumentData) -> String {
         for (i, cell) in row.cells.iter().enumerate() {
             if let Some(h) = doc.headers.get(i) {
                 if !h.is_empty() {
-                    if !first_cs { s.push(','); }
+                    if !first_cs {
+                        s.push(',');
+                    }
                     first_cs = false;
                     push_json_str(&mut s, h);
                     s.push(':');
@@ -409,13 +489,16 @@ fn push_json_str(buf: &mut String, v: &str) {
     buf.push('"');
     for ch in v.chars() {
         match ch {
-            '"'  => buf.push_str("\\\""),
+            '"' => buf.push_str("\\\""),
             '\\' => buf.push_str("\\\\"),
             '\n' => buf.push_str("\\n"),
             '\r' => buf.push_str("\\r"),
             '\t' => buf.push_str("\\t"),
-            c if (c as u32) < 0x20 => { use std::fmt::Write; let _ = write!(buf, "\\u{:04x}", c as u32); }
-            c    => buf.push(c),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(buf, "\\u{:04x}", c as u32);
+            }
+            c => buf.push(c),
         }
     }
     buf.push('"');
@@ -499,7 +582,6 @@ pub fn build_workspace_snapshot(
     Arc::new(snap)
 }
 
-
 // ---------------------------------------------------------------------------
 // TypeScript preprocessor
 // ---------------------------------------------------------------------------
@@ -552,15 +634,25 @@ fn strip_ts_inline(src: &str) -> String {
             continue;
         }
         if i + 1 < n && ch == '/' && chars[i + 1] == '/' {
-            while i < n && chars[i] != '\n' { out.push(chars[i]); i += 1; }
+            while i < n && chars[i] != '\n' {
+                out.push(chars[i]);
+                i += 1;
+            }
             continue;
         }
         if i + 1 < n && ch == '/' && chars[i + 1] == '*' {
-            out.push('/'); out.push('*'); i += 2;
+            out.push('/');
+            out.push('*');
+            i += 2;
             while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
-                out.push(chars[i]); i += 1;
+                out.push(chars[i]);
+                i += 1;
             }
-            if i + 1 < n { out.push('*'); out.push('/'); i += 2; }
+            if i + 1 < n {
+                out.push('*');
+                out.push('/');
+                i += 2;
+            }
             continue;
         }
 
@@ -569,22 +661,34 @@ fn strip_ts_inline(src: &str) -> String {
             brace_paren_stack.push(paren_above_brace);
             paren_above_brace = 0;
             brace_depth += 1;
-            out.push(ch); i += 1; continue;
+            out.push(ch);
+            i += 1;
+            continue;
         }
         if ch == '}' && brace_depth > 0 {
             brace_depth -= 1;
             paren_above_brace = brace_paren_stack.pop().unwrap_or(0);
-            out.push(ch); i += 1; continue;
+            out.push(ch);
+            i += 1;
+            continue;
         }
         if ch == '(' {
             paren_above_brace += 1;
             ternary.push(false);
-            out.push(ch); i += 1; continue;
+            out.push(ch);
+            i += 1;
+            continue;
         }
         if ch == ')' {
-            if paren_above_brace > 0 { paren_above_brace -= 1; }
-            if ternary.len() > 1 { ternary.pop(); }
-            out.push(ch); i += 1; continue;
+            if paren_above_brace > 0 {
+                paren_above_brace -= 1;
+            }
+            if ternary.len() > 1 {
+                ternary.pop();
+            }
+            out.push(ch);
+            i += 1;
+            continue;
         }
 
         // ---- `?` — ternary, optional chaining, optional parameter, or `??` ----
@@ -597,28 +701,44 @@ fn strip_ts_inline(src: &str) -> String {
             }
             if next == Some('.') {
                 // Optional chaining `?.` — keep as-is
-                out.push(ch); i += 1; continue;
+                out.push(ch);
+                i += 1;
+                continue;
             }
             if next == Some('?') {
                 // Nullish coalescing `??` (or `??=`) — not a ternary; consume both `?`s
-                out.push(ch); out.push('?'); i += 2; continue;
+                out.push(ch);
+                out.push('?');
+                i += 2;
+                continue;
             }
             // Ternary `?`
-            if let Some(top) = ternary.last_mut() { *top = true; }
-            out.push(ch); i += 1; continue;
+            if let Some(top) = ternary.last_mut() {
+                *top = true;
+            }
+            out.push(ch);
+            i += 1;
+            continue;
         }
 
         // ---- `:` — type annotation or ternary colon -------------------------
         if ch == ':' {
             // If a pending ternary `?` exists at this depth it's the ternary colon.
             if *ternary.last().unwrap_or(&false) {
-                if let Some(top) = ternary.last_mut() { *top = false; }
-                out.push(ch); i += 1; continue;
+                if let Some(top) = ternary.last_mut() {
+                    *top = false;
+                }
+                out.push(ch);
+                i += 1;
+                continue;
             }
 
             // Use the OUTPUT for the previous-char check so that stripped tokens
             // (e.g. the `?` in `x?:`) don't confuse the context detection.
-            let prev_out = out.chars().rev().find(|c| !matches!(*c, ' ' | '\t' | '\n' | '\r'));
+            let prev_out = out
+                .chars()
+                .rev()
+                .find(|c| !matches!(*c, ' ' | '\t' | '\n' | '\r'));
             // Strip when at top level, inside parens opened since the last `{`
             // (function/arrow params), or immediately after `)` (return-type
             // annotation — `): Type` is never a valid JS object-literal colon).
@@ -637,8 +757,12 @@ fn strip_ts_inline(src: &str) -> String {
             let var_decl_ok = !depth_ok && prev_out.map_or(false, is_id) && {
                 let trimmed = out.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
                 let before_id = trimmed.trim_end_matches(|c: char| is_id(c));
-                let before_id = before_id.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
-                let kw_start = before_id.rfind(|c: char| !is_id(c)).map(|i| i + 1).unwrap_or(0);
+                let before_id =
+                    before_id.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+                let kw_start = before_id
+                    .rfind(|c: char| !is_id(c))
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 matches!(&before_id[kw_start..], "const" | "let" | "var")
             };
 
@@ -701,12 +825,18 @@ fn skip_type_expr(chars: &[char], start: usize, stop_at_brace: bool) -> usize {
         match chars[i] {
             // String literal types ("error" | "warning") — skip verbatim.
             '"' | '\'' => {
-                let q = chars[i]; i += 1;
+                let q = chars[i];
+                i += 1;
                 while i < n {
-                    if chars[i] == '\\' { i += 1; }
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
                     if i < n {
-                        let c = chars[i]; i += 1;
-                        if c == q { break; }
+                        let c = chars[i];
+                        i += 1;
+                        if c == q {
+                            break;
+                        }
                     }
                 }
             }
@@ -717,35 +847,69 @@ fn skip_type_expr(chars: &[char], start: usize, stop_at_brace: bool) -> usize {
             // `=>` — signals function body for return types; part of function
             // type for parameter/variable types.
             '=' if all_zero && i + 1 < n && chars[i + 1] == '>' => {
-                if stop_at_brace { break; } else { i += 2; } // consume `=>`
+                if stop_at_brace {
+                    break;
+                } else {
+                    i += 2;
+                } // consume `=>`
             }
             // Plain `=` (default value) stops the type.
             '=' if all_zero => break,
             // Bare `>` at top level means we over-consumed a generic — stop.
             '>' if all_zero && d_angle == 0 => break,
             // Depth tracking.
-            '<' => { d_angle += 1; i += 1; }
-            '>' if d_angle > 0 => { d_angle -= 1; i += 1; }
-            '(' => { d_paren += 1; i += 1; }
-            ')' if d_paren > 0 => { d_paren -= 1; i += 1; }
-            '[' => { d_bracket += 1; i += 1; }
-            ']' if d_bracket > 0 => { d_bracket -= 1; i += 1; }
-            '{' => { d_brace += 1; i += 1; }
-            '}' if d_brace > 0 => { d_brace -= 1; i += 1; }
-            _ => { i += 1; }
+            '<' => {
+                d_angle += 1;
+                i += 1;
+            }
+            '>' if d_angle > 0 => {
+                d_angle -= 1;
+                i += 1;
+            }
+            '(' => {
+                d_paren += 1;
+                i += 1;
+            }
+            ')' if d_paren > 0 => {
+                d_paren -= 1;
+                i += 1;
+            }
+            '[' => {
+                d_bracket += 1;
+                i += 1;
+            }
+            ']' if d_bracket > 0 => {
+                d_bracket -= 1;
+                i += 1;
+            }
+            '{' => {
+                d_brace += 1;
+                i += 1;
+            }
+            '}' if d_brace > 0 => {
+                d_brace -= 1;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
     i
 }
 
-#[inline] fn is_id(c: char) -> bool { c.is_alphanumeric() || c == '_' || c == '$' }
+#[inline]
+fn is_id(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
 
 fn skip_ws(chars: &[char], start: usize) -> usize {
     let mut i = start;
-    while i < chars.len() && matches!(chars[i], ' ' | '\t') { i += 1; }
+    while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+        i += 1;
+    }
     i
 }
-
 
 fn copy_str_lit(chars: &[char], start: usize, out: &mut String) -> usize {
     let q = chars[start];
@@ -753,9 +917,23 @@ fn copy_str_lit(chars: &[char], start: usize, out: &mut String) -> usize {
     let mut i = start + 1;
     while i < chars.len() {
         match chars[i] {
-            '\\' => { out.push('\\'); i += 1; if i < chars.len() { out.push(chars[i]); i += 1; } }
-            c if c == q => { out.push(c); i += 1; break; }
-            c => { out.push(c); i += 1; }
+            '\\' => {
+                out.push('\\');
+                i += 1;
+                if i < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            c if c == q => {
+                out.push(c);
+                i += 1;
+                break;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
     i
@@ -766,9 +944,23 @@ fn copy_template_lit(chars: &[char], start: usize, out: &mut String) -> usize {
     let mut i = start + 1;
     while i < chars.len() {
         match chars[i] {
-            '\\' => { out.push('\\'); i += 1; if i < chars.len() { out.push(chars[i]); i += 1; } }
-            '`' => { out.push('`'); i += 1; break; }
-            c => { out.push(c); i += 1; }
+            '\\' => {
+                out.push('\\');
+                i += 1;
+                if i < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '`' => {
+                out.push('`');
+                i += 1;
+                break;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
     i
@@ -778,7 +970,7 @@ fn copy_template_lit(chars: &[char], start: usize, out: &mut String) -> usize {
 
 fn strip_ts_declarations(src: &str) -> String {
     let mut out: Vec<&str> = Vec::with_capacity(64);
-    let mut in_block = false;  // inside a removed { ... } body
+    let mut in_block = false; // inside a removed { ... } body
     let mut after_decl = false; // saw keyword, waiting for opening { on next line
     let mut depth: usize = 0;
 
@@ -833,9 +1025,7 @@ fn strip_ts_declarations(src: &str) -> String {
 
             let is_decl = kw.starts_with("interface ")
                 || kw.starts_with("declare ")
-                || (kw.starts_with("type ")
-                    && kw.contains('=')
-                    && !kw.starts_with("typeof "));
+                || (kw.starts_with("type ") && kw.contains('=') && !kw.starts_with("typeof "));
 
             if is_decl {
                 if line.contains('{') {
@@ -888,9 +1078,16 @@ mod tests {
     fn strips_interface_block() {
         let src = "interface Foo {\n  bar: string;\n}\nconst x = 1;\n";
         let out = strip_ts_declarations(src);
-        assert!(!out.contains("interface"), "interface block should be removed");
+        assert!(
+            !out.contains("interface"),
+            "interface block should be removed"
+        );
         assert!(out.contains("const x = 1;"), "regular code preserved");
-        assert_eq!(out.lines().count(), src.lines().count(), "line count preserved");
+        assert_eq!(
+            out.lines().count(),
+            src.lines().count(),
+            "line count preserved"
+        );
     }
 
     #[test]
@@ -986,7 +1183,10 @@ mod tests {
     fn preserves_object_literal_in_call() {
         // `{ key: value }` inside a function call must NOT be stripped
         let out = strip_typescript("return { content: msg };");
-        assert!(out.contains("content: msg"), "object literal preserved, got: {out}");
+        assert!(
+            out.contains("content: msg"),
+            "object literal preserved, got: {out}"
+        );
     }
 
     #[test]
@@ -1001,18 +1201,31 @@ mod tests {
         let out = strip_typescript(
             "function f(ctx: Ctx): void {\n  ctx.rows.forEach((row: Row) => {});\n}",
         );
-        assert!(out.contains("(row)"), "arrow param type stripped, got: {out}");
-        assert!(out.contains("(ctx)"), "outer param type stripped, got: {out}");
+        assert!(
+            out.contains("(row)"),
+            "arrow param type stripped, got: {out}"
+        );
+        assert!(
+            out.contains("(ctx)"),
+            "outer param type stripped, got: {out}"
+        );
     }
 
     #[test]
     fn nullish_coalescing_does_not_poison_ternary() {
         // `??` must not set the pending-ternary flag; a later `:` return-type
         // annotation must still be stripped.
-        let src = "function f() { const x = a ?? 0; }\nfunction g(): string | null { return null; }";
+        let src =
+            "function f() { const x = a ?? 0; }\nfunction g(): string | null { return null; }";
         let out = strip_typescript(src);
-        assert!(out.contains("function g()"), "return type stripped, got: {out}");
-        assert!(!out.contains(": string"), "return type stripped, got: {out}");
+        assert!(
+            out.contains("function g()"),
+            "return type stripped, got: {out}"
+        );
+        assert!(
+            !out.contains(": string"),
+            "return type stripped, got: {out}"
+        );
         assert!(out.contains("return null"), "body preserved, got: {out}");
     }
 
@@ -1021,7 +1234,10 @@ mod tests {
         let out = strip_typescript(
             "function f() {\n    const tokens: string[] = [];\n    let n: number = 0;\n    var m: Record<string, number> = {};\n    return tokens;\n}",
         );
-        assert!(out.contains("const tokens= []"), "const type stripped, got: {out}");
+        assert!(
+            out.contains("const tokens= []"),
+            "const type stripped, got: {out}"
+        );
         assert!(out.contains("let n= 0"), "let type stripped, got: {out}");
         assert!(out.contains("var m= {}"), "var type stripped, got: {out}");
         assert!(out.contains("return tokens"), "body preserved, got: {out}");
@@ -1031,14 +1247,20 @@ mod tests {
     fn preserves_object_literal_in_var_decl() {
         // `const x = { key: value }` — the rename colon must NOT be stripped
         let out = strip_typescript("function f() { const x = { key: value }; }");
-        assert!(out.contains("key: value"), "object literal preserved, got: {out}");
+        assert!(
+            out.contains("key: value"),
+            "object literal preserved, got: {out}"
+        );
     }
 
     #[test]
     fn preserves_string_in_string() {
         // Colon inside a string must not be treated as a type annotation.
         let out = strip_typescript("var x = \"key: value\";");
-        assert!(out.contains("\"key: value\""), "string content preserved, got: {out}");
+        assert!(
+            out.contains("\"key: value\""),
+            "string content preserved, got: {out}"
+        );
     }
 
     #[test]
@@ -1056,10 +1278,19 @@ function validate(ctx: PluginContext): string[] {
 }
 "#;
         let out = strip_typescript(src);
-        assert!(!out.contains("interface PluginContext"), "interface removed");
-        assert!(out.contains("function validate(ctx)"), "param type stripped, got: {out}");
+        assert!(
+            !out.contains("interface PluginContext"),
+            "interface removed"
+        );
+        assert!(
+            out.contains("function validate(ctx)"),
+            "param type stripped, got: {out}"
+        );
         assert!(out.contains("if (ctx.file"), "body preserved, got: {out}");
-        assert!(out.contains("n > 0 ? \"ok\" : \"empty\""), "ternary preserved, got: {out}");
+        assert!(
+            out.contains("n > 0 ? \"ok\" : \"empty\""),
+            "ternary preserved, got: {out}"
+        );
         // Arrow param inside forEach should be stripped
         assert!(out.contains("(row)"), "arrow param stripped, got: {out}");
     }
@@ -1070,8 +1301,14 @@ function validate(ctx: PluginContext): string[] {
         let out = strip_typescript(
             "function hover(ctx: Ctx): HoverResult | null {\n    const fmt = (x: number): string => { return x.toFixed(2); };\n    return null;\n}",
         );
-        assert!(out.contains("const fmt = (x)"), "arrow return type stripped, got: {out}");
-        assert!(!out.contains(": string"), "no type annotation left, got: {out}");
+        assert!(
+            out.contains("const fmt = (x)"),
+            "arrow return type stripped, got: {out}"
+        );
+        assert!(
+            !out.contains(": string"),
+            "no type annotation left, got: {out}"
+        );
     }
 
     #[test]
@@ -1086,7 +1323,13 @@ function validate(ctx: PluginContext): string[] {
                 }\
             }",
         );
-        assert!(out.contains("(s)"), "arrow param type stripped in deep nest, got: {out}");
-        assert!(!out.contains(": string"), "no type annotation left, got: {out}");
+        assert!(
+            out.contains("(s)"),
+            "arrow param type stripped in deep nest, got: {out}"
+        );
+        assert!(
+            !out.contains(": string"),
+            "no type annotation left, got: {out}"
+        );
     }
 }

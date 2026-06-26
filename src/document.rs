@@ -29,7 +29,12 @@ impl DocumentData {
                 .split(delimiter)
                 .map(|s| s.to_string())
                 .collect(),
-            None => return Self { headers: vec![], rows: vec![] },
+            None => {
+                return Self {
+                    headers: vec![],
+                    rows: vec![],
+                };
+            }
         };
 
         let rows = line_iter

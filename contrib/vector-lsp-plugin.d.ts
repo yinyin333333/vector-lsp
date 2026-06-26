@@ -82,6 +82,12 @@ interface ColumnInfo {
 declare function hasFile(stem: string): boolean;
 
 /**
+ * Return true only when the workspace has file `file` and column `col`.
+ * Use this before value-level diagnostics that depend on lookup evidence.
+ */
+declare function hasLookupTarget(file: string, col: string): boolean;
+
+/**
  * Return all non-empty values from column `col` in file `stem`
  * (both case-insensitive).  Only that column is serialized.
  * Returns an empty array when the file or column is absent.

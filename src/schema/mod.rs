@@ -147,7 +147,15 @@ pub struct Schema {
 impl Schema {
     /// Look up the schema entry for a file by its stem (e.g. `"armor"` for `armor.txt`).
     pub fn get_file(&self, stem: &str) -> Option<&SchemaFile> {
-        self.files.get(stem).or_else(|| self.files.get(&stem.to_lowercase()))
+        self.files
+            .get(stem)
+            .or_else(|| self.files.get(&stem.to_lowercase()))
+            .or_else(|| {
+                let lower = stem.to_lowercase();
+                self.files
+                    .iter()
+                    .find_map(|(key, file)| (key.to_lowercase() == lower).then_some(file))
+            })
     }
 
     /// Find a field definition for `col_name` in `file_stem`, following the
@@ -196,7 +204,11 @@ impl Schema {
             .filter_map(|v| v.as_str())
             .map(|s| s.to_string())
             .collect();
-        if values.is_empty() { None } else { Some(values) }
+        if values.is_empty() {
+            None
+        } else {
+            Some(values)
+        }
     }
 
     /// Return the set of `(file_stem, column_name)` pairs that are pointed at by

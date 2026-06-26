@@ -498,7 +498,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                         col:      c,
                         endCol:   c + val.length,
                         severity: "error",
-                        message:  `Invalid calc formula: ${err}`,
+                        message:  `calcCheck: Invalid calc formula: ${err}`,
                     });
                 }
             }

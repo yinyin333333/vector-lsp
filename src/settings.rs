@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(rename_all = "lowercase")]
@@ -37,8 +37,11 @@ impl Encoding {
         let u16s: Vec<u16> = data
             .chunks_exact(2)
             .map(|c| {
-                if be { u16::from_be_bytes([c[0], c[1]]) }
-                else  { u16::from_le_bytes([c[0], c[1]]) }
+                if be {
+                    u16::from_be_bytes([c[0], c[1]])
+                } else {
+                    u16::from_le_bytes([c[0], c[1]])
+                }
             })
             .collect();
         String::from_utf16(&u16s).map_err(|e| anyhow::anyhow!("{e}"))

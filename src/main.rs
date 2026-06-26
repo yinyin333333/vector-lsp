@@ -9,30 +9,36 @@ mod schema;
 mod settings;
 mod workspace;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
 use config::{Config, Environment, File};
 use tokio::sync::RwLock;
-use tower_lsp::lsp_types::DiagnosticSeverity;
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use tower_lsp::{LspService, Server};
 
 use cli::CliArgs;
 use document::DocumentData;
+use runtime::{WorkspaceFileSnapshot, build_workspace_index};
 use schema::find_loader;
 use settings::{IoType, VectorLspSettings};
 use workspace::{SymbolIndex, Workspace};
 
 /// Append sorted .ts/.js plugin files from `dir` to `out`, skipping `_patches.js`.
 fn scan_plugin_dir(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut found: Vec<std::path::PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
-            matches!(p.extension().and_then(|e| e.to_str()), Some("ts") | Some("js"))
-                && p.file_name().map_or(true, |n| n != "_patches.js")
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("ts") | Some("js")
+            ) && p.file_name().map_or(true, |n| n != "_patches.js")
         })
         .collect();
     found.sort();
@@ -59,6 +65,48 @@ fn collect_plugin_paths(settings: &VectorLspSettings) -> Vec<std::path::PathBuf>
     paths
 }
 
+fn collect_data_files(root: &Path, ext: &str) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.path());
+
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn diagnostic_severity_name(diag: &Diagnostic) -> &'static str {
+    match diag.severity {
+        Some(DiagnosticSeverity::ERROR) => "error",
+        Some(DiagnosticSeverity::WARNING) => "warning",
+        Some(DiagnosticSeverity::INFORMATION) => "info",
+        Some(DiagnosticSeverity::HINT) => "hint",
+        _ => "hint",
+    }
+}
+
+fn count_diagnostic(diag: &Diagnostic, counts: &mut (usize, usize, usize, usize)) {
+    match diag.severity {
+        Some(DiagnosticSeverity::ERROR) => counts.0 += 1,
+        Some(DiagnosticSeverity::WARNING) => counts.1 += 1,
+        Some(DiagnosticSeverity::INFORMATION) => counts.2 += 1,
+        Some(DiagnosticSeverity::HINT) => counts.3 += 1,
+        _ => counts.3 += 1,
+    }
+}
+
 /// Run a one-shot workspace check: scan all data files, validate them, print diagnostics, and
 /// return an exit code (0 = clean, 1 = errors found, 2 = configuration/IO error).
 async fn run_check(settings: &VectorLspSettings) -> i32 {
@@ -70,6 +118,13 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
         }
     };
 
+    let plugin_paths = collect_plugin_paths(settings);
+    let plugin_host = if plugin_paths.is_empty() {
+        None
+    } else {
+        Some(plugin::PluginHost::new(plugin_paths.clone()))
+    };
+
     // Load schema if a path or variant is configured.
     let schema_result = if settings.schema_path.is_some() || !settings.schema_variant.is_empty() {
         let loader = match find_loader(
@@ -78,7 +133,10 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
             settings.plugin_path.clone(),
         ) {
             Ok(l) => l,
-            Err(e) => { eprintln!("error: {e}"); return 2; }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
         };
         let schema_path = settings.schema_path.clone();
         match tokio::task::spawn_blocking(move || loader.load(schema_path.as_deref())).await {
@@ -99,6 +157,11 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
         None
     };
 
+    if let (Some(ph), Some(schema)) = (&plugin_host, &schema_result) {
+        ph.set_schema(Arc::clone(schema)).await;
+    }
+    eprintln!("Loaded {} plugin file(s).", plugin_paths.len());
+
     let ref_targets: HashSet<(String, String)> = schema_result
         .as_ref()
         .map(|s| s.reference_targets())
@@ -107,51 +170,71 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
     // Scan and parse workspace files.
     let ext = settings.extension.as_str();
     let delimiter = settings.delimiter_char();
-    let mut entries = match std::fs::read_dir(&workspace_path) {
+    let entries = match collect_data_files(&workspace_path, ext) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("error: cannot read workspace directory '{}': {e}", workspace_path.display());
+            eprintln!(
+                "error: cannot read workspace directory '{}': {e}",
+                workspace_path.display()
+            );
             return 2;
         }
     };
 
     let mut parsed: Vec<(std::path::PathBuf, String, Arc<DocumentData>)> = Vec::new();
-    loop {
-        let entry = match entries.next() {
-            Some(Ok(e)) => e,
-            Some(Err(e)) => { eprintln!("warning: directory entry error: {e}"); continue; }
-            None => break,
-        };
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
-            continue;
-        }
+    for path in entries {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_lowercase();
         match std::fs::read(&path).and_then(|b| Ok(settings.encoding.decode(&b))) {
-            Ok(Ok(src)) => parsed.push((path, stem, Arc::new(DocumentData::parse(&src, delimiter)))),
+            Ok(Ok(src)) => {
+                parsed.push((path, stem, Arc::new(DocumentData::parse(&src, delimiter))))
+            }
             Ok(Err(e)) => eprintln!("warning: skipping '{}': {e}", path.display()),
             Err(e) => eprintln!("warning: skipping '{}': {e}", path.display()),
         }
     }
+    parsed.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Build symbol index.
     let mut symbols = SymbolIndex::new();
     for (path, stem, doc) in &parsed {
-        let Ok(uri) = tower_lsp::lsp_types::Url::from_file_path(path) else { continue };
+        let Ok(uri) = tower_lsp::lsp_types::Url::from_file_path(path) else {
+            continue;
+        };
         symbols.index_document(&uri, stem, doc, &ref_targets);
     }
 
+    let mut file_cache: HashMap<PathBuf, Arc<DocumentData>> = HashMap::new();
+    for (path, _, doc) in &parsed {
+        file_cache.insert(path.clone(), Arc::clone(doc));
+    }
+    let open_documents = HashMap::new();
+    let workspace_index = build_workspace_index(&open_documents, &file_cache);
+    let mut snapshot = WorkspaceFileSnapshot::new();
+    for (path, doc) in &file_cache {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            snapshot.files.insert(stem.to_lowercase(), Arc::clone(doc));
+        }
+    }
+    let snapshot = Arc::new(snapshot);
+
     // Validate and collect diagnostics.
-    let mut total_errors = 0usize;
-    let mut total_warnings = 0usize;
+    let mut counts = (0usize, 0usize, 0usize, 0usize);
     let mut file_count = 0usize;
 
     for (path, stem, doc) in &parsed {
-        let diags = diagnostics::validate_document(stem, doc, schema_result.as_deref(), &symbols);
+        let mut diags =
+            diagnostics::validate_document(stem, doc, schema_result.as_deref(), &symbols);
+        if let Some(ph) = &plugin_host {
+            let ctx = plugin::build_context(stem, doc);
+            diags.extend(
+                ph.run(ctx, Arc::clone(&workspace_index), Arc::clone(&snapshot))
+                    .await,
+            );
+        }
         if diags.is_empty() {
             continue;
         }
@@ -160,23 +243,21 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
         for d in &diags {
             let line = d.range.start.line + 1;
             let col = d.range.start.character + 1;
-            let severity = match d.severity {
-                Some(DiagnosticSeverity::ERROR) => { total_errors += 1; "error" }
-                Some(DiagnosticSeverity::WARNING) => { total_warnings += 1; "warning" }
-                Some(DiagnosticSeverity::INFORMATION) => "info",
-                _ => "hint",
-            };
+            count_diagnostic(d, &mut counts);
+            let severity = diagnostic_severity_name(d);
             println!("{display}:{line}:{col}: {severity}: {}", d.message);
         }
     }
 
-    if total_errors == 0 && total_warnings == 0 {
-        eprintln!("No diagnostics found across {} file(s).", parsed.len());
-        0
-    } else {
-        eprintln!("{} error(s), {} warning(s) across {file_count} file(s).", total_errors, total_warnings);
-        if total_errors > 0 { 1 } else { 0 }
-    }
+    eprintln!(
+        "{} error(s), {} warning(s), {} info, {} hint diagnostic(s) across {file_count} file(s); {} parsed file(s).",
+        counts.0,
+        counts.1,
+        counts.2,
+        counts.3,
+        parsed.len()
+    );
+    if counts.0 > 0 { 1 } else { 0 }
 }
 
 #[tokio::main]
@@ -188,7 +269,9 @@ async fn main() -> anyhow::Result<()> {
         .add_source(Environment::with_prefix("VLSP"))
         .build()?;
 
-    let mut settings = raw.try_deserialize::<VectorLspSettings>().unwrap_or_default();
+    let mut settings = raw
+        .try_deserialize::<VectorLspSettings>()
+        .unwrap_or_default();
     if let Some(schema_path) = args.schema_path {
         settings.schema_path = Some(schema_path);
     }

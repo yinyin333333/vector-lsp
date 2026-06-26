@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use deno_core::{extension, op2, FastString, JsRuntime, OpState, RuntimeOptions};
+use deno_core::{FastString, JsRuntime, OpState, RuntimeOptions, extension, op2};
 use serde_json::Value;
 use tower_lsp::lsp_types::Url;
 
 use crate::document::DocumentData;
-use crate::schema::{format_description, Schema};
+use crate::schema::{Schema, format_description};
 
 // ---------------------------------------------------------------------------
 // WorkspaceFileSnapshot — per-file DocumentData references for plugin ops
@@ -24,7 +24,9 @@ pub struct WorkspaceFileSnapshot {
 
 impl WorkspaceFileSnapshot {
     pub fn new() -> Self {
-        Self { files: HashMap::new() }
+        Self {
+            files: HashMap::new(),
+        }
     }
 }
 
@@ -43,7 +45,10 @@ pub struct WorkspaceIndex {
 
 impl WorkspaceIndex {
     pub fn new() -> Self {
-        Self { data: HashMap::new(), columns: HashMap::new() }
+        Self {
+            data: HashMap::new(),
+            columns: HashMap::new(),
+        }
     }
 
     fn insert(&mut self, file: &str, col: &str, value: String) {
@@ -68,6 +73,10 @@ impl WorkspaceIndex {
             .get(&file.to_lowercase())?
             .iter()
             .position(|h| h.to_lowercase() == col_lower)
+    }
+
+    pub fn has_lookup_target(&self, file: &str, col: &str) -> bool {
+        self.column_index(file, col).is_some()
     }
 }
 
@@ -105,8 +114,16 @@ fn index_doc(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
     idx.columns.insert(stem.to_lowercase(), doc.headers.clone());
 
     for row in &doc.rows {
+        if row
+            .cells
+            .first()
+            .map(|cell| cell.value.trim_start().starts_with('*'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         for (col_i, cell) in row.cells.iter().enumerate() {
-            if cell.value.is_empty() {
+            if cell.value.trim().is_empty() {
                 continue;
             }
             if let Some(h) = doc.headers.get(col_i) {
@@ -150,9 +167,10 @@ pub fn op_get_column(
     #[string] file: &str,
     #[string] col: &str,
 ) -> Option<ColumnInfo> {
-    state
-        .try_borrow::<Arc<WorkspaceIndex>>()
-        .and_then(|idx| idx.column_index(file, col).map(|index| ColumnInfo { index }))
+    state.try_borrow::<Arc<WorkspaceIndex>>().and_then(|idx| {
+        idx.column_index(file, col)
+            .map(|index| ColumnInfo { index })
+    })
 }
 
 /// Return `true` if `stem` is present in the workspace snapshot.
@@ -162,6 +180,16 @@ pub fn op_has_file(state: &OpState, #[string] stem: &str) -> bool {
     state
         .try_borrow::<Arc<WorkspaceFileSnapshot>>()
         .map(|snap| snap.files.contains_key(&stem.to_lowercase()))
+        .unwrap_or(false)
+}
+
+/// Return true when the workspace contains `file` with column `col`.
+/// Callable from JS as `Deno.core.ops.op_has_lookup_target(file, col)`.
+#[op2(fast)]
+pub fn op_has_lookup_target(state: &OpState, #[string] file: &str, #[string] col: &str) -> bool {
+    state
+        .try_borrow::<Arc<WorkspaceIndex>>()
+        .map(|idx| idx.has_lookup_target(file, col))
         .unwrap_or(false)
 }
 
@@ -176,7 +204,10 @@ pub struct CtxJson(pub String);
 #[op2]
 #[string]
 pub fn op_get_ctx_json(state: &OpState) -> String {
-    state.try_borrow::<CtxJson>().map(|c| c.0.clone()).unwrap_or_default()
+    state
+        .try_borrow::<CtxJson>()
+        .map(|c| c.0.clone())
+        .unwrap_or_default()
 }
 
 /// Return all non-empty values in column `col` of file `stem`.
@@ -188,15 +219,30 @@ pub fn op_get_column_values(
     #[string] stem: &str,
     #[string] col: &str,
 ) -> Vec<String> {
-    let Some(snap) = state.try_borrow::<Arc<WorkspaceFileSnapshot>>() else { return vec![] };
-    let Some(doc) = snap.files.get(&stem.to_lowercase()) else { return vec![] };
-    let col_lower = col.to_lowercase();
-    let Some(col_idx) = doc.headers.iter().position(|h| h.to_lowercase() == col_lower) else {
+    let Some(snap) = state.try_borrow::<Arc<WorkspaceFileSnapshot>>() else {
         return vec![];
     };
-    doc.rows.iter()
+    let Some(doc) = snap.files.get(&stem.to_lowercase()) else {
+        return vec![];
+    };
+    let col_lower = col.to_lowercase();
+    let Some(col_idx) = doc
+        .headers
+        .iter()
+        .position(|h| h.to_lowercase() == col_lower)
+    else {
+        return vec![];
+    };
+    doc.rows
+        .iter()
+        .filter(|row| {
+            !row.cells
+                .first()
+                .map(|cell| cell.value.trim_start().starts_with('*'))
+                .unwrap_or(false)
+        })
         .filter_map(|row| row.cells.get(col_idx))
-        .filter(|cell| !cell.value.is_empty())
+        .filter(|cell| !cell.value.trim().is_empty())
         .map(|cell| cell.value.clone())
         .collect()
 }
@@ -212,18 +258,42 @@ pub fn op_get_filtered_column_values(
     #[string] filter_col: &str,
     #[string] filter_value: &str,
 ) -> Vec<String> {
-    let Some(snap) = state.try_borrow::<Arc<WorkspaceFileSnapshot>>() else { return vec![] };
-    let Some(doc) = snap.files.get(&stem.to_lowercase()) else { return vec![] };
-    let Some(vi) = doc.headers.iter().position(|h| h.eq_ignore_ascii_case(value_col)) else {
+    let Some(snap) = state.try_borrow::<Arc<WorkspaceFileSnapshot>>() else {
         return vec![];
     };
-    let Some(fi) = doc.headers.iter().position(|h| h.eq_ignore_ascii_case(filter_col)) else {
+    let Some(doc) = snap.files.get(&stem.to_lowercase()) else {
         return vec![];
     };
-    doc.rows.iter()
-        .filter(|row| row.cells.get(fi).map(|c| c.value == filter_value).unwrap_or(false))
+    let Some(vi) = doc
+        .headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case(value_col))
+    else {
+        return vec![];
+    };
+    let Some(fi) = doc
+        .headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case(filter_col))
+    else {
+        return vec![];
+    };
+    doc.rows
+        .iter()
+        .filter(|row| {
+            !row.cells
+                .first()
+                .map(|cell| cell.value.trim_start().starts_with('*'))
+                .unwrap_or(false)
+        })
+        .filter(|row| {
+            row.cells
+                .get(fi)
+                .map(|c| c.value == filter_value)
+                .unwrap_or(false)
+        })
         .filter_map(|row| row.cells.get(vi))
-        .filter(|cell| !cell.value.is_empty())
+        .filter(|cell| !cell.value.trim().is_empty())
         .map(|cell| cell.value.clone())
         .collect()
 }
@@ -252,26 +322,41 @@ pub fn op_get_enum_table(
     let debug = std::env::var("VLSP_DEBUG_LOGGING").is_ok();
     let schema = state.try_borrow::<Arc<Schema>>();
     if schema.is_none() {
-        if debug { eprintln!("[enum-debug] no schema in OpState for file={file} col={col}"); }
+        if debug {
+            eprintln!("[enum-debug] no schema in OpState for file={file} col={col}");
+        }
         return None;
     }
     let schema = schema.unwrap();
     let field = schema.find_field(file, col);
     if field.is_none() {
-        if debug { eprintln!("[enum-debug] find_field returned None for file={file} col={col}"); }
+        if debug {
+            eprintln!("[enum-debug] find_field returned None for file={file} col={col}");
+        }
         return None;
     }
     let field = field.unwrap();
     let table = field.table.as_ref();
     if table.is_none() {
-        if debug { eprintln!("[enum-debug] field has no table for file={file} col={col}"); }
+        if debug {
+            eprintln!("[enum-debug] field has no table for file={file} col={col}");
+        }
         return None;
     }
     let table = table.unwrap();
     let header_row = table.first()?;
     let headers = header_row.iter().map(cell_raw).collect();
-    let rows = table.iter().skip(1).map(|row| row.iter().map(cell_formatted).collect()).collect();
-    if debug { eprintln!("[enum-debug] returning table with {} rows for file={file} col={col}", table.len() - 1); }
+    let rows = table
+        .iter()
+        .skip(1)
+        .map(|row| row.iter().map(cell_formatted).collect())
+        .collect();
+    if debug {
+        eprintln!(
+            "[enum-debug] returning table with {} rows for file={file} col={col}",
+            table.len() - 1
+        );
+    }
     Some(EnumTableResult { headers, rows })
 }
 
@@ -279,7 +364,11 @@ pub fn op_get_enum_table(
 fn cell_raw(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        Value::Object(o) => o.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+        Value::Object(o) => o
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
         Value::Null => String::new(),
         other => other.to_string(),
     }
@@ -328,6 +417,7 @@ extension!(
         op_get_filtered_column_values,
         op_get_enum_table,
         op_get_ctx_json,
+        op_has_lookup_target,
     ],
 );
 
@@ -380,7 +470,8 @@ impl ScriptRuntime {
 
     /// Execute a JavaScript snippet, discarding the return value.
     pub fn exec(&mut self, name: &'static str, src: impl Into<String>) -> Result<()> {
-        self.inner.execute_script(name, FastString::from(src.into()))?;
+        self.inner
+            .execute_script(name, FastString::from(src.into()))?;
         Ok(())
     }
 
