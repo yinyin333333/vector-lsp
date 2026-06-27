@@ -10,7 +10,7 @@
 //   formula   = expr EOF
 //   expr      = ternary
 //   ternary   = compare ('?' expr ':' expr)?
-//   compare   = add (('<'|'<='|'>'|'>='|'=='|'!=') add)?
+//   compare   = add (('<'|'<='|'>'|'>='|'=='|'!=') add)*
 //   add       = mul (('+' | '-') mul)*
 //   mul       = power (('*' | '/' | '%') power)*
 //   power     = unary ('^' unary)?
@@ -114,9 +114,18 @@ interface Token {
 
 interface CalcParseError {
     code: string;
+    kind: string;
     message: string;
     pos: number;
     length?: number;
+    expected?: string;
+    actual?: string;
+    parserPosition?: number;
+    insertionPoint?: number;
+    insertText?: string;
+    tokenStart?: number;
+    tokenEnd?: number;
+    hint?: string;
 }
 
 interface NormalizedText {
@@ -125,15 +134,145 @@ interface NormalizedText {
     end: number;
 }
 
-function calcError(code: string, message: string, pos: number, length?: number): CalcParseError {
-    return { code, message, pos, length };
+interface CalcErrorMeta {
+    expected?: string;
+    actual?: string;
+    insertionPoint?: number;
+    insertText?: string;
+    tokenStart?: number;
+    tokenEnd?: number;
+    hint?: string;
 }
 
-function tokenError(code: string, message: string, tok: Token): CalcParseError {
-    if (tok.type === "EOF" && tok.pos > 0) {
-        return calcError(code, message, tok.pos - 1, 1);
+const TOKEN_LABELS: Record<string, string> = {
+    LPAREN: "(",
+    RPAREN: ")",
+    LBRACK: "[",
+    RBRACK: "]",
+    COLON: ":",
+    COMMA: ",",
+    DOT: ".",
+    QUOTED: "quoted string",
+    IDENT: "identifier",
+    NUM: "number",
+    EOF: "end of formula",
+};
+
+const TOKEN_INSERT_TEXT: Record<string, string> = {
+    RPAREN: ")",
+    RBRACK: "]",
+    COLON: ":",
+    COMMA: ",",
+};
+
+function calcError(
+    code: string,
+    message: string,
+    pos: number,
+    length?: number,
+    kind?: string,
+    meta?: CalcErrorMeta,
+): CalcParseError {
+    const err: CalcParseError = {
+        code,
+        kind: kind || "invalid-argument",
+        message,
+        pos,
+        length,
+        parserPosition: pos,
+    };
+    if (meta) {
+        if (meta.expected !== undefined) err.expected = meta.expected;
+        if (meta.actual !== undefined) err.actual = meta.actual;
+        if (meta.insertionPoint !== undefined) err.insertionPoint = meta.insertionPoint;
+        if (meta.insertText !== undefined) err.insertText = meta.insertText;
+        if (meta.tokenStart !== undefined) err.tokenStart = meta.tokenStart;
+        if (meta.tokenEnd !== undefined) err.tokenEnd = meta.tokenEnd;
+        if (meta.hint !== undefined) err.hint = meta.hint;
     }
-    return calcError(code, message, tok.pos, tok.value.length || 1);
+    return err;
+}
+
+function tokenLabel(type: string): string {
+    return TOKEN_LABELS[type] || type;
+}
+
+function tokenActual(tok: Token): string {
+    return tok.type === "EOF" ? "EOF" : (tok.value || tok.type);
+}
+
+function tokenCodePart(type: string): string {
+    return type.toLowerCase().replace(/_/g, "-");
+}
+
+function tokenError(code: string, message: string, tok: Token, kind?: string, meta?: CalcErrorMeta): CalcParseError {
+    const actual = tokenActual(tok);
+    if (tok.type === "EOF") {
+        return calcError(
+            code,
+            message,
+            tok.pos,
+            0,
+            kind || "unexpected-eof",
+            {
+                actual,
+                insertionPoint: tok.pos,
+                hint: "Complete the expression before the end of the formula.",
+                ...(meta || {}),
+            },
+        );
+    }
+    const length = tok.value.length || 1;
+    return calcError(
+        code,
+        message,
+        tok.pos,
+        length,
+        kind || "unexpected-token",
+        {
+            actual,
+            tokenStart: tok.pos,
+            tokenEnd: tok.pos + length,
+            ...(meta || {}),
+        },
+    );
+}
+
+function expectedTokenError(type: string, tok: Token): CalcParseError {
+    const expected = tokenLabel(type);
+    const actual = tokenActual(tok);
+    const insertText = TOKEN_INSERT_TEXT[type] || expected;
+    const code = `calc.expected-${tokenCodePart(type)}${tok.type === "EOF" ? ".eof" : ""}`;
+    if (tok.type === "EOF") {
+        return calcError(
+            code,
+            `Missing '${expected}' before end of formula`,
+            tok.pos,
+            0,
+            "missing-token",
+            {
+                expected,
+                actual,
+                insertionPoint: tok.pos,
+                insertText,
+                hint: `Insert '${expected}' at the end of this expression.`,
+            },
+        );
+    }
+    return calcError(
+        code,
+        `Missing '${expected}' before '${actual}'`,
+        tok.pos,
+        0,
+        "missing-token",
+        {
+            expected,
+            actual,
+            insertionPoint: tok.pos,
+            insertText,
+            hint: `Insert '${expected}' before '${actual}'.`,
+        },
+    );
 }
 
 function isWhitespace(ch: string): boolean {
@@ -157,22 +296,43 @@ function normalizeFormula(raw: string): NormalizedText {
 function mapParseError(err: CalcParseError, normalized: NormalizedText): CalcParseError {
     const maxPos = normalized.text.length;
     const parserPos = Math.max(0, Math.min(err.pos, maxPos));
-    let pos = normalized.start + parserPos;
+    const pos = normalized.start + parserPos;
     let length = err.length ?? 1;
-
-    if (parserPos >= maxPos && maxPos > 0 && length <= 0) {
-        pos = normalized.start + maxPos - 1;
-        length = 1;
-    }
 
     const available = Math.max(0, normalized.end - pos);
     if (available > 0) {
-        length = Math.max(1, Math.min(length || 1, available));
+        length = length > 0 ? Math.max(1, Math.min(length, available)) : 0;
     } else {
         length = 0;
     }
 
-    return { code: err.code, message: err.message, pos, length };
+    const mapped: CalcParseError = {
+        ...err,
+        pos,
+        length,
+        parserPosition: parserPos,
+    };
+
+    if (err.tokenStart !== undefined) {
+        const tokenStart = Math.max(0, Math.min(err.tokenStart, maxPos));
+        mapped.tokenStart = normalized.start + tokenStart;
+    } else if (length > 0) {
+        mapped.tokenStart = pos;
+    }
+    if (err.tokenEnd !== undefined) {
+        const tokenEnd = Math.max(0, Math.min(err.tokenEnd, maxPos));
+        mapped.tokenEnd = normalized.start + tokenEnd;
+    } else if (length > 0) {
+        mapped.tokenEnd = pos + length;
+    }
+    if (err.insertionPoint !== undefined) {
+        const insertionPoint = Math.max(0, Math.min(err.insertionPoint, maxPos));
+        mapped.insertionPoint = normalized.start + insertionPoint;
+    } else if (length === 0 || err.kind === "missing-token" || err.kind === "unexpected-eof") {
+        mapped.insertionPoint = pos;
+    }
+
+    return mapped;
 }
 
 function tokenize(src: string): Token[] | CalcParseError {
@@ -196,10 +356,17 @@ function tokenize(src: string): Token[] | CalcParseError {
             const end = src.indexOf("'", i + 1);
             if (end === -1) {
                 return calcError(
-                    "unterminatedString",
-                    `Unterminated string literal at position ${i}`,
+                    "calc.unterminated-string",
+                    "Unterminated string literal",
                     i,
                     1,
+                    "unterminated-string",
+                    {
+                        actual: "'",
+                        tokenStart: i,
+                        tokenEnd: i + 1,
+                        hint: "Close the string with a single quote.",
+                    },
                 );
             }
             tokens.push({ type: "QUOTED", value: src.slice(i, end + 1), pos: i });
@@ -235,7 +402,18 @@ function tokenize(src: string): Token[] | CalcParseError {
             continue;
         }
 
-        return calcError("unexpectedCharacter", `Unexpected character '${ch}' at position ${i}`, i, 1);
+        return calcError(
+            "calc.unexpected-character",
+            `Unexpected character '${ch}'`,
+            i,
+            1,
+            "unexpected-character",
+            {
+                actual: ch,
+                tokenStart: i,
+                tokenEnd: i + 1,
+            },
+        );
     }
     tokens.push({ type: "EOF", value: "", pos: i });
     return tokens;
@@ -262,12 +440,7 @@ function check(st: ParseState, type: string): boolean { return peek(st).type ===
 
 function eat(st: ParseState, type: string): CalcParseError | null {
     if (!check(st, type)) {
-        const t = peek(st);
-        return tokenError(
-            "expectedToken",
-            `Expected '${type}' but got '${t.value || t.type}' at position ${t.pos}`,
-            t,
-        );
+        return expectedTokenError(type, peek(st));
     }
     advance(st);
     return null;
@@ -297,9 +470,10 @@ function parseCompare(st: ParseState): CalcParseError | null {
     let err = parseAdd(st);
     if (err) return err;
     const cmpOps = ["LT", "LE", "GT", "GE", "EQ", "NEQ"];
-    if (cmpOps.indexOf(peek(st).type) !== -1) {
+    while (cmpOps.indexOf(peek(st).type) !== -1) {
         advance(st);
-        return parseAdd(st);
+        err = parseAdd(st);
+        if (err) return err;
     }
     return null;
 }
@@ -375,8 +549,16 @@ function parsePrimary(st: ParseState): CalcParseError | null {
         return null;
     }
 
-    if (tok.type === "EOF") return tokenError("unexpectedEof", "Unexpected end of formula", tok);
-    return tokenError("unexpectedToken", `Unexpected token '${tok.value}' at position ${tok.pos}`, tok);
+    if (tok.type === "EOF") {
+        return tokenError(
+            "calc.unexpected-eof",
+            "Unexpected end of formula",
+            tok,
+            "unexpected-eof",
+            { expected: "expression" },
+        );
+    }
+    return tokenError("calc.unexpected-token", `Unexpected token '${tok.value}'`, tok);
 }
 
 function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null {
@@ -387,9 +569,14 @@ function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null 
         if (!check(st, "QUOTED")) {
             const t = peek(st);
             return tokenError(
-                "expectedQuotedArgument",
-                `Expected quoted string as first argument of '${funcName}()' at position ${t.pos}`,
+                "calc.expected-quoted-argument",
+                `Expected quoted string as first argument of '${funcName}()'`,
                 t,
+                "invalid-argument",
+                {
+                    expected: "quoted string",
+                    hint: `Wrap the first argument of '${funcName}()' in single quotes.`,
+                },
             );
         }
         const quotedTok = advance(st);
@@ -405,9 +592,14 @@ function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null 
             const t = peek(st);
             if (t.type !== "IDENT" && t.type !== "NUM") {
                 return tokenError(
-                    "expectedDotIdentifier",
-                    `Expected identifier after '.' in '${funcName}()' at position ${t.pos}`,
+                    "calc.expected-dot-identifier",
+                    `Expected identifier after '.' in '${funcName}()'`,
                     t,
+                    "invalid-parser-token",
+                    {
+                        expected: "identifier",
+                        hint: `Add an identifier after '.' in '${funcName}()'.`,
+                    },
                 );
             }
             dotIdents.push(advance(st));
@@ -544,7 +736,7 @@ function parseBBE(
     if (!check(st, "EOF")) {
         const t = peek(st);
         return mapParseError(
-            tokenError("unexpectedToken", `Unexpected token '${t.value}' at position ${t.pos}`, t),
+            tokenError("calc.unexpected-token", `Unexpected token '${t.value}'`, t),
             normalized,
         );
     }
@@ -552,6 +744,30 @@ function parseBBE(
 }
 
 // ─── validate ─────────────────────────────────────────────────────────────────
+
+function addDiagnosticData(
+    data: Record<string, string | number>,
+    key: string,
+    value: string | number | undefined,
+) {
+    if (value !== undefined) data[key] = value;
+}
+
+function calcDiagnosticData(err: CalcParseError): Record<string, string | number> {
+    const data: Record<string, string | number> = {
+        rule: "calcCheck",
+        kind: err.kind,
+    };
+    addDiagnosticData(data, "expected", err.expected);
+    addDiagnosticData(data, "actual", err.actual);
+    addDiagnosticData(data, "parserPosition", err.parserPosition);
+    addDiagnosticData(data, "insertionPoint", err.insertionPoint);
+    addDiagnosticData(data, "insertText", err.insertText);
+    addDiagnosticData(data, "tokenStart", err.tokenStart);
+    addDiagnosticData(data, "tokenEnd", err.tokenEnd);
+    addDiagnosticData(data, "hint", err.hint);
+    return data;
+}
 
 function validate(ctx: PluginContext): PluginDiagnostic[] {
     const scopeMap = BBE_FIELDS[ctx.file];
@@ -613,6 +829,8 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                         endCol:   c + err.pos + length,
                         severity: "error",
                         message:  `calcCheck: Invalid calc formula: ${err.message}`,
+                        code:     err.code,
+                        data:     calcDiagnosticData(err),
                     });
                 }
             }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Url};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url};
 
 use crate::document::DocumentData;
 use crate::runtime::{ScriptRuntime, WorkspaceFileSnapshot, WorkspaceIndex};
@@ -25,6 +25,10 @@ struct RawDiag {
     #[serde(default)]
     severity: String,
     message: String,
+    #[serde(default)]
+    code: Option<NumberOrString>,
+    #[serde(default)]
+    data: Option<Value>,
 }
 
 impl RawDiag {
@@ -52,8 +56,10 @@ impl RawDiag {
                 },
             },
             severity: Some(severity),
+            code: self.code,
             source: Some("vector-lsp/plugin".into()),
             message: self.message,
+            data: self.data,
             ..Default::default()
         }
     }
@@ -1074,10 +1080,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+    use serde_json::json;
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
     use super::{
-        PluginHost, build_context, build_hover_context, strip_ts_declarations, strip_typescript,
+        PluginHost, RawDiag, build_context, build_hover_context, strip_ts_declarations,
+        strip_typescript,
     };
     use crate::document::DocumentData;
     use crate::runtime::{WorkspaceFileSnapshot, build_workspace_index};
@@ -1410,6 +1418,33 @@ function validate(ctx: PluginContext): string[] {
         range(&diags[0])
     }
 
+    fn assert_code(diag: &Diagnostic, expected: &str) {
+        assert_eq!(
+            diag.code.as_ref(),
+            Some(&NumberOrString::String(expected.to_string()))
+        );
+    }
+
+    fn diag_data(diag: &Diagnostic) -> &serde_json::Value {
+        diag.data
+            .as_ref()
+            .expect("diagnostic should carry structured data")
+    }
+
+    fn data_str<'a>(diag: &'a Diagnostic, key: &str) -> &'a str {
+        diag_data(diag)
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("missing string data field {key}: {diag:#?}"))
+    }
+
+    fn data_u64(diag: &Diagnostic, key: &str) -> u64 {
+        diag_data(diag)
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| panic!("missing numeric data field {key}: {diag:#?}"))
+    }
+
     fn base_lookup_files() -> Vec<(&'static str, &'static str)> {
         vec![
             ("weapons", "code\tname\nhpot\tHealing Potion\n"),
@@ -1430,42 +1465,114 @@ function validate(ctx: PluginContext): string[] {
         files
     }
 
+    #[test]
+    fn raw_diag_preserves_optional_code_and_data() {
+        let raw: RawDiag = serde_json::from_value(json!({
+            "line": 3,
+            "col": 10,
+            "endCol": 10,
+            "severity": "error",
+            "message": "missing token",
+            "code": "calc.expected-rparen.eof",
+            "data": {
+                "rule": "calcCheck",
+                "kind": "missing-token",
+                "expected": ")",
+                "actual": "EOF",
+                "parserPosition": 33,
+                "insertionPoint": 33,
+                "insertText": ")"
+            }
+        }))
+        .expect("raw diagnostic should deserialize");
+
+        let diag = raw.into_lsp();
+        assert_eq!(range(&diag), (3, 10, 10));
+        assert_code(&diag, "calc.expected-rparen.eof");
+        assert_eq!(
+            diag.data,
+            Some(json!({
+                "rule": "calcCheck",
+                "kind": "missing-token",
+                "expected": ")",
+                "actual": "EOF",
+                "parserPosition": 33,
+                "insertionPoint": 33,
+                "insertText": ")"
+            }))
+        );
+    }
+
+    #[test]
+    fn raw_diag_still_accepts_plugins_without_code_or_data() {
+        let raw: RawDiag = serde_json::from_value(json!({
+            "line": 1,
+            "col": 2,
+            "message": "old plugin shape"
+        }))
+        .expect("legacy raw diagnostic should deserialize");
+
+        let diag = raw.into_lsp();
+        assert_eq!(range(&diag), (1, 2, 2));
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diag.code, None);
+        assert_eq!(diag.data, None);
+    }
+
     #[tokio::test]
     async fn calc_check_reports_narrow_parser_ranges() {
         let cases = [
+            (
+                "unexpected character at start",
+                "code\tlen\nr\t\"bad\n",
+                (1, 2, 3),
+                "Unexpected character '\"'",
+                "calc.unexpected-character",
+                "unexpected-character",
+            ),
             (
                 "unterminated string literal",
                 "code\tlen\nr\tskill('Fire\n",
                 (1, 8, 9),
                 "Unterminated string literal",
+                "calc.unterminated-string",
+                "unterminated-string",
             ),
             (
                 "unexpected token",
                 "code\tlen\nr\t1 + * 2\n",
                 (1, 6, 7),
                 "Unexpected token '*'",
+                "calc.unexpected-token",
+                "unexpected-token",
             ),
             (
                 "expected quoted argument",
                 "code\tlen\nr\tskill(1)\n",
                 (1, 8, 9),
                 "Expected quoted string",
+                "calc.expected-quoted-argument",
+                "invalid-argument",
             ),
             (
                 "leading whitespace mapping",
                 "code\tlen\nr\t  1 + * 2\n",
                 (1, 8, 9),
                 "Unexpected token '*'",
+                "calc.unexpected-token",
+                "unexpected-token",
             ),
             (
                 "outer quote mapping",
                 "code\tlen\nr\t\"1 + * 2\"\n",
                 (1, 7, 8),
                 "Unexpected token '*'",
+                "calc.unexpected-token",
+                "unexpected-token",
             ),
         ];
 
-        for (label, misc, expected, message) in cases {
+        for (label, misc, expected, message, code, kind) in cases {
             let fx = fixture(&[("misc", misc)]);
             let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
             assert_eq!(first_range(&diags), expected, "{label}");
@@ -1474,6 +1581,9 @@ function validate(ctx: PluginContext): string[] {
                 "{label}: human-readable message missing, got {:?}",
                 diags[0].message
             );
+            assert_code(&diags[0], code);
+            assert_eq!(data_str(&diags[0], "rule"), "calcCheck", "{label}");
+            assert_eq!(data_str(&diags[0], "kind"), kind, "{label}");
             assert!(
                 diags[0].range.end.character - diags[0].range.start.character < 3,
                 "{label}: diagnostic should stay narrow, got {:?}",
@@ -1483,11 +1593,154 @@ function validate(ctx: PluginContext): string[] {
     }
 
     #[tokio::test]
+    async fn calc_check_reports_eof_missing_tokens_as_insertion_points() {
+        let formula = "min(5,1+skill('Fire Ball'.blvl)/5";
+        let misc = format!("code\tlen\nr\t{formula}\n");
+        let fx = fixture(&[("misc", misc.as_str())]);
+        let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+        let insertion = 2 + formula.chars().count() as u32;
+
+        assert_eq!(first_range(&diags), (1, insertion, insertion));
+        assert!(
+            diags[0]
+                .message
+                .contains("Missing ')' before end of formula"),
+            "friendly EOF message missing: {:?}",
+            diags[0].message
+        );
+        assert_code(&diags[0], "calc.expected-rparen.eof");
+        assert_eq!(data_str(&diags[0], "kind"), "missing-token");
+        assert_eq!(data_str(&diags[0], "expected"), ")");
+        assert_eq!(data_str(&diags[0], "actual"), "EOF");
+        assert_eq!(data_str(&diags[0], "insertText"), ")");
+        assert_eq!(data_u64(&diags[0], "parserPosition"), formula.len() as u64);
+        assert_eq!(data_u64(&diags[0], "insertionPoint"), formula.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn calc_check_reports_other_expected_token_eof_as_insertion_point() {
+        let formula = "1 ? 2";
+        let misc = format!("code\tlen\nr\t{formula}\n");
+        let fx = fixture(&[("misc", misc.as_str())]);
+        let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+        let insertion = 2 + formula.chars().count() as u32;
+
+        assert_eq!(first_range(&diags), (1, insertion, insertion));
+        assert!(
+            diags[0]
+                .message
+                .contains("Missing ':' before end of formula"),
+            "friendly EOF message missing: {:?}",
+            diags[0].message
+        );
+        assert_code(&diags[0], "calc.expected-colon.eof");
+        assert_eq!(data_str(&diags[0], "kind"), "missing-token");
+        assert_eq!(data_str(&diags[0], "expected"), ":");
+        assert_eq!(data_str(&diags[0], "actual"), "EOF");
+        assert_eq!(data_str(&diags[0], "insertText"), ":");
+        assert_eq!(data_u64(&diags[0], "insertionPoint"), formula.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn calc_check_maps_missing_token_before_trailing_whitespace() {
+        let formula = "min(1, 2   ";
+        let trimmed_len = "min(1, 2".len();
+        let misc = format!("code\tlen\nr\t{formula}\n");
+        let fx = fixture(&[("misc", misc.as_str())]);
+        let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+        let insertion = 2 + trimmed_len as u32;
+
+        assert_eq!(first_range(&diags), (1, insertion, insertion));
+        assert_code(&diags[0], "calc.expected-rparen.eof");
+        assert_eq!(data_str(&diags[0], "kind"), "missing-token");
+        assert_eq!(data_u64(&diags[0], "parserPosition"), trimmed_len as u64);
+        assert_eq!(data_u64(&diags[0], "insertionPoint"), trimmed_len as u64);
+    }
+
+    #[tokio::test]
+    async fn calc_check_reports_unexpected_eof_as_insertion_point() {
+        let formula = "1 +";
+        let misc = format!("code\tlen\nr\t{formula}\n");
+        let fx = fixture(&[("misc", misc.as_str())]);
+        let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+        let insertion = 2 + formula.chars().count() as u32;
+
+        assert_eq!(first_range(&diags), (1, insertion, insertion));
+        assert!(diags[0].message.contains("Unexpected end of formula"));
+        assert_code(&diags[0], "calc.unexpected-eof");
+        assert_eq!(data_str(&diags[0], "kind"), "unexpected-eof");
+        assert_eq!(data_str(&diags[0], "expected"), "expression");
+        assert_eq!(data_str(&diags[0], "actual"), "EOF");
+        assert_eq!(data_u64(&diags[0], "insertionPoint"), formula.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn calc_check_reports_expected_quoted_argument_metadata() {
+        let fx = fixture(&[("misc", "code\tlen\nr\tskill(1)\n")]);
+        let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+
+        assert_eq!(first_range(&diags), (1, 8, 9));
+        assert_code(&diags[0], "calc.expected-quoted-argument");
+        assert_eq!(data_str(&diags[0], "kind"), "invalid-argument");
+        assert_eq!(data_str(&diags[0], "expected"), "quoted string");
+        assert_eq!(data_str(&diags[0], "actual"), "1");
+        assert_eq!(data_u64(&diags[0], "tokenStart"), 6);
+        assert_eq!(data_u64(&diags[0], "tokenEnd"), 7);
+    }
+
+    #[tokio::test]
     async fn calc_check_maps_offsets_after_non_ascii_text() {
         let fx = fixture(&[("misc", "code\tlen\nr\tskill('한', 1 + * 2)\n")]);
         let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
         assert_eq!(first_range(&diags), (1, 17, 18));
         assert!(diags[0].message.contains("Unexpected token '*'"));
+        assert_code(&diags[0], "calc.unexpected-token");
+        assert_eq!(data_str(&diags[0], "kind"), "unexpected-token");
+        assert_eq!(data_u64(&diags[0], "tokenStart"), 15);
+        assert_eq!(data_u64(&diags[0], "tokenEnd"), 16);
+    }
+
+    #[tokio::test]
+    async fn calc_check_accepts_existing_valid_formula_without_diagnostics() {
+        let fx = fixture(&[("misc", "code\tlen\nr\tmin(1, 2)\n")]);
+        let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "valid formula should stay clean: {diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn calc_check_accepts_stock_monpet_comparison_sum_formula() {
+        let formula = "((100-hpct)/((elte==1+elte==4)?20:((elte==2)?10:5)))";
+        let fx = fixture(&[
+            ("moncalc", "code\nhpct\nelte\n"),
+            ("monpet", &format!("id\tcalc1\nwolf\t{formula}\n")),
+        ]);
+        let diags = run_plugin("calcCheck.ts", "monpet", &fx).await;
+
+        assert!(
+            diags.is_empty(),
+            "stock monpet formula should be valid: {diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn calc_check_accepts_comparison_terms_in_arithmetic_expressions() {
+        let fx = fixture(&[
+            ("moncalc", "code\nelte\nhpct\n"),
+            (
+                "monpet",
+                "id\tcalc1\tcalc2\tcalc3\n\
+                 wolf\telte==1+elte==4\t100-(elte==1+elte==4)\t(elte==1+elte==4)?20:5\n",
+            ),
+        ]);
+        let diags = run_plugin("calcCheck.ts", "monpet", &fx).await;
+
+        assert!(
+            diags.is_empty(),
+            "comparison-plus-comparison formulas should be valid: {diags:#?}"
+        );
     }
 
     #[tokio::test]

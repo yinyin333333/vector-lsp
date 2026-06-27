@@ -50,6 +50,21 @@ interface PluginDiagnostic {
     /** Defaults to `"warning"`. */
     severity?: "error" | "warning" | "info" | "hint";
     message: string;
+    /** Optional machine-readable diagnostic code forwarded to LSP clients. */
+    code?: string | number;
+    /** Optional structured diagnostic metadata forwarded to LSP clients. */
+    data?: {
+        rule?: string;
+        kind?: string;
+        expected?: string;
+        actual?: string;
+        parserPosition?: number;
+        insertionPoint?: number;
+        insertText?: string;
+        tokenStart?: number;
+        tokenEnd?: number;
+        hint?: string;
+    };
 }
 
 // ---------------------------------------------------------------------------
