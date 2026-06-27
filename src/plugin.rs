@@ -1070,7 +1070,17 @@ fn strip_ts_declarations(src: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ts_declarations, strip_typescript};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+
+    use super::{
+        PluginHost, build_context, build_hover_context, strip_ts_declarations, strip_typescript,
+    };
+    use crate::document::DocumentData;
+    use crate::runtime::{WorkspaceFileSnapshot, build_workspace_index};
 
     // --- Structural (pass 1) -------------------------------------------------
 
@@ -1331,5 +1341,333 @@ function validate(ctx: PluginContext): string[] {
             !out.contains(": string"),
             "no type annotation left, got: {out}"
         );
+    }
+
+    struct PluginFixture {
+        docs: HashMap<String, Arc<DocumentData>>,
+        index: Arc<crate::runtime::WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
+    }
+
+    fn plugin_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc")
+            .join("plugins")
+            .join(name)
+    }
+
+    fn fixture(files: &[(&str, &str)]) -> PluginFixture {
+        let mut docs = HashMap::new();
+        let mut file_cache = HashMap::new();
+        for (stem, text) in files {
+            let doc = Arc::new(DocumentData::parse(text, '\t'));
+            file_cache.insert(PathBuf::from(format!("{stem}.txt")), Arc::clone(&doc));
+            docs.insert((*stem).to_string(), doc);
+        }
+
+        let open_docs = HashMap::new();
+        let index = build_workspace_index(&open_docs, &file_cache);
+        let mut snapshot = WorkspaceFileSnapshot::new();
+        for (path, doc) in &file_cache {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                snapshot.files.insert(stem.to_lowercase(), Arc::clone(doc));
+            }
+        }
+
+        PluginFixture {
+            docs,
+            index,
+            snapshot: Arc::new(snapshot),
+        }
+    }
+
+    async fn run_plugin(plugin_name: &str, file: &str, fx: &PluginFixture) -> Vec<Diagnostic> {
+        let host = PluginHost::new(vec![plugin_path(plugin_name)]);
+        let doc = fx.docs.get(file).expect("test document should exist");
+        host.run(
+            build_context(file, doc),
+            Arc::clone(&fx.index),
+            Arc::clone(&fx.snapshot),
+        )
+        .await
+    }
+
+    fn range(diag: &Diagnostic) -> (u32, u32, u32) {
+        (
+            diag.range.start.line,
+            diag.range.start.character,
+            diag.range.end.character,
+        )
+    }
+
+    fn first_range(diags: &[Diagnostic]) -> (u32, u32, u32) {
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one diagnostic, got {diags:#?}"
+        );
+        range(&diags[0])
+    }
+
+    fn base_lookup_files() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("weapons", "code\tname\nhpot\tHealing Potion\n"),
+            ("armor", "code\tname\ncap\tCap\n"),
+            ("misc", "code\tname\nkey\tKey\n"),
+            (
+                "itemtypes",
+                "Code\tTreasureClass\tItemType\nweap\t1\tWeapon\narmo\t1\tArmor\n",
+            ),
+            ("uniqueitems", "index\nThe Gnasher\n"),
+            ("setitems", "index\nHsarus' Iron Heel\n"),
+        ]
+    }
+
+    fn with_base_files(primary: (&'static str, &'static str)) -> Vec<(&'static str, &'static str)> {
+        let mut files = base_lookup_files();
+        files.push(primary);
+        files
+    }
+
+    #[tokio::test]
+    async fn calc_check_reports_narrow_parser_ranges() {
+        let cases = [
+            (
+                "unterminated string literal",
+                "code\tlen\nr\tskill('Fire\n",
+                (1, 8, 9),
+                "Unterminated string literal",
+            ),
+            (
+                "unexpected token",
+                "code\tlen\nr\t1 + * 2\n",
+                (1, 6, 7),
+                "Unexpected token '*'",
+            ),
+            (
+                "expected quoted argument",
+                "code\tlen\nr\tskill(1)\n",
+                (1, 8, 9),
+                "Expected quoted string",
+            ),
+            (
+                "leading whitespace mapping",
+                "code\tlen\nr\t  1 + * 2\n",
+                (1, 8, 9),
+                "Unexpected token '*'",
+            ),
+            (
+                "outer quote mapping",
+                "code\tlen\nr\t\"1 + * 2\"\n",
+                (1, 7, 8),
+                "Unexpected token '*'",
+            ),
+        ];
+
+        for (label, misc, expected, message) in cases {
+            let fx = fixture(&[("misc", misc)]);
+            let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+            assert_eq!(first_range(&diags), expected, "{label}");
+            assert!(
+                diags[0].message.contains(message),
+                "{label}: human-readable message missing, got {:?}",
+                diags[0].message
+            );
+            assert!(
+                diags[0].range.end.character - diags[0].range.start.character < 3,
+                "{label}: diagnostic should stay narrow, got {:?}",
+                range(&diags[0])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn calc_check_maps_offsets_after_non_ascii_text() {
+        let fx = fixture(&[("misc", "code\tlen\nr\tskill('한', 1 + * 2)\n")]);
+        let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+        assert_eq!(first_range(&diags), (1, 17, 18));
+        assert!(diags[0].message.contains("Unexpected token '*'"));
+    }
+
+    #[tokio::test]
+    async fn cube_input_check_reports_token_ranges() {
+        let cases = [
+            (
+                "invalid base",
+                "desc\tinput 1\nr\tbadbase,qty=1\n",
+                (1, 2, 9),
+                "not a valid cubemain input",
+            ),
+            (
+                "invalid modifier key",
+                "desc\tinput 1\nr\thpot,foo=1\n",
+                (1, 7, 10),
+                "Unknown parameterized modifier",
+            ),
+            (
+                "invalid modifier value",
+                "desc\tinput 1\nr\thpot,qty=abc\n",
+                (1, 11, 14),
+                "requires a non-negative integer",
+            ),
+            (
+                "missing modifier value",
+                "desc\tinput 1\nr\thpot,qty=\n",
+                (1, 10, 11),
+                "requires a non-negative integer",
+            ),
+            (
+                "quoted input",
+                "desc\tinput 1\nr\t\"hpot,qty=abc\"\n",
+                (1, 12, 15),
+                "requires a non-negative integer",
+            ),
+        ];
+
+        for (label, cubemain, expected, message) in cases {
+            let files = with_base_files(("cubemain", cubemain));
+            let fx = fixture(&files);
+            let diags = run_plugin("cubeInputCheck.ts", "cubemain", &fx).await;
+            assert_eq!(first_range(&diags), expected, "{label}");
+            assert!(
+                diags[0].message.contains(message),
+                "{label}: message mismatch: {:?}",
+                diags[0].message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cube_input_check_keeps_incomplete_workspace_guard_and_disabled_rows() {
+        let fx = fixture(&[("cubemain", "desc\tinput 1\nr\tbadbase\n")]);
+        let diags = run_plugin("cubeInputCheck.ts", "cubemain", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "incomplete lookup evidence should not flag invalid bases: {diags:#?}"
+        );
+
+        let files = with_base_files(("cubemain", "desc\tinput 1\n*disabled\tbadbase\n"));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeInputCheck.ts", "cubemain", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "disabled rows should stay ignored: {diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tc_item_check_reports_token_ranges() {
+        let cases = [
+            (
+                "invalid base",
+                "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nAct 1\t1\t0\tbaditem,mul=1280\t1\n",
+                (1, 10, 17),
+                "not a valid item code",
+            ),
+            (
+                "invalid modifier key",
+                "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nAct 1\t1\t0\thpot,zz=1\t1\n",
+                (1, 15, 17),
+                "Unknown modifier key",
+            ),
+            (
+                "missing modifier value",
+                "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nAct 1\t1\t0\thpot,mul=\t1\n",
+                (1, 18, 19),
+                "Missing value",
+            ),
+            (
+                "quoted modifier",
+                "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nAct 1\t1\t0\t\"hpot,zz=1\"\t1\n",
+                (1, 16, 18),
+                "Unknown modifier key",
+            ),
+            (
+                "forward reference",
+                "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nFirst\t1\t0\tLater\t1\nLater\t1\t0\thpot\t1\n",
+                (1, 10, 15),
+                "defined at or below",
+            ),
+        ];
+
+        for (label, treasureclassex, expected, message) in cases {
+            let files = with_base_files(("treasureclassex", treasureclassex));
+            let fx = fixture(&files);
+            let diags = run_plugin("tcItemCheck.ts", "treasureclassex", &fx).await;
+            assert_eq!(first_range(&diags), expected, "{label}");
+            assert!(
+                diags[0].message.contains(message),
+                "{label}: message mismatch: {:?}",
+                diags[0].message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tc_item_check_keeps_incomplete_workspace_guard() {
+        let fx = fixture(&[(
+            "treasureclassex",
+            "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nAct 1\t1\t0\tbaditem\t1\n",
+        )]);
+        let diags = run_plugin("tcItemCheck.ts", "treasureclassex", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "incomplete lookup evidence should not flag invalid bases: {diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_input_hover_and_definition_still_use_the_base_token() {
+        let files = with_base_files(("cubemain", "desc\tinput 1\nr\thpot,qty=3\n"));
+        let fx = fixture(&files);
+        let host = PluginHost::new(vec![plugin_path("cubeInputCheck.ts")]);
+        let doc = fx.docs.get("cubemain").expect("cubemain fixture");
+        let ctx = build_hover_context("cubemain", "input 1", "hpot,qty=3", 1, doc);
+
+        let hover = host
+            .hover(ctx.clone(), Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("hover content");
+        assert!(
+            hover.contains("hpot"),
+            "hover should name the base: {hover}"
+        );
+        assert!(
+            hover.contains("Quantity: 3"),
+            "hover should include modifier text: {hover}"
+        );
+
+        let target = host
+            .goto_definition(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("definition target");
+        assert_eq!(
+            target,
+            (
+                "weapons".to_string(),
+                "code".to_string(),
+                "hpot".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn single_token_item_and_prop_checks_still_cover_the_cell() {
+        let item_files = with_base_files(("uniqueitems", "index\tcode\nUnique Bad\tbad\n"));
+        let fx = fixture(&item_files);
+        let diags = run_plugin("itemCodeCheck.ts", "uniqueitems", &fx).await;
+        assert_eq!(first_range(&diags), (1, 11, 14));
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+
+        let prop_files = vec![
+            ("cubemain", "desc\tmod 1\nr\tbadprop\n"),
+            ("properties", "code\nvalidprop\n"),
+            ("propertygroups", "code\nvalidgroup\n"),
+        ];
+        let fx = fixture(&prop_files);
+        let diags = run_plugin("propCodeCheck.ts", "cubemain", &fx).await;
+        assert_eq!(first_range(&diags), (1, 2, 9));
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 }

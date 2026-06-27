@@ -112,7 +112,70 @@ interface Token {
     pos: number;
 }
 
-function tokenize(src: string): Token[] | string {
+interface CalcParseError {
+    code: string;
+    message: string;
+    pos: number;
+    length?: number;
+}
+
+interface NormalizedText {
+    text: string;
+    start: number;
+    end: number;
+}
+
+function calcError(code: string, message: string, pos: number, length?: number): CalcParseError {
+    return { code, message, pos, length };
+}
+
+function tokenError(code: string, message: string, tok: Token): CalcParseError {
+    if (tok.type === "EOF" && tok.pos > 0) {
+        return calcError(code, message, tok.pos - 1, 1);
+    }
+    return calcError(code, message, tok.pos, tok.value.length || 1);
+}
+
+function isWhitespace(ch: string): boolean {
+    return /\s/.test(ch);
+}
+
+function trimSpan(raw: string, start: number, end: number): NormalizedText {
+    while (start < end && isWhitespace(raw[start])) start++;
+    while (end > start && isWhitespace(raw[end - 1])) end--;
+    return { text: raw.slice(start, end), start, end };
+}
+
+function normalizeFormula(raw: string): NormalizedText {
+    let span = trimSpan(raw, 0, raw.length);
+    if (span.text.length >= 2 && span.text[0] === '"' && span.text[span.text.length - 1] === '"') {
+        span = trimSpan(raw, span.start + 1, span.end - 1);
+    }
+    return span;
+}
+
+function mapParseError(err: CalcParseError, normalized: NormalizedText): CalcParseError {
+    const maxPos = normalized.text.length;
+    const parserPos = Math.max(0, Math.min(err.pos, maxPos));
+    let pos = normalized.start + parserPos;
+    let length = err.length ?? 1;
+
+    if (parserPos >= maxPos && maxPos > 0 && length <= 0) {
+        pos = normalized.start + maxPos - 1;
+        length = 1;
+    }
+
+    const available = Math.max(0, normalized.end - pos);
+    if (available > 0) {
+        length = Math.max(1, Math.min(length || 1, available));
+    } else {
+        length = 0;
+    }
+
+    return { code: err.code, message: err.message, pos, length };
+}
+
+function tokenize(src: string): Token[] | CalcParseError {
     const tokens: Token[] = [];
     let i = 0;
     while (i < src.length) {
@@ -131,7 +194,14 @@ function tokenize(src: string): Token[] | string {
         // Single-quoted string (skill / missile / stat / condition names)
         if (ch === "'") {
             const end = src.indexOf("'", i + 1);
-            if (end === -1) return `Unterminated string literal at position ${i}`;
+            if (end === -1) {
+                return calcError(
+                    "unterminatedString",
+                    `Unterminated string literal at position ${i}`,
+                    i,
+                    1,
+                );
+            }
             tokens.push({ type: "QUOTED", value: src.slice(i, end + 1), pos: i });
             i = end + 1;
             continue;
@@ -165,7 +235,7 @@ function tokenize(src: string): Token[] | string {
             continue;
         }
 
-        return `Unexpected character '${ch}' at position ${i}`;
+        return calcError("unexpectedCharacter", `Unexpected character '${ch}' at position ${i}`, i, 1);
     }
     tokens.push({ type: "EOF", value: "", pos: i });
     return tokens;
@@ -190,10 +260,14 @@ function peek(st: ParseState): Token { return st.tokens[st.pos]; }
 function advance(st: ParseState): Token { return st.tokens[st.pos++]; }
 function check(st: ParseState, type: string): boolean { return peek(st).type === type; }
 
-function eat(st: ParseState, type: string): string | null {
+function eat(st: ParseState, type: string): CalcParseError | null {
     if (!check(st, type)) {
         const t = peek(st);
-        return `Expected '${type}' but got '${t.value || t.type}' at position ${t.pos}`;
+        return tokenError(
+            "expectedToken",
+            `Expected '${type}' but got '${t.value || t.type}' at position ${t.pos}`,
+            t,
+        );
     }
     advance(st);
     return null;
@@ -201,11 +275,11 @@ function eat(st: ParseState, type: string): string | null {
 
 // ─── Grammar ──────────────────────────────────────────────────────────────────
 
-function parseExpr(st: ParseState): string | null {
+function parseExpr(st: ParseState): CalcParseError | null {
     return parseTernary(st);
 }
 
-function parseTernary(st: ParseState): string | null {
+function parseTernary(st: ParseState): CalcParseError | null {
     let err = parseCompare(st);
     if (err) return err;
     if (check(st, "QUESTION")) {
@@ -219,7 +293,7 @@ function parseTernary(st: ParseState): string | null {
     return null;
 }
 
-function parseCompare(st: ParseState): string | null {
+function parseCompare(st: ParseState): CalcParseError | null {
     let err = parseAdd(st);
     if (err) return err;
     const cmpOps = ["LT", "LE", "GT", "GE", "EQ", "NEQ"];
@@ -230,7 +304,7 @@ function parseCompare(st: ParseState): string | null {
     return null;
 }
 
-function parseAdd(st: ParseState): string | null {
+function parseAdd(st: ParseState): CalcParseError | null {
     let err = parseMul(st);
     if (err) return err;
     while (check(st, "PLUS") || check(st, "MINUS")) {
@@ -241,7 +315,7 @@ function parseAdd(st: ParseState): string | null {
     return null;
 }
 
-function parseMul(st: ParseState): string | null {
+function parseMul(st: ParseState): CalcParseError | null {
     let err = parsePower(st);
     if (err) return err;
     while (check(st, "STAR") || check(st, "SLASH") || check(st, "PCT")) {
@@ -252,7 +326,7 @@ function parseMul(st: ParseState): string | null {
     return null;
 }
 
-function parsePower(st: ParseState): string | null {
+function parsePower(st: ParseState): CalcParseError | null {
     let err = parseUnary(st);
     if (err) return err;
     if (check(st, "CARET")) {
@@ -262,12 +336,12 @@ function parsePower(st: ParseState): string | null {
     return null;
 }
 
-function parseUnary(st: ParseState): string | null {
+function parseUnary(st: ParseState): CalcParseError | null {
     if (check(st, "MINUS")) { advance(st); return parseUnary(st); }
     return parsePrimary(st);
 }
 
-function parsePrimary(st: ParseState): string | null {
+function parsePrimary(st: ParseState): CalcParseError | null {
     const tok = peek(st);
 
     if (tok.type === "NUM") { advance(st); return null; }
@@ -291,39 +365,52 @@ function parsePrimary(st: ParseState): string | null {
         }
         // Bare identifier: validate against scope when at the top-level expression.
         if (st.funcDepth === 0 && st.scopeIds !== null && !st.scopeIds.has(tok.value)) {
-            return `Unknown identifier '${tok.value}' for this BBE scope`;
+            return calcError(
+                "unknownIdentifier",
+                `Unknown identifier '${tok.value}' for this BBE scope`,
+                tok.pos,
+                tok.value.length,
+            );
         }
         return null;
     }
 
-    if (tok.type === "EOF") return `Unexpected end of formula`;
-    return `Unexpected token '${tok.value}' at position ${tok.pos}`;
+    if (tok.type === "EOF") return tokenError("unexpectedEof", "Unexpected end of formula", tok);
+    return tokenError("unexpectedToken", `Unexpected token '${tok.value}' at position ${tok.pos}`, tok);
 }
 
-function parseFuncArgs(st: ParseState, funcName: string): string | null {
+function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null {
     if (check(st, "RPAREN")) return null; // zero-arg (defensive)
 
     if (QUOTED_ARG_FUNCS[funcName] || check(st, "QUOTED")) {
         // Quoted-string style: QUOTED ('.' (IDENT | NUM))* (',' expr)?
         if (!check(st, "QUOTED")) {
             const t = peek(st);
-            return `Expected quoted string as first argument of '${funcName}()' at position ${t.pos}`;
+            return tokenError(
+                "expectedQuotedArgument",
+                `Expected quoted string as first argument of '${funcName}()' at position ${t.pos}`,
+                t,
+            );
         }
         const quotedTok = advance(st);
         const quotedVal = quotedTok.value.slice(1, -1); // strip surrounding ' '
 
-        const nameErr = validateQuotedName(funcName, quotedVal);
+        const nameErr = validateQuotedName(funcName, quotedVal, quotedTok);
         if (nameErr) return nameErr;
 
         // Collect dot-separated identifiers / numbers
-        const dotIdents: string[] = [];
+        const dotIdents: Token[] = [];
         while (check(st, "DOT")) {
             advance(st); // consume '.'
             const t = peek(st);
             if (t.type !== "IDENT" && t.type !== "NUM") {
-                return `Expected identifier after '.' in '${funcName}()' at position ${t.pos}`;
+                return tokenError(
+                    "expectedDotIdentifier",
+                    `Expected identifier after '.' in '${funcName}()' at position ${t.pos}`,
+                    t,
+                );
             }
-            dotIdents.push(advance(st).value);
+            dotIdents.push(advance(st));
         }
 
         const dotErr = validateDotIdents(funcName, dotIdents, st);
@@ -352,49 +439,74 @@ function parseFuncArgs(st: ParseState, funcName: string): string | null {
 
 // ─── Function argument validation ─────────────────────────────────────────────
 
-function validateQuotedName(funcName: string, name: string): string | null {
+function validateQuotedName(funcName: string, name: string, tok: Token): CalcParseError | null {
     if (funcName === "skill" || funcName === "sksrc" || funcName === "sklvl") {
         if (hasFile("skills") && !lookupKey("skills", "skill", name)) {
-            return `Unknown skill '${name}'`;
+            return calcError("unknownSkill", `Unknown skill '${name}'`, tok.pos, tok.value.length);
         }
     } else if (funcName === "miss") {
         if (hasFile("missiles") && !lookupKey("missiles", "Missile", name)) {
-            return `Unknown missile '${name}'`;
+            return calcError("unknownMissile", `Unknown missile '${name}'`, tok.pos, tok.value.length);
         }
     } else if (funcName === "stat") {
         if (hasFile("itemstatcost") && !lookupKey("itemstatcost", "Stat", name)) {
-            return `Unknown stat '${name}'`;
+            return calcError("unknownStat", `Unknown stat '${name}'`, tok.pos, tok.value.length);
         }
     } else if (funcName === "cond") {
         if (!VALID_COND_NAMES[name]) {
-            return `Unknown condition '${name}'`;
+            return calcError("unknownCondition", `Unknown condition '${name}'`, tok.pos, tok.value.length);
         }
     }
     return null;
 }
 
-function validateDotIdents(funcName: string, idents: string[], st: ParseState): string | null {
+function validateDotIdents(funcName: string, idents: Token[], st: ParseState): CalcParseError | null {
     if (funcName === "skill" || funcName === "sksrc") {
-        if (idents.length >= 1 && st.skillIds.size > 0 && !st.skillIds.has(idents[0])) {
-            return `Unknown skill identifier '${idents[0]}'`;
+        if (idents.length >= 1 && st.skillIds.size > 0 && !st.skillIds.has(idents[0].value)) {
+            return calcError(
+                "unknownSkillIdentifier",
+                `Unknown skill identifier '${idents[0].value}'`,
+                idents[0].pos,
+                idents[0].value.length,
+            );
         }
     } else if (funcName === "miss") {
-        if (idents.length >= 1 && st.missIds.size > 0 && !st.missIds.has(idents[0])) {
-            return `Unknown missile identifier '${idents[0]}'`;
+        if (idents.length >= 1 && st.missIds.size > 0 && !st.missIds.has(idents[0].value)) {
+            return calcError(
+                "unknownMissileIdentifier",
+                `Unknown missile identifier '${idents[0].value}'`,
+                idents[0].pos,
+                idents[0].value.length,
+            );
         }
     } else if (funcName === "stat") {
-        if (idents.length >= 1 && !STAT_PARAMS[idents[0]]) {
-            return `Invalid stat parameter '${idents[0]}' (expected accr, base, or mod)`;
+        if (idents.length >= 1 && !STAT_PARAMS[idents[0].value]) {
+            return calcError(
+                "invalidStatParameter",
+                `Invalid stat parameter '${idents[0].value}' (expected accr, base, or mod)`,
+                idents[0].pos,
+                idents[0].value.length,
+            );
         }
     } else if (funcName === "sklvl") {
         // First dot-ident: current-scope identifier (level source)
         if (idents.length >= 1 && st.scopeIds !== null && st.scopeIds.size > 0
-                && !st.scopeIds.has(idents[0])) {
-            return `Unknown scope identifier '${idents[0]}' as level in sklvl()`;
+                && !st.scopeIds.has(idents[0].value)) {
+            return calcError(
+                "unknownScopeIdentifier",
+                `Unknown scope identifier '${idents[0].value}' as level in sklvl()`,
+                idents[0].pos,
+                idents[0].value.length,
+            );
         }
         // Second dot-ident: skill-scope identifier
-        if (idents.length >= 2 && st.skillIds.size > 0 && !st.skillIds.has(idents[1])) {
-            return `Unknown skill identifier '${idents[1]}' in sklvl()`;
+        if (idents.length >= 2 && st.skillIds.size > 0 && !st.skillIds.has(idents[1].value)) {
+            return calcError(
+                "unknownSkillIdentifier",
+                `Unknown skill identifier '${idents[1].value}' in sklvl()`,
+                idents[1].pos,
+                idents[1].value.length,
+            );
         }
     }
     return null;
@@ -413,16 +525,14 @@ function parseBBE(
     scopeIds: Set<string> | null,
     skillIds: Set<string>,
     missIds: Set<string>,
-): string | null {
+): CalcParseError | null {
     // Strip outer double-quotes that some editors wrap around cell formulas.
-    let src = raw.trim();
-    if (src.length >= 2 && src[0] === '"' && src[src.length - 1] === '"') {
-        src = src.slice(1, -1).trim();
-    }
+    const normalized = normalizeFormula(raw);
+    const src = normalized.text;
     if (!src) return null;
 
     const result = tokenize(src);
-    if (typeof result === "string") return result;
+    if (!Array.isArray(result)) return mapParseError(result, normalized);
 
     const st: ParseState = {
         tokens: result, pos: 0,
@@ -430,10 +540,13 @@ function parseBBE(
         funcDepth: 0,
     };
     const err = parseExpr(st);
-    if (err) return err;
+    if (err) return mapParseError(err, normalized);
     if (!check(st, "EOF")) {
         const t = peek(st);
-        return `Unexpected token '${t.value}' at position ${t.pos}`;
+        return mapParseError(
+            tokenError("unexpectedToken", `Unexpected token '${t.value}' at position ${t.pos}`, t),
+            normalized,
+        );
     }
     return null;
 }
@@ -493,12 +606,13 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                 const err = parseBBE(val, scopeIds, skillIds, missIds);
                 if (err) {
                     const c = row.__colstarts[col] ?? 0;
+                    const length = err.length ?? 1;
                     diags.push({
                         line:     row.__line,
-                        col:      c,
-                        endCol:   c + val.length,
+                        col:      c + err.pos,
+                        endCol:   c + err.pos + length,
                         severity: "error",
-                        message:  `calcCheck: Invalid calc formula: ${err}`,
+                        message:  `calcCheck: Invalid calc formula: ${err.message}`,
                     });
                 }
             }
