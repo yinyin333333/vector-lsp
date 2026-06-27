@@ -23,10 +23,88 @@ const VALID_MOD_KEYS: Record<string, true> = {
     cm: true, ce: true, cg: true, ma: true, mg: true,
 };
 
+interface TextSpan {
+    text: string;
+    start: number;
+    end: number;
+}
+
+interface ModifierSpan {
+    text: string;
+    start: number;
+    end: number;
+    key?: TextSpan;
+    value?: TextSpan;
+    equals?: TextSpan;
+}
+
+interface ParsedItemWithSpans {
+    base: TextSpan;
+    modifiers: ModifierSpan[];
+}
+
+interface ItemValidationError {
+    message: string;
+    span: TextSpan;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 // Split "BASE,key=val,key=val" → [base, "key=val,key=val"].
 // Only splits when what follows the first comma looks like a modifier.
+function isWhitespace(ch: string): boolean {
+    return /\s/.test(ch);
+}
+
+function trimTextSpan(raw: string, start: number, end: number): TextSpan {
+    while (start < end && isWhitespace(raw[start])) start++;
+    while (end > start && isWhitespace(raw[end - 1])) end--;
+    return { text: raw.slice(start, end), start, end };
+}
+
+function normalizeItemSpan(raw: string): TextSpan {
+    let span = trimTextSpan(raw, 0, raw.length);
+    if (span.text.length >= 2 && span.text[0] === '"' && span.text[span.text.length - 1] === '"') {
+        span = trimTextSpan(raw, span.start + 1, span.end - 1);
+    }
+    return span;
+}
+
+function splitCommaSpans(raw: string, span: TextSpan): TextSpan[] {
+    const parts: TextSpan[] = [];
+    let start = span.start;
+    for (let i = span.start; i < span.end; i++) {
+        if (raw[i] === ",") {
+            parts.push(trimTextSpan(raw, start, i));
+            start = i + 1;
+        }
+    }
+    parts.push(trimTextSpan(raw, start, span.end));
+    return parts;
+}
+
+function parseModifierSpan(raw: string, span: TextSpan): ModifierSpan {
+    const eq = span.text.indexOf("=");
+    if (eq === -1) {
+        return { text: span.text, start: span.start, end: span.end };
+    }
+    const eqStart = span.start + eq;
+    return {
+        text: span.text,
+        start: span.start,
+        end: span.end,
+        key: trimTextSpan(raw, span.start, eqStart),
+        value: trimTextSpan(raw, eqStart + 1, span.end),
+        equals: { text: "=", start: eqStart, end: eqStart + 1 },
+    };
+}
+
+function nonEmptySpan(span: TextSpan): TextSpan {
+    if (span.end > span.start) return span;
+    if (span.start > 0) return { text: "", start: span.start - 1, end: span.start };
+    return { text: "", start: span.start, end: span.end };
+}
+
 function splitModifiers(raw: string): [string, string] {
     const idx = raw.indexOf(",");
     if (idx !== -1) {
@@ -39,16 +117,46 @@ function splitModifiers(raw: string): [string, string] {
     return [raw.trim(), ""];
 }
 
-function validateModifiers(modsStr: string): string | null {
-    for (const part of modsStr.split(",")) {
-        const eq = part.indexOf("=");
-        if (eq === -1) return `Invalid modifier '${part}' (expected key=value)`;
-        const key = part.slice(0, eq).trim();
-        const val = part.slice(eq + 1).trim();
-        if (!VALID_MOD_KEYS[key]) {
-            return `Unknown modifier key '${key}' (valid: mul, cu, cs, cr, cm, ce, cg, ma, mg)`;
+function parseItemWithSpans(raw: string): ParsedItemWithSpans {
+    const normalized = normalizeItemSpan(raw);
+    const comma = normalized.text.indexOf(",");
+    if (comma !== -1) {
+        const commaStart = normalized.start + comma;
+        const after = raw.slice(commaStart + 1, normalized.end);
+        if (/^[a-z]+=/.test(after)) {
+            const base = trimTextSpan(raw, normalized.start, commaStart);
+            const modsSpan = { text: after, start: commaStart + 1, end: normalized.end };
+            return {
+                base,
+                modifiers: splitCommaSpans(raw, modsSpan).map((m) => parseModifierSpan(raw, m)),
+            };
         }
-        if (!val) return `Missing value for modifier '${key}'`;
+    }
+    return { base: normalized, modifiers: [] };
+}
+
+function validateModifiers(modifiers: ModifierSpan[]): ItemValidationError | null {
+    for (const mod of modifiers) {
+        if (!mod.key || !mod.value || !mod.equals) {
+            return {
+                message: `Invalid modifier '${mod.text}' (expected key=value)`,
+                span: nonEmptySpan({ text: mod.text, start: mod.start, end: mod.end }),
+            };
+        }
+        const key = mod.key.text;
+        const val = mod.value.text;
+        if (!VALID_MOD_KEYS[key]) {
+            return {
+                message: `Unknown modifier key '${key}' (valid: mul, cu, cs, cr, cm, ce, cg, ma, mg)`,
+                span: nonEmptySpan(mod.key),
+            };
+        }
+        if (!val) {
+            return {
+                message: `Missing value for modifier '${key}'`,
+                span: mod.equals,
+            };
+        }
     }
     return null;
 }
@@ -114,7 +222,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
             if (!raw || !raw.trim()) continue;
 
             const err = validateItem(
-                raw.trim(), row.__line,
+                raw, row.__line,
                 tcLineMap, autoTcCodes,
                 hasWeapons, hasArmor, hasMisc, hasUnique, hasSetitems, canProveExternalItemInvalid,
             );
@@ -122,10 +230,10 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                 const c = row.__colstarts[col] ?? 0;
                 diags.push({
                     line:     row.__line,
-                    col:      c,
-                    endCol:   c + raw.length,
+                    col:      c + err.span.start,
+                    endCol:   c + Math.max(err.span.end, err.span.start + 1),
                     severity: "error",
-                    message:  err,
+                    message:  err.message,
                 });
             }
         }
@@ -145,21 +253,20 @@ function validateItem(
     hasUnique: boolean,
     hasSetitems: boolean,
     canProveExternalItemInvalid: boolean,
-): string | null {
+): ItemValidationError | null {
     // Strip surrounding double-quotes — the game engine requires quotes around
     // entries that contain modifiers (e.g. `"gld,mul=1280"`).
-    if (raw.startsWith('"') && raw.endsWith('"')) {
-        raw = raw.slice(1, -1).trim();
-    }
+    // parseItemWithSpans keeps quote/trim offsets mapped to the original cell.
 
     // ── Split BASE from optional modifiers.
-    const [base, modsStr] = splitModifiers(raw);
+    const parsed = parseItemWithSpans(raw);
+    const base = parsed.base.text;
 
-    if (!base) return "Empty item value";
+    if (!base) return { message: "Empty item value", span: nonEmptySpan(parsed.base) };
 
     // ── Validate modifiers (always, regardless of base validity).
-    if (modsStr) {
-        const modErr = validateModifiers(modsStr);
+    if (parsed.modifiers.length > 0) {
+        const modErr = validateModifiers(parsed.modifiers);
         if (modErr) return modErr;
     }
 
@@ -176,8 +283,11 @@ function validateItem(
     if (baseLower in tcLineMap) {
         const defLine = tcLineMap[baseLower];
         if (defLine >= currentLine) {
-            return `'${base}' is a treasure class defined at or below the current row`
-                 + ` (line ${defLine + 1}); TC references must point upward`;
+            return {
+                message: `'${base}' is a treasure class defined at or below the current row`
+                    + ` (line ${defLine + 1}); TC references must point upward`,
+                span: parsed.base,
+            };
         }
         return null;
     }
@@ -202,7 +312,10 @@ function validateItem(
     // emit a false positive.
     if (!canProveExternalItemInvalid) return null;
 
-    return `'${base}' is not a valid item code, treasure class, auto-TC, unique index, or set item index`;
+    return {
+        message: `'${base}' is not a valid item code, treasure class, auto-TC, unique index, or set item index`,
+        span: parsed.base,
+    };
 }
 
 // ─── hover helpers ──────────────────────────────────────────────────────────
@@ -344,7 +457,7 @@ function gotoDefinition(ctx: GotoDefinitionContext) : GotoDefinitionTarget | nul
         return { targetFile: "setitems", targetCol: "index", targetValue: ctx.value };
     if (lookupKey("treasureclassex", "treasure class", ctx.value))
         return { targetFile: "treasureclassex", targetCol: "treasure class", targetValue: ctx.value };
-    
+
     const autoTcCodes = new Set(
         getFilteredColumnValues("itemtypes", "Code", "TreasureClass", "1")
             .map((c: string) => c.toLowerCase())

@@ -60,36 +60,125 @@ interface ParsedInput {
     modifiers: string[];
 }
 
-function parseInput(raw: string): ParsedInput {
-    let s = raw.trim();
-    if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
-        s = s.slice(1, -1).trim();
+interface TextSpan {
+    text: string;
+    start: number;
+    end: number;
+}
+
+interface ModifierSpan {
+    text: string;
+    start: number;
+    end: number;
+    key?: TextSpan;
+    value?: TextSpan;
+    equals?: TextSpan;
+}
+
+interface ParsedInputWithSpans {
+    base: TextSpan;
+    modifiers: ModifierSpan[];
+}
+
+interface ModifierValidationError {
+    message: string;
+    span: TextSpan;
+}
+
+function isWhitespace(ch: string): boolean {
+    return /\s/.test(ch);
+}
+
+function trimTextSpan(raw: string, start: number, end: number): TextSpan {
+    while (start < end && isWhitespace(raw[start])) start++;
+    while (end > start && isWhitespace(raw[end - 1])) end--;
+    return { text: raw.slice(start, end), start, end };
+}
+
+function normalizeInputSpan(raw: string): TextSpan {
+    let span = trimTextSpan(raw, 0, raw.length);
+    if (span.text.length >= 2 && span.text[0] === '"' && span.text[span.text.length - 1] === '"') {
+        span = trimTextSpan(raw, span.start + 1, span.end - 1);
     }
-    const parts = s.split(",");
+    return span;
+}
+
+function splitCommaSpans(raw: string, span: TextSpan): TextSpan[] {
+    const parts: TextSpan[] = [];
+    let start = span.start;
+    for (let i = span.start; i < span.end; i++) {
+        if (raw[i] === ",") {
+            parts.push(trimTextSpan(raw, start, i));
+            start = i + 1;
+        }
+    }
+    parts.push(trimTextSpan(raw, start, span.end));
+    return parts;
+}
+
+function parseModifierSpan(raw: string, span: TextSpan): ModifierSpan {
+    const eq = span.text.indexOf("=");
+    if (eq === -1) {
+        return { text: span.text, start: span.start, end: span.end };
+    }
+    const eqStart = span.start + eq;
     return {
-        base:      parts[0].trim(),
-        modifiers: parts.slice(1).map((m) => m.trim()).filter((m) => m.length > 0),
+        text: span.text,
+        start: span.start,
+        end: span.end,
+        key: trimTextSpan(raw, span.start, eqStart),
+        value: trimTextSpan(raw, eqStart + 1, span.end),
+        equals: { text: "=", start: eqStart, end: eqStart + 1 },
+    };
+}
+
+function parseInputWithSpans(raw: string): ParsedInputWithSpans {
+    const normalized = normalizeInputSpan(raw);
+    const parts = splitCommaSpans(raw, normalized);
+    return {
+        base: parts[0] ?? { text: "", start: normalized.start, end: normalized.start },
+        modifiers: parts.slice(1)
+            .filter((m) => m.text.length > 0)
+            .map((m) => parseModifierSpan(raw, m)),
+    };
+}
+
+function parseInput(raw: string): ParsedInput {
+    const parsed = parseInputWithSpans(raw);
+    return {
+        base:      parsed.base.text,
+        modifiers: parsed.modifiers.map((m) => m.text),
     };
 }
 
 // Returns null if the modifier is valid, or an error string if not.
-function validateModifier(mod: string): string | null {
-    const eq = mod.indexOf("=");
-    if (eq !== -1) {
-        const key = mod.slice(0, eq).trim().toLowerCase();
-        const val = mod.slice(eq + 1).trim();
+function validateModifier(mod: ModifierSpan): ModifierValidationError | null {
+    if (mod.key && mod.value && mod.equals) {
+        const key = mod.key.text.toLowerCase();
+        const val = mod.value.text;
         if (!PARAM_MODS[key]) {
             const validParams = Object.keys(PARAM_MODS).join(", ");
-            return `Unknown parameterized modifier '${key}' (valid parameterized: ${validParams})`;
+            return {
+                message: `Unknown parameterized modifier '${key}' (valid parameterized: ${validParams})`,
+                span: mod.key.text ? mod.key : { text: mod.text, start: mod.start, end: mod.end },
+            };
         }
         if (!/^\d+$/.test(val)) {
-            return `Modifier '${key}' requires a non-negative integer value, got '${val}'`;
+            return {
+                message: val
+                    ? `Modifier '${key}' requires a non-negative integer value, got '${val}'`
+                    : `Modifier '${key}' requires a non-negative integer value`,
+                span: val ? mod.value : mod.equals,
+            };
         }
         return null;
     }
-    if (!SIMPLE_MODS[mod.toLowerCase()]) {
+    if (!SIMPLE_MODS[mod.text.toLowerCase()]) {
         const valid = Object.keys(SIMPLE_MODS).concat(Object.keys(PARAM_MODS).map((k) => k + "=#")).join(", ");
-        return `Unknown input modifier '${mod}' (valid: ${valid})`;
+        return {
+            message: `Unknown input modifier '${mod.text}' (valid: ${valid})`,
+            span: { text: mod.text, start: mod.start, end: mod.end },
+        };
     }
     return null;
 }
@@ -148,33 +237,33 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
             const raw = row[col] as string | undefined;
             if (!raw || !raw.trim()) continue;
 
-            const { base, modifiers } = parseInput(raw.trim());
-            if (!base) continue;
+            const parsed = parseInputWithSpans(raw);
+            if (!parsed.base.text) continue;
 
             const c = row.__colstarts[col] ?? 0;
 
-            if (base.toLowerCase() !== "any" && canProveBaseInvalid && resolveSource(base) === null) {
+            if (parsed.base.text.toLowerCase() !== "any" && canProveBaseInvalid && resolveSource(parsed.base.text) === null) {
                 diags.push({
                     line:     row.__line,
-                    col:      c,
-                    endCol:   c + raw.length,
+                    col:      c + parsed.base.start,
+                    endCol:   c + parsed.base.end,
                     severity: "error",
-                    message:  `'${base}' is not a valid cubemain input`
+                    message:  `'${parsed.base.text}' is not a valid cubemain input`
                         + ` (not found in weapons/armor/misc codes, itemtypes codes,`
                         + ` uniqueitems index, or setitems index)`,
                 });
                 continue;
             }
 
-            for (const mod of modifiers) {
+            for (const mod of parsed.modifiers) {
                 const err = validateModifier(mod);
                 if (err) {
                     diags.push({
                         line:     row.__line,
-                        col:      c,
-                        endCol:   c + raw.length,
+                        col:      c + err.span.start,
+                        endCol:   c + Math.max(err.span.end, err.span.start + 1),
                         severity: "warning",
-                        message:  err,
+                        message:  err.message,
                     });
                 }
             }

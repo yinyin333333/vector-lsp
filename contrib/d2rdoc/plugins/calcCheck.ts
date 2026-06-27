@@ -10,7 +10,7 @@
 //   formula   = expr EOF
 //   expr      = ternary
 //   ternary   = compare ('?' expr ':' expr)?
-//   compare   = add (('<'|'<='|'>'|'>='|'=='|'!=') add)?
+//   compare   = add (('<'|'<='|'>'|'>='|'=='|'!=') add)*
 //   add       = mul (('+' | '-') mul)*
 //   mul       = power (('*' | '/' | '%') power)*
 //   power     = unary ('^' unary)?
@@ -112,7 +112,230 @@ interface Token {
     pos: number;
 }
 
-function tokenize(src: string): Token[] | string {
+interface CalcParseError {
+    code: string;
+    kind: string;
+    message: string;
+    pos: number;
+    length?: number;
+    expected?: string;
+    actual?: string;
+    parserPosition?: number;
+    insertionPoint?: number;
+    insertText?: string;
+    tokenStart?: number;
+    tokenEnd?: number;
+    hint?: string;
+}
+
+interface NormalizedText {
+    text: string;
+    start: number;
+    end: number;
+}
+
+interface CalcErrorMeta {
+    expected?: string;
+    actual?: string;
+    insertionPoint?: number;
+    insertText?: string;
+    tokenStart?: number;
+    tokenEnd?: number;
+    hint?: string;
+}
+
+const TOKEN_LABELS: Record<string, string> = {
+    LPAREN: "(",
+    RPAREN: ")",
+    LBRACK: "[",
+    RBRACK: "]",
+    COLON: ":",
+    COMMA: ",",
+    DOT: ".",
+    QUOTED: "quoted string",
+    IDENT: "identifier",
+    NUM: "number",
+    EOF: "end of formula",
+};
+
+const TOKEN_INSERT_TEXT: Record<string, string> = {
+    RPAREN: ")",
+    RBRACK: "]",
+    COLON: ":",
+    COMMA: ",",
+};
+
+function calcError(
+    code: string,
+    message: string,
+    pos: number,
+    length?: number,
+    kind?: string,
+    meta?: CalcErrorMeta,
+): CalcParseError {
+    const err: CalcParseError = {
+        code,
+        kind: kind || "invalid-argument",
+        message,
+        pos,
+        length,
+        parserPosition: pos,
+    };
+    if (meta) {
+        if (meta.expected !== undefined) err.expected = meta.expected;
+        if (meta.actual !== undefined) err.actual = meta.actual;
+        if (meta.insertionPoint !== undefined) err.insertionPoint = meta.insertionPoint;
+        if (meta.insertText !== undefined) err.insertText = meta.insertText;
+        if (meta.tokenStart !== undefined) err.tokenStart = meta.tokenStart;
+        if (meta.tokenEnd !== undefined) err.tokenEnd = meta.tokenEnd;
+        if (meta.hint !== undefined) err.hint = meta.hint;
+    }
+    return err;
+}
+
+function tokenLabel(type: string): string {
+    return TOKEN_LABELS[type] || type;
+}
+
+function tokenActual(tok: Token): string {
+    return tok.type === "EOF" ? "EOF" : (tok.value || tok.type);
+}
+
+function tokenCodePart(type: string): string {
+    return type.toLowerCase().replace(/_/g, "-");
+}
+
+function tokenError(code: string, message: string, tok: Token, kind?: string, meta?: CalcErrorMeta): CalcParseError {
+    const actual = tokenActual(tok);
+    if (tok.type === "EOF") {
+        return calcError(
+            code,
+            message,
+            tok.pos,
+            0,
+            kind || "unexpected-eof",
+            {
+                actual,
+                insertionPoint: tok.pos,
+                hint: "Complete the expression before the end of the formula.",
+                ...(meta || {}),
+            },
+        );
+    }
+    const length = tok.value.length || 1;
+    return calcError(
+        code,
+        message,
+        tok.pos,
+        length,
+        kind || "unexpected-token",
+        {
+            actual,
+            tokenStart: tok.pos,
+            tokenEnd: tok.pos + length,
+            ...(meta || {}),
+        },
+    );
+}
+
+function expectedTokenError(type: string, tok: Token): CalcParseError {
+    const expected = tokenLabel(type);
+    const actual = tokenActual(tok);
+    const insertText = TOKEN_INSERT_TEXT[type] || expected;
+    const code = `calc.expected-${tokenCodePart(type)}${tok.type === "EOF" ? ".eof" : ""}`;
+    if (tok.type === "EOF") {
+        return calcError(
+            code,
+            `Missing '${expected}' before end of formula`,
+            tok.pos,
+            0,
+            "missing-token",
+            {
+                expected,
+                actual,
+                insertionPoint: tok.pos,
+                insertText,
+                hint: `Insert '${expected}' at the end of this expression.`,
+            },
+        );
+    }
+    return calcError(
+        code,
+        `Missing '${expected}' before '${actual}'`,
+        tok.pos,
+        0,
+        "missing-token",
+        {
+            expected,
+            actual,
+            insertionPoint: tok.pos,
+            insertText,
+            hint: `Insert '${expected}' before '${actual}'.`,
+        },
+    );
+}
+
+function isWhitespace(ch: string): boolean {
+    return /\s/.test(ch);
+}
+
+function trimSpan(raw: string, start: number, end: number): NormalizedText {
+    while (start < end && isWhitespace(raw[start])) start++;
+    while (end > start && isWhitespace(raw[end - 1])) end--;
+    return { text: raw.slice(start, end), start, end };
+}
+
+function normalizeFormula(raw: string): NormalizedText {
+    let span = trimSpan(raw, 0, raw.length);
+    if (span.text.length >= 2 && span.text[0] === '"' && span.text[span.text.length - 1] === '"') {
+        span = trimSpan(raw, span.start + 1, span.end - 1);
+    }
+    return span;
+}
+
+function mapParseError(err: CalcParseError, normalized: NormalizedText): CalcParseError {
+    const maxPos = normalized.text.length;
+    const parserPos = Math.max(0, Math.min(err.pos, maxPos));
+    const pos = normalized.start + parserPos;
+    let length = err.length ?? 1;
+
+    const available = Math.max(0, normalized.end - pos);
+    if (available > 0) {
+        length = length > 0 ? Math.max(1, Math.min(length, available)) : 0;
+    } else {
+        length = 0;
+    }
+
+    const mapped: CalcParseError = {
+        ...err,
+        pos,
+        length,
+        parserPosition: parserPos,
+    };
+
+    if (err.tokenStart !== undefined) {
+        const tokenStart = Math.max(0, Math.min(err.tokenStart, maxPos));
+        mapped.tokenStart = normalized.start + tokenStart;
+    } else if (length > 0) {
+        mapped.tokenStart = pos;
+    }
+    if (err.tokenEnd !== undefined) {
+        const tokenEnd = Math.max(0, Math.min(err.tokenEnd, maxPos));
+        mapped.tokenEnd = normalized.start + tokenEnd;
+    } else if (length > 0) {
+        mapped.tokenEnd = pos + length;
+    }
+    if (err.insertionPoint !== undefined) {
+        const insertionPoint = Math.max(0, Math.min(err.insertionPoint, maxPos));
+        mapped.insertionPoint = normalized.start + insertionPoint;
+    } else if (length === 0 || err.kind === "missing-token" || err.kind === "unexpected-eof") {
+        mapped.insertionPoint = pos;
+    }
+
+    return mapped;
+}
+
+function tokenize(src: string): Token[] | CalcParseError {
     const tokens: Token[] = [];
     let i = 0;
     while (i < src.length) {
@@ -131,7 +354,21 @@ function tokenize(src: string): Token[] | string {
         // Single-quoted string (skill / missile / stat / condition names)
         if (ch === "'") {
             const end = src.indexOf("'", i + 1);
-            if (end === -1) return `Unterminated string literal at position ${i}`;
+            if (end === -1) {
+                return calcError(
+                    "calc.unterminated-string",
+                    "Unterminated string literal",
+                    i,
+                    1,
+                    "unterminated-string",
+                    {
+                        actual: "'",
+                        tokenStart: i,
+                        tokenEnd: i + 1,
+                        hint: "Close the string with a single quote.",
+                    },
+                );
+            }
             tokens.push({ type: "QUOTED", value: src.slice(i, end + 1), pos: i });
             i = end + 1;
             continue;
@@ -165,7 +402,18 @@ function tokenize(src: string): Token[] | string {
             continue;
         }
 
-        return `Unexpected character '${ch}' at position ${i}`;
+        return calcError(
+            "calc.unexpected-character",
+            `Unexpected character '${ch}'`,
+            i,
+            1,
+            "unexpected-character",
+            {
+                actual: ch,
+                tokenStart: i,
+                tokenEnd: i + 1,
+            },
+        );
     }
     tokens.push({ type: "EOF", value: "", pos: i });
     return tokens;
@@ -190,10 +438,9 @@ function peek(st: ParseState): Token { return st.tokens[st.pos]; }
 function advance(st: ParseState): Token { return st.tokens[st.pos++]; }
 function check(st: ParseState, type: string): boolean { return peek(st).type === type; }
 
-function eat(st: ParseState, type: string): string | null {
+function eat(st: ParseState, type: string): CalcParseError | null {
     if (!check(st, type)) {
-        const t = peek(st);
-        return `Expected '${type}' but got '${t.value || t.type}' at position ${t.pos}`;
+        return expectedTokenError(type, peek(st));
     }
     advance(st);
     return null;
@@ -201,11 +448,11 @@ function eat(st: ParseState, type: string): string | null {
 
 // ─── Grammar ──────────────────────────────────────────────────────────────────
 
-function parseExpr(st: ParseState): string | null {
+function parseExpr(st: ParseState): CalcParseError | null {
     return parseTernary(st);
 }
 
-function parseTernary(st: ParseState): string | null {
+function parseTernary(st: ParseState): CalcParseError | null {
     let err = parseCompare(st);
     if (err) return err;
     if (check(st, "QUESTION")) {
@@ -219,18 +466,19 @@ function parseTernary(st: ParseState): string | null {
     return null;
 }
 
-function parseCompare(st: ParseState): string | null {
+function parseCompare(st: ParseState): CalcParseError | null {
     let err = parseAdd(st);
     if (err) return err;
     const cmpOps = ["LT", "LE", "GT", "GE", "EQ", "NEQ"];
-    if (cmpOps.indexOf(peek(st).type) !== -1) {
+    while (cmpOps.indexOf(peek(st).type) !== -1) {
         advance(st);
-        return parseAdd(st);
+        err = parseAdd(st);
+        if (err) return err;
     }
     return null;
 }
 
-function parseAdd(st: ParseState): string | null {
+function parseAdd(st: ParseState): CalcParseError | null {
     let err = parseMul(st);
     if (err) return err;
     while (check(st, "PLUS") || check(st, "MINUS")) {
@@ -241,7 +489,7 @@ function parseAdd(st: ParseState): string | null {
     return null;
 }
 
-function parseMul(st: ParseState): string | null {
+function parseMul(st: ParseState): CalcParseError | null {
     let err = parsePower(st);
     if (err) return err;
     while (check(st, "STAR") || check(st, "SLASH") || check(st, "PCT")) {
@@ -252,7 +500,7 @@ function parseMul(st: ParseState): string | null {
     return null;
 }
 
-function parsePower(st: ParseState): string | null {
+function parsePower(st: ParseState): CalcParseError | null {
     let err = parseUnary(st);
     if (err) return err;
     if (check(st, "CARET")) {
@@ -262,12 +510,12 @@ function parsePower(st: ParseState): string | null {
     return null;
 }
 
-function parseUnary(st: ParseState): string | null {
+function parseUnary(st: ParseState): CalcParseError | null {
     if (check(st, "MINUS")) { advance(st); return parseUnary(st); }
     return parsePrimary(st);
 }
 
-function parsePrimary(st: ParseState): string | null {
+function parsePrimary(st: ParseState): CalcParseError | null {
     const tok = peek(st);
 
     if (tok.type === "NUM") { advance(st); return null; }
@@ -291,39 +539,70 @@ function parsePrimary(st: ParseState): string | null {
         }
         // Bare identifier: validate against scope when at the top-level expression.
         if (st.funcDepth === 0 && st.scopeIds !== null && !st.scopeIds.has(tok.value)) {
-            return `Unknown identifier '${tok.value}' for this BBE scope`;
+            return calcError(
+                "unknownIdentifier",
+                `Unknown identifier '${tok.value}' for this BBE scope`,
+                tok.pos,
+                tok.value.length,
+            );
         }
         return null;
     }
 
-    if (tok.type === "EOF") return `Unexpected end of formula`;
-    return `Unexpected token '${tok.value}' at position ${tok.pos}`;
+    if (tok.type === "EOF") {
+        return tokenError(
+            "calc.unexpected-eof",
+            "Unexpected end of formula",
+            tok,
+            "unexpected-eof",
+            { expected: "expression" },
+        );
+    }
+    return tokenError("calc.unexpected-token", `Unexpected token '${tok.value}'`, tok);
 }
 
-function parseFuncArgs(st: ParseState, funcName: string): string | null {
+function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null {
     if (check(st, "RPAREN")) return null; // zero-arg (defensive)
 
     if (QUOTED_ARG_FUNCS[funcName] || check(st, "QUOTED")) {
         // Quoted-string style: QUOTED ('.' (IDENT | NUM))* (',' expr)?
         if (!check(st, "QUOTED")) {
             const t = peek(st);
-            return `Expected quoted string as first argument of '${funcName}()' at position ${t.pos}`;
+            return tokenError(
+                "calc.expected-quoted-argument",
+                `Expected quoted string as first argument of '${funcName}()'`,
+                t,
+                "invalid-argument",
+                {
+                    expected: "quoted string",
+                    hint: `Wrap the first argument of '${funcName}()' in single quotes.`,
+                },
+            );
         }
         const quotedTok = advance(st);
         const quotedVal = quotedTok.value.slice(1, -1); // strip surrounding ' '
 
-        const nameErr = validateQuotedName(funcName, quotedVal);
+        const nameErr = validateQuotedName(funcName, quotedVal, quotedTok);
         if (nameErr) return nameErr;
 
         // Collect dot-separated identifiers / numbers
-        const dotIdents: string[] = [];
+        const dotIdents: Token[] = [];
         while (check(st, "DOT")) {
             advance(st); // consume '.'
             const t = peek(st);
             if (t.type !== "IDENT" && t.type !== "NUM") {
-                return `Expected identifier after '.' in '${funcName}()' at position ${t.pos}`;
+                return tokenError(
+                    "calc.expected-dot-identifier",
+                    `Expected identifier after '.' in '${funcName}()'`,
+                    t,
+                    "invalid-parser-token",
+                    {
+                        expected: "identifier",
+                        hint: `Add an identifier after '.' in '${funcName}()'.`,
+                    },
+                );
             }
-            dotIdents.push(advance(st).value);
+            dotIdents.push(advance(st));
         }
 
         const dotErr = validateDotIdents(funcName, dotIdents, st);
@@ -352,49 +631,74 @@ function parseFuncArgs(st: ParseState, funcName: string): string | null {
 
 // ─── Function argument validation ─────────────────────────────────────────────
 
-function validateQuotedName(funcName: string, name: string): string | null {
+function validateQuotedName(funcName: string, name: string, tok: Token): CalcParseError | null {
     if (funcName === "skill" || funcName === "sksrc" || funcName === "sklvl") {
         if (hasFile("skills") && !lookupKey("skills", "skill", name)) {
-            return `Unknown skill '${name}'`;
+            return calcError("unknownSkill", `Unknown skill '${name}'`, tok.pos, tok.value.length);
         }
     } else if (funcName === "miss") {
         if (hasFile("missiles") && !lookupKey("missiles", "Missile", name)) {
-            return `Unknown missile '${name}'`;
+            return calcError("unknownMissile", `Unknown missile '${name}'`, tok.pos, tok.value.length);
         }
     } else if (funcName === "stat") {
         if (hasFile("itemstatcost") && !lookupKey("itemstatcost", "Stat", name)) {
-            return `Unknown stat '${name}'`;
+            return calcError("unknownStat", `Unknown stat '${name}'`, tok.pos, tok.value.length);
         }
     } else if (funcName === "cond") {
         if (!VALID_COND_NAMES[name]) {
-            return `Unknown condition '${name}'`;
+            return calcError("unknownCondition", `Unknown condition '${name}'`, tok.pos, tok.value.length);
         }
     }
     return null;
 }
 
-function validateDotIdents(funcName: string, idents: string[], st: ParseState): string | null {
+function validateDotIdents(funcName: string, idents: Token[], st: ParseState): CalcParseError | null {
     if (funcName === "skill" || funcName === "sksrc") {
-        if (idents.length >= 1 && st.skillIds.size > 0 && !st.skillIds.has(idents[0])) {
-            return `Unknown skill identifier '${idents[0]}'`;
+        if (idents.length >= 1 && st.skillIds.size > 0 && !st.skillIds.has(idents[0].value)) {
+            return calcError(
+                "unknownSkillIdentifier",
+                `Unknown skill identifier '${idents[0].value}'`,
+                idents[0].pos,
+                idents[0].value.length,
+            );
         }
     } else if (funcName === "miss") {
-        if (idents.length >= 1 && st.missIds.size > 0 && !st.missIds.has(idents[0])) {
-            return `Unknown missile identifier '${idents[0]}'`;
+        if (idents.length >= 1 && st.missIds.size > 0 && !st.missIds.has(idents[0].value)) {
+            return calcError(
+                "unknownMissileIdentifier",
+                `Unknown missile identifier '${idents[0].value}'`,
+                idents[0].pos,
+                idents[0].value.length,
+            );
         }
     } else if (funcName === "stat") {
-        if (idents.length >= 1 && !STAT_PARAMS[idents[0]]) {
-            return `Invalid stat parameter '${idents[0]}' (expected accr, base, or mod)`;
+        if (idents.length >= 1 && !STAT_PARAMS[idents[0].value]) {
+            return calcError(
+                "invalidStatParameter",
+                `Invalid stat parameter '${idents[0].value}' (expected accr, base, or mod)`,
+                idents[0].pos,
+                idents[0].value.length,
+            );
         }
     } else if (funcName === "sklvl") {
         // First dot-ident: current-scope identifier (level source)
         if (idents.length >= 1 && st.scopeIds !== null && st.scopeIds.size > 0
-                && !st.scopeIds.has(idents[0])) {
-            return `Unknown scope identifier '${idents[0]}' as level in sklvl()`;
+                && !st.scopeIds.has(idents[0].value)) {
+            return calcError(
+                "unknownScopeIdentifier",
+                `Unknown scope identifier '${idents[0].value}' as level in sklvl()`,
+                idents[0].pos,
+                idents[0].value.length,
+            );
         }
         // Second dot-ident: skill-scope identifier
-        if (idents.length >= 2 && st.skillIds.size > 0 && !st.skillIds.has(idents[1])) {
-            return `Unknown skill identifier '${idents[1]}' in sklvl()`;
+        if (idents.length >= 2 && st.skillIds.size > 0 && !st.skillIds.has(idents[1].value)) {
+            return calcError(
+                "unknownSkillIdentifier",
+                `Unknown skill identifier '${idents[1].value}' in sklvl()`,
+                idents[1].pos,
+                idents[1].value.length,
+            );
         }
     }
     return null;
@@ -413,16 +717,14 @@ function parseBBE(
     scopeIds: Set<string> | null,
     skillIds: Set<string>,
     missIds: Set<string>,
-): string | null {
+): CalcParseError | null {
     // Strip outer double-quotes that some editors wrap around cell formulas.
-    let src = raw.trim();
-    if (src.length >= 2 && src[0] === '"' && src[src.length - 1] === '"') {
-        src = src.slice(1, -1).trim();
-    }
+    const normalized = normalizeFormula(raw);
+    const src = normalized.text;
     if (!src) return null;
 
     const result = tokenize(src);
-    if (typeof result === "string") return result;
+    if (!Array.isArray(result)) return mapParseError(result, normalized);
 
     const st: ParseState = {
         tokens: result, pos: 0,
@@ -430,15 +732,42 @@ function parseBBE(
         funcDepth: 0,
     };
     const err = parseExpr(st);
-    if (err) return err;
+    if (err) return mapParseError(err, normalized);
     if (!check(st, "EOF")) {
         const t = peek(st);
-        return `Unexpected token '${t.value}' at position ${t.pos}`;
+        return mapParseError(
+            tokenError("calc.unexpected-token", `Unexpected token '${t.value}'`, t),
+            normalized,
+        );
     }
     return null;
 }
 
 // ─── validate ─────────────────────────────────────────────────────────────────
+
+function addDiagnosticData(
+    data: Record<string, string | number>,
+    key: string,
+    value: string | number | undefined,
+) {
+    if (value !== undefined) data[key] = value;
+}
+
+function calcDiagnosticData(err: CalcParseError): Record<string, string | number> {
+    const data: Record<string, string | number> = {
+        rule: "calcCheck",
+        kind: err.kind,
+    };
+    addDiagnosticData(data, "expected", err.expected);
+    addDiagnosticData(data, "actual", err.actual);
+    addDiagnosticData(data, "parserPosition", err.parserPosition);
+    addDiagnosticData(data, "insertionPoint", err.insertionPoint);
+    addDiagnosticData(data, "insertText", err.insertText);
+    addDiagnosticData(data, "tokenStart", err.tokenStart);
+    addDiagnosticData(data, "tokenEnd", err.tokenEnd);
+    addDiagnosticData(data, "hint", err.hint);
+    return data;
+}
 
 function validate(ctx: PluginContext): PluginDiagnostic[] {
     const scopeMap = BBE_FIELDS[ctx.file];
@@ -493,12 +822,15 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                 const err = parseBBE(val, scopeIds, skillIds, missIds);
                 if (err) {
                     const c = row.__colstarts[col] ?? 0;
+                    const length = err.length ?? 1;
                     diags.push({
                         line:     row.__line,
-                        col:      c,
-                        endCol:   c + val.length,
+                        col:      c + err.pos,
+                        endCol:   c + err.pos + length,
                         severity: "error",
-                        message:  `calcCheck: Invalid calc formula: ${err}`,
+                        message:  `calcCheck: Invalid calc formula: ${err.message}`,
+                        code:     err.code,
+                        data:     calcDiagnosticData(err),
                     });
                 }
             }
