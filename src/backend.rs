@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -12,6 +13,7 @@ use crate::schema::{FieldTypeName, find_loader, format_description};
 use crate::settings::VectorLspSettings;
 use crate::workspace::Workspace;
 
+#[derive(Clone)]
 pub struct Backend {
     pub client: Client,
     // Arc so the same settings can be shared across TCP connections cheaply.
@@ -19,6 +21,17 @@ pub struct Backend {
     pub workspace: Arc<RwLock<Workspace>>,
     /// None when no plugins are configured.
     pub plugin_host: Option<plugin::PluginHost>,
+}
+
+#[derive(Clone, Copy)]
+enum DiagnosticPublishTarget {
+    Startup {
+        scan_generation: u64,
+    },
+    OpenDocument {
+        generation: u64,
+        version: Option<i32>,
+    },
 }
 
 impl Backend {
@@ -62,15 +75,119 @@ impl Backend {
         Ok(files)
     }
 
+    async fn publish_startup_diagnostics_if_safe(
+        &self,
+        uri: Url,
+        diags: Vec<Diagnostic>,
+        scan_generation: u64,
+    ) {
+        let should_publish = {
+            let ws = self.workspace.read().await;
+            ws.should_publish_startup_diagnostics(&uri, scan_generation)
+        };
+
+        if should_publish {
+            self.client.publish_diagnostics(uri, diags, None).await;
+        }
+    }
+
+    async fn publish_open_document_diagnostics_if_current(
+        &self,
+        uri: Url,
+        generation: u64,
+        version: Option<i32>,
+        diags: Vec<Diagnostic>,
+    ) {
+        let is_current = {
+            let ws = self.workspace.read().await;
+            ws.should_publish_generation(&uri, generation)
+                && version
+                    .map(|v| ws.open_document_versions.get(&uri).copied() == Some(v))
+                    .unwrap_or(true)
+        };
+
+        if is_current {
+            self.client.publish_diagnostics(uri, diags, version).await;
+        }
+    }
+
+    fn spawn_final_document_diagnostics(&self, uri: Url, generation: u64, version: Option<i32>) {
+        let backend = self.clone();
+        tokio::spawn(async move {
+            backend
+                .refresh_open_document_diagnostics(uri, generation, version)
+                .await;
+        });
+    }
+
+    async fn refresh_open_document_diagnostics(
+        &self,
+        uri: Url,
+        generation: u64,
+        version: Option<i32>,
+    ) {
+        let stem = Self::file_stem(&uri);
+
+        let (doc, schema, symbols, plugin_data) = {
+            let ws = self.workspace.read().await;
+
+            if !ws.should_publish_generation(&uri, generation)
+                || version
+                    .map(|v| ws.open_document_versions.get(&uri).copied() != Some(v))
+                    .unwrap_or(false)
+            {
+                return;
+            }
+
+            let Some(doc) = ws.open_documents.get(&uri).cloned() else {
+                return;
+            };
+
+            let schema = ws.schema.clone();
+            let symbols = Arc::new(ws.symbols.clone());
+            let plugin_data = self.plugin_host.as_ref().map(|_| {
+                let ctx = plugin::build_context(&stem, &doc);
+                let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
+                let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
+                (ctx, idx, snap)
+            });
+
+            (doc, schema, symbols, plugin_data)
+        };
+
+        let schema_diags = tokio::task::spawn_blocking({
+            let stem = stem.clone();
+            let doc = Arc::clone(&doc);
+            let schema = schema.clone();
+            let symbols = Arc::clone(&symbols);
+
+            move || diagnostics::validate_document(&stem, &doc, schema.as_deref(), &*symbols)
+        })
+        .await
+        .unwrap_or_default();
+
+        let plugin_diags = match (plugin_data, &self.plugin_host) {
+            (Some((ctx, idx, snap)), Some(ph)) => ph.run(ctx, idx, snap).await,
+            _ => vec![],
+        };
+
+        let mut diags = schema_diags;
+        diags.extend(plugin_diags);
+
+        self.publish_open_document_diagnostics_if_current(uri, generation, version, diags)
+            .await;
+    }
+
     /// Scan all data files in the workspace root, parse and index them.
     /// Called after the schema (and thus ref_targets) is ready.
     async fn scan_and_index_workspace(&self) {
-        let (root_uri, delimiter, ext) = {
+        let (root_uri, delimiter, ext, scan_generation) = {
             let ws = self.workspace.read().await;
             (
                 ws.root_uri.clone(),
                 self.settings.delimiter_char(),
                 self.settings.extension.clone(),
+                ws.generation,
             )
         };
 
@@ -122,27 +239,35 @@ impl Backend {
             });
         }
 
-        let mut parsed: Vec<(Url, std::path::PathBuf, String, Arc<DocumentData>)> = Vec::new();
+        let mut uri_stems: Vec<(Url, String)> = Vec::new();
+        let mut count = 0usize;
         while let Some(result) = join_set.join_next().await {
-            if let Ok(Some(item)) = result {
-                parsed.push(item);
+            let Ok(Some((uri, path, stem, doc))) = result else {
+                continue;
+            };
+
+            {
+                let mut ws = self.workspace.write().await;
+                let ref_targets = ws.ref_targets.clone();
+                let doc_for_index = ws
+                    .open_documents
+                    .get(&uri)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&doc));
+
+                ws.symbols.remove_file(&stem);
+                ws.symbols
+                    .index_document(&uri, &stem, &doc_for_index, &ref_targets);
+                ws.file_cache.insert(path, Arc::clone(&doc));
             }
+
+            uri_stems.push((uri, stem));
+            count += 1;
         }
 
-        // Retain (uri, stem) pairs before consuming the vec for indexing.
-        let uri_stems: Vec<(Url, String)> = parsed
-            .iter()
-            .map(|(uri, _, stem, _)| (uri.clone(), stem.clone()))
-            .collect();
-
-        let count = parsed.len();
         {
             let mut ws = self.workspace.write().await;
-            let ref_targets = ws.ref_targets.clone();
-            for (uri, path, stem, doc) in parsed {
-                ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
-                ws.file_cache.insert(path, doc);
-            }
+            ws.startup_index_ready = true;
         }
 
         let t_index = Instant::now();
@@ -172,17 +297,48 @@ impl Backend {
             let ws = self.workspace.read().await;
             let schema = ws.schema.clone();
             let symbols = Arc::new(ws.symbols.clone());
-            let pairs: Vec<(Url, String, Option<Arc<DocumentData>>)> = uri_stems
+
+            let mut open_uris = HashSet::new();
+            let mut pairs: Vec<(
+                Url,
+                String,
+                Option<Arc<DocumentData>>,
+                DiagnosticPublishTarget,
+            )> = ws
+                .open_documents
                 .iter()
-                .map(|(uri, stem)| {
-                    let doc = uri
-                        .to_file_path()
-                        .ok()
-                        .and_then(|p| ws.file_cache.get(&p))
-                        .cloned();
-                    (uri.clone(), stem.clone(), doc)
+                .map(|(uri, doc)| {
+                    open_uris.insert(uri.clone());
+                    (
+                        uri.clone(),
+                        Self::file_stem(uri),
+                        Some(Arc::clone(doc)),
+                        DiagnosticPublishTarget::OpenDocument {
+                            generation: ws.generation,
+                            version: ws.open_document_versions.get(uri).copied(),
+                        },
+                    )
                 })
                 .collect();
+
+            pairs.extend(
+                uri_stems
+                    .iter()
+                    .filter(|(uri, _)| !open_uris.contains(uri))
+                    .map(|(uri, stem)| {
+                        let doc = uri
+                            .to_file_path()
+                            .ok()
+                            .and_then(|p| ws.file_cache.get(&p).cloned());
+                        (
+                            uri.clone(),
+                            stem.clone(),
+                            doc,
+                            DiagnosticPublishTarget::Startup { scan_generation },
+                        )
+                    }),
+            );
+
             (schema, symbols, pairs)
         };
 
@@ -192,9 +348,10 @@ impl Backend {
             Url,
             String,
             Option<Arc<DocumentData>>,
+            DiagnosticPublishTarget,
             Vec<Diagnostic>,
         )> = tokio::task::JoinSet::new();
-        for (uri, stem, doc) in file_pairs {
+        for (uri, stem, doc, target) in file_pairs {
             let schema = schema_arc.clone();
             let symbols = Arc::clone(&symbols_arc);
             diag_set.spawn_blocking(move || {
@@ -202,23 +359,17 @@ impl Backend {
                     .as_ref()
                     .map(|d| diagnostics::validate_document(&stem, d, schema.as_deref(), &*symbols))
                     .unwrap_or_default();
-                (uri, stem, doc, diags)
+                (uri, stem, doc, target, diags)
             });
         }
-        let mut schema_results: Vec<(Url, String, Option<Arc<DocumentData>>, Vec<Diagnostic>)> =
-            Vec::new();
-        while let Some(result) = diag_set.join_next().await {
-            if let Ok(item) = result {
-                schema_results.push(item);
-            }
-        }
-        let schema_total = t_schema_start.elapsed();
-
         // Plugin diagnostics are async and must remain sequential, but publishing does
         // not need to wait for every file's plugin diagnostics to finish.
         let mut plugin_total = std::time::Duration::ZERO;
         let mut publish_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        for (uri, stem, doc, schema_diags) in schema_results {
+        while let Some(result) = diag_set.join_next().await {
+            let Ok((uri, stem, doc, target, schema_diags)) = result else {
+                continue;
+            };
             let t = Instant::now();
             let plugin_diags = match (&shared, doc.as_ref(), &self.plugin_host) {
                 (Some((snap, idx)), Some(d), Some(ph)) => {
@@ -231,12 +382,29 @@ impl Backend {
             let mut diags = schema_diags;
             diags.extend(plugin_diags);
 
-            let client = self.client.clone();
+            let backend = self.clone();
             publish_set.spawn(async move {
-                client.publish_diagnostics(uri, diags, None).await;
+                match target {
+                    DiagnosticPublishTarget::Startup { scan_generation } => {
+                        backend
+                            .publish_startup_diagnostics_if_safe(uri, diags, scan_generation)
+                            .await;
+                    }
+                    DiagnosticPublishTarget::OpenDocument {
+                        generation,
+                        version,
+                    } => {
+                        backend
+                            .publish_open_document_diagnostics_if_current(
+                                uri, generation, version, diags,
+                            )
+                            .await;
+                    }
+                }
             });
         }
         while publish_set.join_next().await.is_some() {}
+        let schema_total = t_schema_start.elapsed().saturating_sub(plugin_total);
 
         let total = t_index.elapsed();
         self.client
@@ -381,7 +549,10 @@ impl LanguageServer for Backend {
                     self.client
                         .log_message(MessageType::INFO, "Schema loaded successfully.")
                         .await;
-                    self.scan_and_index_workspace().await;
+                    let backend = self.clone();
+                    tokio::spawn(async move {
+                        backend.scan_and_index_workspace().await;
+                    });
                 }
                 Ok(Err(e)) => {
                     self.client
@@ -403,46 +574,47 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
+        let version = params.text_document.version;
         let doc = Arc::new(DocumentData::parse(
             &params.text_document.text,
             self.settings.delimiter_char(),
         ));
         let stem = Self::file_stem(&uri);
 
-        let (schema_diags, plugin_data) = {
+        let (local_diags, generation, startup_index_ready) = {
             let mut ws = self.workspace.write().await;
+            ws.generation = ws.generation.wrapping_add(1);
+            let generation = ws.generation;
+            ws.open_document_versions.insert(uri.clone(), version);
             let ref_targets = ws.ref_targets.clone();
             ws.symbols.remove_file(&stem);
             ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
-            let schema_diags =
-                diagnostics::validate_document(&stem, &doc, ws.schema.as_deref(), &ws.symbols);
             ws.open_documents.insert(uri.clone(), Arc::clone(&doc));
-            let plugin_data = self.plugin_host.as_ref().map(|_| {
-                let ctx = plugin::build_context(&stem, &doc);
-                let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-                let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-                (ctx, idx, snap)
-            });
-            (schema_diags, plugin_data)
+            (
+                diagnostics::validate_document_local(&stem, &doc, ws.schema.as_deref()),
+                generation,
+                ws.startup_index_ready,
+            )
         };
 
-        let plugin_diags = match (plugin_data, &self.plugin_host) {
-            (Some((ctx, idx, snap)), Some(ph)) => ph.run(ctx, idx, snap).await,
-            _ => vec![],
-        };
-        let mut diags = schema_diags;
-        diags.extend(plugin_diags);
-        self.client.publish_diagnostics(uri, diags, None).await;
+        self.client
+            .publish_diagnostics(uri.clone(), local_diags, Some(version))
+            .await;
+
+        if startup_index_ready {
+            self.spawn_final_document_diagnostics(uri, generation, Some(version));
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        let version = params.text_document.version;
         let delimiter = self.settings.delimiter_char();
         let stem = Self::file_stem(&uri);
 
         // Reconstruct current text from the stored document, apply each incremental
         // change in order, then re-parse. Avoids receiving the full document over IPC.
-        let doc = {
+        let (local_diags, generation, startup_index_ready) = {
             let mut ws = self.workspace.write().await;
 
             let existing_text = ws
@@ -461,34 +633,37 @@ impl LanguageServer for Backend {
 
             let full_text = lines.join("\n");
             let doc = Arc::new(DocumentData::parse(&full_text, delimiter));
+            ws.generation = ws.generation.wrapping_add(1);
+            let generation = ws.generation;
+            ws.open_document_versions.insert(uri.clone(), version);
             let ref_targets = ws.ref_targets.clone();
             ws.symbols.remove_file(&stem);
             ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
-            let schema_diags =
-                diagnostics::validate_document(&stem, &doc, ws.schema.as_deref(), &ws.symbols);
             ws.open_documents.insert(uri.clone(), Arc::clone(&doc));
-            let plugin_data = self.plugin_host.as_ref().map(|_| {
-                let ctx = plugin::build_context(&stem, &doc);
-                let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-                let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-                (ctx, idx, snap)
-            });
-            (schema_diags, plugin_data, doc)
+            (
+                diagnostics::validate_document_local(&stem, &doc, ws.schema.as_deref()),
+                generation,
+                ws.startup_index_ready,
+            )
         };
 
-        let (schema_diags, plugin_data, _doc) = doc;
-        let plugin_diags = match (plugin_data, &self.plugin_host) {
-            (Some((ctx, idx, snap)), Some(ph)) => ph.run(ctx, idx, snap).await,
-            _ => vec![],
-        };
-        let mut diags = schema_diags;
-        diags.extend(plugin_diags);
-        self.client.publish_diagnostics(uri, diags, None).await;
+        self.client
+            .publish_diagnostics(uri.clone(), local_diags, Some(version))
+            .await;
+
+        if startup_index_ready {
+            self.spawn_final_document_diagnostics(uri, generation, Some(version));
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        self.workspace.write().await.open_documents.remove(&uri);
+        {
+            let mut ws = self.workspace.write().await;
+            ws.generation = ws.generation.wrapping_add(1);
+            ws.open_documents.remove(&uri);
+            ws.open_document_versions.remove(&uri);
+        }
         // Clear editor diagnostics; the file-cache copy remains for workspace validation.
         self.client.publish_diagnostics(uri, vec![], None).await;
     }

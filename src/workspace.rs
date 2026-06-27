@@ -118,6 +118,8 @@ pub struct Workspace {
     pub root_uri: Option<Url>,
     /// Documents currently open in the editor (managed via didOpen/didChange).
     pub open_documents: HashMap<Url, Arc<DocumentData>>,
+    /// LSP versions for currently open documents.
+    pub open_document_versions: HashMap<Url, i32>,
     /// All other workspace files parsed from disk on startup.
     pub file_cache: HashMap<PathBuf, Arc<DocumentData>>,
     pub symbols: SymbolIndex,
@@ -130,6 +132,8 @@ pub struct Workspace {
     /// Incremented whenever an open document changes so startup diagnostics cannot
     /// overwrite newer editor diagnostics.
     pub generation: u64,
+    /// True after the initial workspace file cache and symbol index are complete.
+    pub startup_index_ready: bool,
 }
 
 impl Workspace {
@@ -137,11 +141,68 @@ impl Workspace {
         Self {
             root_uri: None,
             open_documents: HashMap::new(),
+            open_document_versions: HashMap::new(),
             file_cache: HashMap::new(),
             symbols: SymbolIndex::new(),
             schema: None,
             ref_targets: HashSet::new(),
             generation: 0,
+            startup_index_ready: false,
         }
+    }
+
+    pub fn should_publish_generation(&self, uri: &Url, generation: u64) -> bool {
+        self.generation == generation && self.open_documents.contains_key(uri)
+    }
+
+    pub fn should_publish_startup_diagnostics(&self, uri: &Url, scan_generation: u64) -> bool {
+        let _ = scan_generation;
+        !self.open_documents.contains_key(uri)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn uri(name: &str) -> Url {
+        Url::parse(&format!("file:///C:/workspace/{name}.txt")).unwrap()
+    }
+
+    fn doc() -> Arc<DocumentData> {
+        Arc::new(DocumentData::parse("id\nrow\n", '\t'))
+    }
+
+    #[test]
+    fn workspace_starts_before_startup_index_is_ready() {
+        let ws = Workspace::new();
+        assert!(!ws.startup_index_ready);
+    }
+
+    #[test]
+    fn generation_guard_accepts_only_current_open_document_generation() {
+        let mut ws = Workspace::new();
+        let open_uri = uri("open");
+        ws.open_documents.insert(open_uri.clone(), doc());
+        ws.generation = 7;
+
+        assert!(ws.should_publish_generation(&open_uri, 7));
+        assert!(!ws.should_publish_generation(&open_uri, 6));
+        assert!(!ws.should_publish_generation(&uri("closed"), 7));
+    }
+
+    #[test]
+    fn startup_guard_does_not_overwrite_open_documents_after_generation_changes() {
+        let mut ws = Workspace::new();
+        let open_uri = uri("open");
+        let closed_uri = uri("closed");
+        ws.open_documents.insert(open_uri.clone(), doc());
+        ws.generation = 2;
+
+        assert!(!ws.should_publish_startup_diagnostics(&open_uri, 2));
+        assert!(!ws.should_publish_startup_diagnostics(&open_uri, 1));
+        assert!(ws.should_publish_startup_diagnostics(&closed_uri, 1));
     }
 }
