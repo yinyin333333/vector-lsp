@@ -127,6 +127,9 @@ pub struct Workspace {
     /// Cached set of `(file_stem, column_name)` reference targets derived from the schema.
     /// Drives what SymbolIndex stores — populated once when the schema loads.
     pub ref_targets: HashSet<(String, String)>,
+    /// Incremented whenever an open document changes so startup diagnostics cannot
+    /// overwrite newer editor diagnostics.
+    pub generation: u64,
 }
 
 impl Workspace {
@@ -138,6 +141,7 @@ impl Workspace {
             symbols: SymbolIndex::new(),
             schema: None,
             ref_targets: HashSet::new(),
+            generation: 0,
         }
     }
 }

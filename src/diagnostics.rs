@@ -8,6 +8,21 @@ use crate::workspace::SymbolIndex;
 
 const PLUGIN_LOOKUP_TARGETS: &[(&str, &str)] = &[("setitems", "index"), ("uniqueitems", "index")];
 
+#[derive(Clone, Copy, Debug)]
+pub struct ValidationOptions {
+    pub check_references: bool,
+}
+
+impl ValidationOptions {
+    pub const FULL: Self = Self {
+        check_references: true,
+    };
+
+    pub const LOCAL_ONLY: Self = Self {
+        check_references: false,
+    };
+}
+
 /// Validate a single document against the schema and symbol index.
 ///
 /// Three classes of diagnostic are produced:
@@ -19,6 +34,31 @@ pub fn validate_document(
     doc: &DocumentData,
     schema: Option<&Schema>,
     symbols: &SymbolIndex,
+) -> Vec<Diagnostic> {
+    validate_document_with_options(
+        file_stem,
+        doc,
+        schema,
+        Some(symbols),
+        ValidationOptions::FULL,
+    )
+}
+
+/// Validate only diagnostics that do not require the full workspace symbol index.
+pub fn validate_document_local(
+    file_stem: &str,
+    doc: &DocumentData,
+    schema: Option<&Schema>,
+) -> Vec<Diagnostic> {
+    validate_document_with_options(file_stem, doc, schema, None, ValidationOptions::LOCAL_ONLY)
+}
+
+fn validate_document_with_options(
+    file_stem: &str,
+    doc: &DocumentData,
+    schema: Option<&Schema>,
+    symbols: Option<&SymbolIndex>,
+    options: ValidationOptions,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
@@ -96,6 +136,12 @@ pub fn validate_document(
 
             match ft.type_name {
                 FieldTypeName::Reference => {
+                    if !options.check_references {
+                        continue;
+                    }
+                    let Some(symbols) = symbols else {
+                        continue;
+                    };
                     if cell.value.trim().is_empty() {
                         continue;
                     }
@@ -227,4 +273,124 @@ fn reference_target_columns(file_stem: &str, schema: Option<&Schema>) -> HashSet
         }
     }
     targets
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tower_lsp::lsp_types::Url;
+
+    use super::*;
+    use crate::schema::{FieldType, SchemaField, SchemaFile};
+
+    fn schema_field(
+        name: &str,
+        type_name: FieldTypeName,
+        file: Option<&str>,
+        field: Option<&str>,
+    ) -> SchemaField {
+        SchemaField {
+            name: name.to_string(),
+            description: None,
+            field_type: Some(FieldType {
+                type_name,
+                data_length: 0,
+                mem_size: 0,
+                file: file.map(str::to_string),
+                field: field.map(str::to_string),
+            }),
+            alt_names: vec![],
+            append_field: None,
+            table: None,
+        }
+    }
+
+    fn test_schema() -> Schema {
+        let mut files = HashMap::new();
+        files.insert(
+            "source".to_string(),
+            SchemaFile {
+                fields: vec![
+                    schema_field("id", FieldTypeName::Text, None, None),
+                    schema_field(
+                        "ref",
+                        FieldTypeName::Reference,
+                        Some("target"),
+                        Some("code"),
+                    ),
+                    schema_field("qty", FieldTypeName::Int, None, None),
+                    schema_field("enabled", FieldTypeName::Boolean, None, None),
+                ],
+                ..Default::default()
+            },
+        );
+        files.insert(
+            "target".to_string(),
+            SchemaFile {
+                fields: vec![schema_field("code", FieldTypeName::Text, None, None)],
+                ..Default::default()
+            },
+        );
+        Schema { files }
+    }
+
+    fn has_message(diags: &[Diagnostic], needle: &str) -> bool {
+        diags.iter().any(|diag| diag.message.contains(needle))
+    }
+
+    #[test]
+    fn validate_document_local_does_not_emit_missing_reference_errors() {
+        let schema = test_schema();
+        let doc = DocumentData::parse("id\tref\tqty\tenabled\nrow1\tmissing\t1\t1\n", '\t');
+
+        let diags = validate_document_local("source", &doc, Some(&schema));
+
+        assert!(
+            !has_message(&diags, "Reference value 'missing' not found in target.code"),
+            "local diagnostics should not report missing references: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn validate_document_still_emits_missing_reference_errors_in_full_mode() {
+        let schema = test_schema();
+        let target_doc = DocumentData::parse("code\npresent\n", '\t');
+        let mut symbols = SymbolIndex::new();
+        let ref_targets = schema.reference_targets();
+        symbols.index_document(
+            &Url::parse("file:///target.txt").unwrap(),
+            "target",
+            &target_doc,
+            &ref_targets,
+        );
+        let source_doc = DocumentData::parse("id\tref\tqty\tenabled\nrow1\tmissing\t1\t1\n", '\t');
+
+        let diags = validate_document("source", &source_doc, Some(&schema), &symbols);
+
+        assert!(
+            has_message(&diags, "Reference value 'missing' not found in target.code"),
+            "full diagnostics should report missing references: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn validate_document_local_keeps_type_parsing_warnings() {
+        let schema = test_schema();
+        let doc = DocumentData::parse("id\tref\tqty\tenabled\nrow1\tmissing\tbad\t2\n", '\t');
+
+        let diags = validate_document_local("source", &doc, Some(&schema));
+
+        assert!(
+            has_message(&diags, "'bad' is not a valid integer for column 'qty'"),
+            "local diagnostics should keep integer warnings: {diags:?}"
+        );
+        assert!(
+            has_message(
+                &diags,
+                "'2' is not a valid boolean for column 'enabled' (expected empty, 0, or 1)"
+            ),
+            "local diagnostics should keep boolean warnings: {diags:?}"
+        );
+    }
 }

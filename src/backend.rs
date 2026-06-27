@@ -214,9 +214,10 @@ impl Backend {
         }
         let schema_total = t_schema_start.elapsed();
 
-        // Plugin diagnostics are async and must remain sequential.
+        // Plugin diagnostics are async and must remain sequential, but publishing does
+        // not need to wait for every file's plugin diagnostics to finish.
         let mut plugin_total = std::time::Duration::ZERO;
-        let mut pending_publish: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
+        let mut publish_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         for (uri, stem, doc, schema_diags) in schema_results {
             let t = Instant::now();
             let plugin_diags = match (&shared, doc.as_ref(), &self.plugin_host) {
@@ -229,13 +230,7 @@ impl Backend {
             plugin_total += t.elapsed();
             let mut diags = schema_diags;
             diags.extend(plugin_diags);
-            pending_publish.push((uri, diags));
-        }
 
-        // Publish all diagnostics concurrently so they arrive at the client in a
-        // burst rather than trickling in one sequential await at a time.
-        let mut publish_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        for (uri, diags) in pending_publish {
             let client = self.client.clone();
             publish_set.spawn(async move {
                 client.publish_diagnostics(uri, diags, None).await;
