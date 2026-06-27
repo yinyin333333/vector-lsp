@@ -111,6 +111,49 @@ impl Backend {
         }
     }
 
+    async fn publish_diagnostics_for_target(
+        &self,
+        uri: Url,
+        diags: Vec<Diagnostic>,
+        target: DiagnosticPublishTarget,
+    ) {
+        match target {
+            DiagnosticPublishTarget::Startup { scan_generation } => {
+                self.publish_startup_diagnostics_if_safe(uri, diags, scan_generation)
+                    .await;
+            }
+            DiagnosticPublishTarget::OpenDocument {
+                generation,
+                version,
+            } => {
+                self.publish_open_document_diagnostics_if_current(uri, generation, version, diags)
+                    .await;
+            }
+        }
+    }
+
+    async fn build_plugin_workspace_shared(
+        &self,
+    ) -> Option<(
+        Arc<runtime::WorkspaceFileSnapshot>,
+        Arc<runtime::WorkspaceIndex>,
+    )> {
+        self.plugin_host.as_ref()?;
+
+        let (open_documents, file_cache) = {
+            let ws = self.workspace.read().await;
+            (ws.open_documents.clone(), ws.file_cache.clone())
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let snapshot = plugin::build_workspace_snapshot(&open_documents, &file_cache);
+            let idx = runtime::build_workspace_index(&open_documents, &file_cache);
+            (snapshot, idx)
+        })
+        .await
+        .ok()
+    }
+
     fn spawn_final_document_diagnostics(&self, uri: Url, generation: u64, version: Option<i32>) {
         let backend = self.clone();
         tokio::spawn(async move {
@@ -128,7 +171,7 @@ impl Backend {
     ) {
         let stem = Self::file_stem(&uri);
 
-        let (doc, schema, symbols, plugin_data) = {
+        let (doc, schema, symbols) = {
             let ws = self.workspace.read().await;
 
             if !ws.should_publish_generation(&uri, generation)
@@ -145,14 +188,8 @@ impl Backend {
 
             let schema = ws.schema.clone();
             let symbols = Arc::new(ws.symbols.clone());
-            let plugin_data = self.plugin_host.as_ref().map(|_| {
-                let ctx = plugin::build_context(&stem, &doc);
-                let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-                let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-                (ctx, idx, snap)
-            });
 
-            (doc, schema, symbols, plugin_data)
+            (doc, schema, symbols)
         };
 
         let schema_diags = tokio::task::spawn_blocking({
@@ -166,15 +203,33 @@ impl Backend {
         .await
         .unwrap_or_default();
 
-        let plugin_diags = match (plugin_data, &self.plugin_host) {
-            (Some((ctx, idx, snap)), Some(ph)) => ph.run(ctx, idx, snap).await,
+        self.publish_open_document_diagnostics_if_current(
+            uri.clone(),
+            generation,
+            version,
+            schema_diags.clone(),
+        )
+        .await;
+
+        let plugin_diags = match (
+            self.build_plugin_workspace_shared().await,
+            &self.plugin_host,
+        ) {
+            (Some((snap, idx)), Some(ph)) => {
+                let ctx = plugin::build_context(&stem, &doc);
+                ph.run(ctx, idx, snap).await
+            }
             _ => vec![],
         };
 
-        let mut diags = schema_diags;
-        diags.extend(plugin_diags);
+        if plugin_diags.is_empty() {
+            return;
+        }
 
-        self.publish_open_document_diagnostics_if_current(uri, generation, version, diags)
+        let mut final_diags = schema_diags;
+        final_diags.extend(plugin_diags);
+
+        self.publish_open_document_diagnostics_if_current(uri, generation, version, final_diags)
             .await;
     }
 
@@ -278,18 +333,6 @@ impl Backend {
             )
             .await;
 
-        // Build workspace snapshot + index once for plugins; shared via Arc.
-        let t_snapshot_start = Instant::now();
-        let shared = if self.plugin_host.is_some() {
-            let ws = self.workspace.read().await;
-            let snapshot = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-            let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-            Some((snapshot, idx))
-        } else {
-            None
-        };
-        let t_snapshot = t_snapshot_start.elapsed();
-
         // Snapshot schema + symbol index once under a single read lock, then release it.
         // Cloning SymbolIndex (one HashMap copy) lets all spawn_blocking tasks validate
         // in parallel without any of them holding the workspace lock.
@@ -363,13 +406,40 @@ impl Backend {
             });
         }
         // Plugin diagnostics are async and must remain sequential, but publishing does
-        // not need to wait for every file's plugin diagnostics to finish.
-        let mut plugin_total = std::time::Duration::ZERO;
-        let mut publish_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // not gate the first schema/reference diagnostics publish.
+        let mut schema_results = Vec::new();
+        let mut schema_publish_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         while let Some(result) = diag_set.join_next().await {
             let Ok((uri, stem, doc, target, schema_diags)) = result else {
                 continue;
             };
+
+            let schema_prepublished = !schema_diags.is_empty()
+                || matches!(target, DiagnosticPublishTarget::OpenDocument { .. });
+            if schema_prepublished {
+                let backend = self.clone();
+                let publish_uri = uri.clone();
+                let publish_diags = schema_diags.clone();
+                schema_publish_set.spawn(async move {
+                    backend
+                        .publish_diagnostics_for_target(publish_uri, publish_diags, target)
+                        .await;
+                });
+            }
+
+            schema_results.push((uri, stem, doc, target, schema_diags, schema_prepublished));
+        }
+        while schema_publish_set.join_next().await.is_some() {}
+        let schema_total = t_schema_start.elapsed();
+
+        let t_snapshot_start = Instant::now();
+        let shared = self.build_plugin_workspace_shared().await;
+        let t_snapshot = t_snapshot_start.elapsed();
+
+        let mut plugin_total = std::time::Duration::ZERO;
+        let t_plugin_publish_start = Instant::now();
+        let mut plugin_publish_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        for (uri, stem, doc, target, schema_diags, schema_prepublished) in schema_results {
             let t = Instant::now();
             let plugin_diags = match (&shared, doc.as_ref(), &self.plugin_host) {
                 (Some((snap, idx)), Some(d), Some(ph)) => {
@@ -379,40 +449,33 @@ impl Backend {
                 _ => vec![],
             };
             plugin_total += t.elapsed();
-            let mut diags = schema_diags;
-            diags.extend(plugin_diags);
+            if plugin_diags.is_empty() && schema_prepublished {
+                continue;
+            }
+
+            let mut final_diags = schema_diags;
+            final_diags.extend(plugin_diags);
 
             let backend = self.clone();
-            publish_set.spawn(async move {
-                match target {
-                    DiagnosticPublishTarget::Startup { scan_generation } => {
-                        backend
-                            .publish_startup_diagnostics_if_safe(uri, diags, scan_generation)
-                            .await;
-                    }
-                    DiagnosticPublishTarget::OpenDocument {
-                        generation,
-                        version,
-                    } => {
-                        backend
-                            .publish_open_document_diagnostics_if_current(
-                                uri, generation, version, diags,
-                            )
-                            .await;
-                    }
-                }
+            plugin_publish_set.spawn(async move {
+                backend
+                    .publish_diagnostics_for_target(uri, final_diags, target)
+                    .await;
             });
         }
-        while publish_set.join_next().await.is_some() {}
-        let schema_total = t_schema_start.elapsed().saturating_sub(plugin_total);
+        while plugin_publish_set.join_next().await.is_some() {}
+        let plugin_publish_total = t_plugin_publish_start
+            .elapsed()
+            .saturating_sub(plugin_total);
 
         let total = t_index.elapsed();
         self.client
             .log_message(
                 MessageType::LOG,
                 format!(
-                    "vlsp perf [{count} files]: snapshot={t_snapshot:.0?} \
-                     schema={schema_total:.0?}(parallel) plugins={plugin_total:.0?} total={total:.0?}"
+                    "vlsp perf [{count} files]: schema_wall={schema_total:.0?}(parallel) \
+                     plugin_workspace={t_snapshot:.0?} plugin_wall={plugin_total:.0?} \
+                     plugin_publish={plugin_publish_total:.0?} total={total:.0?}"
                 ),
             )
             .await;

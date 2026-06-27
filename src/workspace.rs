@@ -156,6 +156,9 @@ impl Workspace {
     }
 
     pub fn should_publish_startup_diagnostics(&self, uri: &Url, scan_generation: u64) -> bool {
+        // Startup diagnostics are intentionally allowed for unopened files even if
+        // the global generation changed while scanning. They must never overwrite
+        // open-document diagnostics, which have their own versioned guard.
         let _ = scan_generation;
         !self.open_documents.contains_key(uri)
     }
