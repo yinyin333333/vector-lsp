@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 
 use crate::document::DocumentData;
+use crate::runtime;
 use crate::schema::Schema;
 
 /// Cross-file symbol index.
@@ -134,6 +135,13 @@ pub struct Workspace {
     pub generation: u64,
     /// True after the initial workspace file cache and symbol index are complete.
     pub startup_index_ready: bool,
+    pub plugin_bundle: Option<Arc<PluginWorkspaceBundle>>,
+}
+
+pub struct PluginWorkspaceBundle {
+    pub generation: u64,
+    pub snapshot: Arc<runtime::WorkspaceFileSnapshot>,
+    pub index: Arc<runtime::WorkspaceIndex>,
 }
 
 impl Workspace {
@@ -148,6 +156,7 @@ impl Workspace {
             ref_targets: HashSet::new(),
             generation: 0,
             startup_index_ready: false,
+            plugin_bundle: None,
         }
     }
 

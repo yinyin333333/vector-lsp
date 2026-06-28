@@ -100,18 +100,21 @@ enum PluginRequest {
         ctx: String,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        generation: u64,
         reply: oneshot::Sender<Vec<Diagnostic>>,
     },
     Hover {
         ctx: Value,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        generation: u64,
         reply: oneshot::Sender<Option<String>>,
     },
     GotoDefinition {
         ctx: Value,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        generation: u64,
         reply: oneshot::Sender<Option<(String, String, String)>>,
     },
 }
@@ -183,9 +186,9 @@ impl PluginHost {
                 }
             }
 
-            // Tracks the last snapshot seen so the column-value cache can be
+            // Tracks the last workspace generation seen so lookup caches are
             // invalidated exactly when the workspace data changes.
-            let mut last_snapshot_ptr: usize = 0;
+            let mut last_workspace_generation: Option<u64> = None;
 
             while let Some(req) = rx.blocking_recv() {
                 match req {
@@ -196,12 +199,12 @@ impl PluginHost {
                         ctx,
                         index,
                         snapshot,
+                        generation,
                         reply,
                     } => {
-                        let ptr = Arc::as_ptr(&snapshot) as usize;
-                        if ptr != last_snapshot_ptr {
+                        if last_workspace_generation != Some(generation) {
                             let _ = rt.exec("__cache_reset__", "var __lookupCache={}; var __colCache={}; var __cvCache={}; var __filteredCvCache={};");
-                            last_snapshot_ptr = ptr;
+                            last_workspace_generation = Some(generation);
                         }
                         rt.set_workspace_index(index);
                         rt.set_workspace_snapshot(snapshot);
@@ -238,8 +241,13 @@ impl PluginHost {
                         ctx,
                         index,
                         snapshot,
+                        generation,
                         reply,
                     } => {
+                        if last_workspace_generation != Some(generation) {
+                            let _ = rt.exec("__cache_reset__", "var __lookupCache={}; var __colCache={}; var __cvCache={}; var __filteredCvCache={};");
+                            last_workspace_generation = Some(generation);
+                        }
                         rt.set_workspace_index(index);
                         rt.set_workspace_snapshot(snapshot);
                         let ctx_json = ctx.to_string();
@@ -297,8 +305,13 @@ impl PluginHost {
                         ctx,
                         index,
                         snapshot,
+                        generation,
                         reply,
                     } => {
+                        if last_workspace_generation != Some(generation) {
+                            let _ = rt.exec("__cache_reset__", "var __lookupCache={}; var __colCache={}; var __cvCache={}; var __filteredCvCache={};");
+                            last_workspace_generation = Some(generation);
+                        }
                         rt.set_workspace_index(index);
                         rt.set_workspace_snapshot(snapshot);
                         let ctx_json = ctx.to_string();
@@ -340,6 +353,7 @@ impl PluginHost {
         ctx: String,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        generation: u64,
     ) -> Vec<Diagnostic> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -348,6 +362,7 @@ impl PluginHost {
                 ctx,
                 index,
                 snapshot,
+                generation,
                 reply: reply_tx,
             })
             .await
@@ -364,6 +379,7 @@ impl PluginHost {
         ctx: Value,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        generation: u64,
     ) -> Option<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -371,6 +387,7 @@ impl PluginHost {
                 ctx,
                 index,
                 snapshot,
+                generation,
                 reply: reply_tx,
             })
             .await
@@ -385,6 +402,7 @@ impl PluginHost {
         ctx: Value,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        generation: u64,
     ) -> Option<(String, String, String)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -392,6 +410,7 @@ impl PluginHost {
                 ctx,
                 index,
                 snapshot,
+                generation,
                 reply: reply_tx,
             })
             .await
@@ -1397,6 +1416,7 @@ function validate(ctx: PluginContext): string[] {
             build_context(file, doc),
             Arc::clone(&fx.index),
             Arc::clone(&fx.snapshot),
+            0,
         )
         .await
     }
@@ -1879,7 +1899,12 @@ function validate(ctx: PluginContext): string[] {
         let ctx = build_hover_context("cubemain", "input 1", "hpot,qty=3", 1, doc);
 
         let hover = host
-            .hover(ctx.clone(), Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .hover(
+                ctx.clone(),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+                0,
+            )
             .await
             .expect("hover content");
         assert!(
@@ -1892,7 +1917,7 @@ function validate(ctx: PluginContext): string[] {
         );
 
         let target = host
-            .goto_definition(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .goto_definition(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot), 0)
             .await
             .expect("definition target");
         assert_eq!(

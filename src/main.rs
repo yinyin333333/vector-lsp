@@ -231,7 +231,7 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
         if let Some(ph) = &plugin_host {
             let ctx = plugin::build_context(stem, doc);
             diags.extend(
-                ph.run(ctx, Arc::clone(&workspace_index), Arc::clone(&snapshot))
+                ph.run(ctx, Arc::clone(&workspace_index), Arc::clone(&snapshot), 0)
                     .await,
             );
         }
