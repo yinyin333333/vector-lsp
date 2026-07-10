@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-use crate::document::DocumentData;
+use crate::document::{DocumentData, utf16_len};
 use crate::schema::{FieldTypeName, Schema};
 use crate::workspace::SymbolIndex;
 
@@ -54,7 +54,7 @@ pub fn validate_document(
             {
                 let key = cell.value.to_lowercase();
                 if let Some((_first_value, first_line, first_col)) = seen.get(&key) {
-                    let cell_end = cell.col_start + cell.value.chars().count() as u32;
+                    let cell_end = cell.col_start + utf16_len(&cell.value);
                     diags.push(Diagnostic {
                         range: Range {
                             start: Position { line: row.line, character: cell.col_start },
@@ -82,7 +82,7 @@ pub fn validate_document(
 
             let Some(ft) = field_type else { continue };
 
-            let cell_end = cell.col_start + cell.value.chars().count() as u32;
+            let cell_end = cell.col_start + utf16_len(&cell.value);
             let cell_range = Range {
                 start: Position {
                     line: row.line,
@@ -227,4 +227,74 @@ fn reference_target_columns(file_stem: &str, schema: Option<&Schema>) -> HashSet
         }
     }
     targets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{FieldType, SchemaField, SchemaFile};
+
+    #[test]
+    fn diagnostic_ranges_use_utf16_code_units() {
+        let document = DocumentData::parse("lead\tcount\n🙂\tbad", '\t');
+        let mut schema = Schema::default();
+        schema.files.insert(
+            "items".to_string(),
+            SchemaFile {
+                fields: vec![SchemaField {
+                    name: "count".to_string(),
+                    description: None,
+                    field_type: Some(FieldType {
+                        type_name: FieldTypeName::Int,
+                        data_length: 0,
+                        mem_size: 0,
+                        file: None,
+                        field: None,
+                    }),
+                    alt_names: vec![],
+                    append_field: None,
+                    table: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let diagnostics = validate_document("items", &document, Some(&schema), &SymbolIndex::new());
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start, Position::new(1, 3));
+        assert_eq!(diagnostics[0].range.end, Position::new(1, 6));
+    }
+
+    #[test]
+    fn current_unknown_and_ignored_header_behavior_is_fingerprinted_without_new_diagnostics() {
+        let document = DocumentData::parse("known\tignored\tunknown\nvalue\tx\ty", '\t');
+        let mut schema = Schema::default();
+        schema.files.insert(
+            "items".to_string(),
+            SchemaFile {
+                fields: vec![SchemaField {
+                    name: "known".to_string(),
+                    description: None,
+                    field_type: Some(FieldType {
+                        type_name: FieldTypeName::Text,
+                        data_length: 0,
+                        mem_size: 0,
+                        file: None,
+                        field: None,
+                    }),
+                    alt_names: vec![],
+                    append_field: None,
+                    table: None,
+                }],
+                ignore_fields: vec!["ignored".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            validate_document("items", &document, Some(&schema), &SymbolIndex::new()).is_empty(),
+            "current product emits no header-only diagnostics; changing that requires an explicit contract decision"
+        );
+    }
 }

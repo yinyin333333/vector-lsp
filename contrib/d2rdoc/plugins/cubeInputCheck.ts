@@ -1,5 +1,11 @@
 /// <reference path="../../vector-lsp-plugin.d.ts" />
 
+const pluginMetadata: PluginMetadata = {
+    validateFiles: ["cubemain"],
+    hoverFiles: ["cubemain"],
+    gotoDefinitionFiles: ["cubemain"],
+};
+
 // Validates "input #" fields in cubemain.txt.
 //
 // Each cell has the form:   ["]BASE[,MOD[,MOD...]]["]

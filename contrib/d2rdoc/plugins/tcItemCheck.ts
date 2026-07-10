@@ -1,5 +1,11 @@
 /// <reference path="../../vector-lsp-plugin.d.ts" />
 
+const pluginMetadata: PluginMetadata = {
+    validateFiles: ["treasureclassex"],
+    hoverFiles: ["treasureclassex"],
+    gotoDefinitionFiles: ["treasureclassex"],
+};
+
 // Validates Item# fields in TreasureClassEx.txt.
 //
 // Each Item# cell has the form:   BASE[,KEY=VALUE[,KEY=VALUE...]]

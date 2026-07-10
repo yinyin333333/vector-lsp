@@ -9,6 +9,7 @@ use tower_lsp::lsp_types::Url;
 
 use crate::document::DocumentData;
 use crate::schema::{Schema, format_description};
+use crate::source_selection::effective_workspace_sources;
 
 // ---------------------------------------------------------------------------
 // WorkspaceFileSnapshot — per-file DocumentData references for plugin ops
@@ -88,22 +89,8 @@ pub fn build_workspace_index(
     file_cache: &HashMap<PathBuf, Arc<DocumentData>>,
 ) -> Arc<WorkspaceIndex> {
     let mut idx = WorkspaceIndex::new();
-
-    for (path, doc) in file_cache {
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            index_doc(&mut idx, stem, doc);
-        }
-    }
-    // Open docs are processed second so they overwrite cache column lists.
-    for (uri, doc) in open_docs {
-        let stem = uri
-            .path_segments()
-            .and_then(|s| s.last())
-            .and_then(|n| n.rfind('.').map(|i| &n[..i]))
-            .unwrap_or_default();
-        if !stem.is_empty() {
-            index_doc(&mut idx, stem, doc);
-        }
+    for source in effective_workspace_sources(open_docs, file_cache) {
+        index_doc(&mut idx, &source.stem, &source.document);
     }
 
     Arc::new(idx)
@@ -466,6 +453,14 @@ impl ScriptRuntime {
     /// Call this before each plugin run so `getWorkspaceFile` sees up-to-date data.
     pub fn set_workspace_snapshot(&mut self, snapshot: Arc<WorkspaceFileSnapshot>) {
         self.inner.op_state().borrow_mut().put(snapshot);
+    }
+
+    pub fn execution_handle(&mut self) -> deno_core::v8::IsolateHandle {
+        self.inner.v8_isolate().thread_safe_handle()
+    }
+
+    pub fn cancel_terminate_execution(&mut self) {
+        self.inner.v8_isolate().cancel_terminate_execution();
     }
 
     /// Execute a JavaScript snippet, discarding the return value.

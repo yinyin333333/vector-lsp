@@ -1,5 +1,11 @@
 /// <reference path="../../vector-lsp-plugin.d.ts" />
 
+const pluginMetadata: PluginMetadata = {
+    validateFiles: ["uniqueitems", "books", "charstats", "gamble", "gems", "monequip", "setitems", "runes"],
+    hoverFiles: ["uniqueitems", "books", "charstats", "gamble", "gems", "monequip", "setitems", "runes"],
+    gotoDefinitionFiles: ["uniqueitems", "books", "charstats", "gamble", "gems", "monequip", "setitems", "runes"],
+};
+
 // Validates fields that must contain a valid item code (weapons/armor/misc)
 // but are typed as plain text in the schema because they resolve against
 // multiple source files simultaneously.

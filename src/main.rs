@@ -3,14 +3,18 @@ mod cli;
 mod contrib;
 mod diagnostics;
 mod document;
+#[cfg(test)]
+mod performance_measurement_tests;
 mod plugin;
 mod runtime;
+mod scan;
 mod schema;
 mod settings;
+mod source_selection;
 mod workspace;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -21,9 +25,10 @@ use tower_lsp::{LspService, Server};
 
 use cli::CliArgs;
 use document::DocumentData;
-use runtime::{WorkspaceFileSnapshot, build_workspace_index};
+use runtime::build_workspace_index;
 use schema::find_loader;
 use settings::{IoType, VectorLspSettings};
+use source_selection::effective_workspace_sources;
 use workspace::{SymbolIndex, Workspace};
 
 /// Append sorted .ts/.js plugin files from `dir` to `out`, skipping `_patches.js`.
@@ -65,28 +70,6 @@ fn collect_plugin_paths(settings: &VectorLspSettings) -> Vec<std::path::PathBuf>
     paths
 }
 
-fn collect_data_files(root: &Path, ext: &str) -> std::io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let mut entries: Vec<_> = std::fs::read_dir(&dir)?.filter_map(|e| e.ok()).collect();
-        entries.sort_by_key(|e| e.path());
-
-        for entry in entries {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-                files.push(path);
-            }
-        }
-    }
-
-    files.sort();
-    Ok(files)
-}
-
 fn diagnostic_severity_name(diag: &Diagnostic) -> &'static str {
     match diag.severity {
         Some(DiagnosticSeverity::ERROR) => "error",
@@ -122,7 +105,13 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
     let plugin_host = if plugin_paths.is_empty() {
         None
     } else {
-        Some(plugin::PluginHost::new(plugin_paths.clone()))
+        match plugin::PluginHost::new(plugin_paths.clone()) {
+            Ok(host) => Some(host),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 2;
+            }
+        }
     };
 
     // Load schema if a path or variant is configured.
@@ -170,19 +159,27 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
     // Scan and parse workspace files.
     let ext = settings.extension.as_str();
     let delimiter = settings.delimiter_char();
-    let entries = match collect_data_files(&workspace_path, ext) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!(
-                "error: cannot read workspace directory '{}': {e}",
-                workspace_path.display()
-            );
-            return 2;
-        }
-    };
+    let discovery =
+        match scan::collect_data_files(&workspace_path, &scan::ScanPolicy::standalone(ext)) {
+            Ok(discovery) => discovery,
+            Err(e) => {
+                eprintln!(
+                    "error: cannot read workspace directory '{}': {e}",
+                    workspace_path.display()
+                );
+                return 2;
+            }
+        };
+    for failure in &discovery.failures {
+        eprintln!(
+            "warning: skipping '{}': {}",
+            failure.path.display(),
+            failure.reason
+        );
+    }
 
     let mut parsed: Vec<(std::path::PathBuf, String, Arc<DocumentData>)> = Vec::new();
-    for path in entries {
+    for path in discovery.paths {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -198,37 +195,33 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
     }
     parsed.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Build symbol index.
-    let mut symbols = SymbolIndex::new();
-    for (path, stem, doc) in &parsed {
-        let Ok(uri) = tower_lsp::lsp_types::Url::from_file_path(path) else {
-            continue;
-        };
-        symbols.index_document(&uri, stem, doc, &ref_targets);
-    }
-
     let mut file_cache: HashMap<PathBuf, Arc<DocumentData>> = HashMap::new();
     for (path, _, doc) in &parsed {
         file_cache.insert(path.clone(), Arc::clone(doc));
     }
     let open_documents = HashMap::new();
-    let workspace_index = build_workspace_index(&open_documents, &file_cache);
-    let mut snapshot = WorkspaceFileSnapshot::new();
-    for (path, doc) in &file_cache {
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            snapshot.files.insert(stem.to_lowercase(), Arc::clone(doc));
-        }
+    let effective_sources = effective_workspace_sources(&open_documents, &file_cache);
+    let mut symbols = SymbolIndex::new();
+    for source in &effective_sources {
+        let Some(uri) = &source.uri else { continue };
+        symbols.index_document(uri, &source.stem, &source.document, &ref_targets);
     }
-    let snapshot = Arc::new(snapshot);
+    let workspace_index = build_workspace_index(&open_documents, &file_cache);
+    let snapshot = plugin::build_workspace_snapshot(&open_documents, &file_cache);
 
     // Validate and collect diagnostics.
     let mut counts = (0usize, 0usize, 0usize, 0usize);
     let mut file_count = 0usize;
 
-    for (path, stem, doc) in &parsed {
+    for source in &effective_sources {
+        let Some(path) = &source.path else { continue };
+        let stem = &source.stem;
+        let doc = &source.document;
         let mut diags =
             diagnostics::validate_document(stem, doc, schema_result.as_deref(), &symbols);
-        if let Some(ph) = &plugin_host {
+        if let Some(ph) = &plugin_host
+            && ph.validates_file(stem)
+        {
             let ctx = plugin::build_context(stem, doc);
             diags.extend(
                 ph.run(ctx, Arc::clone(&workspace_index), Arc::clone(&snapshot))
@@ -264,36 +257,48 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
 
-    let raw = Config::builder()
-        .add_source(File::with_name(&args.config_file).required(false))
+    let mut config_builder = Config::builder();
+    if !args.editor_mode {
+        config_builder =
+            config_builder.add_source(File::with_name(&args.config_file).required(false));
+    }
+    let raw = config_builder
         .add_source(Environment::with_prefix("VLSP"))
         .build()?;
 
     let mut settings = raw
         .try_deserialize::<VectorLspSettings>()
-        .unwrap_or_default();
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "invalid vector-lsp configuration from '{}': {error}",
+                args.config_file
+            )
+        })?;
     if let Some(schema_path) = args.schema_path {
         settings.schema_path = Some(schema_path);
     }
+    if args.editor_mode {
+        settings.apply_editor_mode();
+    }
+    settings.validate()?;
     let settings = Arc::new(settings);
 
-    if settings.single_shot || args.single_shot {
+    if !settings.editor_mode && (settings.single_shot || args.single_shot) {
         let code = run_check(&settings).await;
         std::process::exit(code);
     }
 
-    let workspace = Arc::new(RwLock::new(Workspace::new()));
-    // PluginHost is Clone (wraps an mpsc::Sender) so it can be shared cheaply
-    // across TCP connections without spawning additional threads.
     let plugin_paths = collect_plugin_paths(&settings);
-    let plugin_host = if plugin_paths.is_empty() {
-        None
-    } else {
-        Some(plugin::PluginHost::new(plugin_paths))
-    };
 
     match settings.io_type.clone() {
         IoType::Stdio => {
+            let workspace = Arc::new(RwLock::new(Workspace::new()));
+            let publish_gates = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let plugin_host = if plugin_paths.is_empty() {
+                None
+            } else {
+                Some(plugin::PluginHost::new(plugin_paths)?)
+            };
             let stdin = tokio::io::stdin();
             let stdout = tokio::io::stdout();
             let (service, socket) = LspService::new(move |client| backend::Backend {
@@ -301,23 +306,37 @@ async fn main() -> anyhow::Result<()> {
                 settings: Arc::clone(&settings),
                 workspace: Arc::clone(&workspace),
                 plugin_host: plugin_host.clone(),
+                publish_gates: Arc::clone(&publish_gates),
             });
             Server::new(stdin, stdout, socket).serve(service).await;
         }
         IoType::Tcp(tcp) => {
             let addr = format!("{}:{}", tcp.host, tcp.port);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
+            let plugin_paths = Arc::new(plugin_paths);
             loop {
                 let (stream, _) = listener.accept().await?;
                 let (read, write) = tokio::io::split(stream);
                 let settings = Arc::clone(&settings);
-                let workspace = Arc::clone(&workspace);
-                let plugin_host = plugin_host.clone();
+                let workspace = Arc::new(RwLock::new(Workspace::new()));
+                let publish_gates = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let plugin_host = if plugin_paths.is_empty() {
+                    None
+                } else {
+                    match plugin::PluginHost::new(plugin_paths.as_ref().clone()) {
+                        Ok(host) => Some(host),
+                        Err(error) => {
+                            eprintln!("vector-lsp: TCP plugin runtime startup failed: {error}");
+                            continue;
+                        }
+                    }
+                };
                 let (service, socket) = LspService::new(move |client| backend::Backend {
                     client,
                     settings: Arc::clone(&settings),
                     workspace: Arc::clone(&workspace),
                     plugin_host: plugin_host.clone(),
+                    publish_gates: Arc::clone(&publish_gates),
                 });
                 tokio::spawn(async move {
                     Server::new(read, write, socket).serve(service).await;
