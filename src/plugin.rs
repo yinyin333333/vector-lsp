@@ -148,19 +148,33 @@ impl OperationApplicability {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PluginOperationCounts {
+    validate: usize,
+    hover: usize,
+    goto_definition: usize,
+}
+
 #[derive(Clone, Debug)]
 struct PluginApplicability {
     validate: OperationApplicability,
     hover: OperationApplicability,
     goto_definition: OperationApplicability,
+    counts: PluginOperationCounts,
 }
 
 impl From<RawPluginApplicability> for PluginApplicability {
     fn from(raw: RawPluginApplicability) -> Self {
+        let counts = PluginOperationCounts {
+            validate: raw.validate.len(),
+            hover: raw.hover.len(),
+            goto_definition: raw.goto_definition.len(),
+        };
         Self {
             validate: OperationApplicability::from_plugins(raw.validate),
             hover: OperationApplicability::from_plugins(raw.hover),
             goto_definition: OperationApplicability::from_plugins(raw.goto_definition),
+            counts,
         }
     }
 }
@@ -240,6 +254,7 @@ impl PluginHost {
                 "__seed__",
                 "var __plugins = []; var __hovers = []; var __gotos = [];\
                  var __activePluginName=null;\
+                 var __requestCtx=null;\
                  var __lookupCache={};\
                  var __colCache={};\
                  var __cvCache={};\
@@ -309,6 +324,10 @@ impl PluginHost {
                     .map(PluginApplicability::from)
                     .map_err(|error| format!("plugin applicability metadata failed: {error}"))
             };
+            let operation_counts = applicability
+                .as_ref()
+                .map(|value| value.counts)
+                .unwrap_or_default();
             if startup_tx.send(applicability).is_err() {
                 return;
             }
@@ -330,26 +349,13 @@ impl PluginHost {
                         reply,
                     } => {
                         install_workspace_view(&mut rt, &mut last_snapshot_ptr, index, snapshot);
-                        rt.set_ctx_json(ctx);
-                        let expr = "(function(){\
-                            var ctx=JSON.parse(Deno.core.ops.op_get_ctx_json());\
-                            var results=[];\
-                            for(var i=0;i<__plugins.length;i++){\
-                                var plugin=__plugins[i];__activePluginName=plugin.name;\
-                                if(plugin.files!==null&&plugin.files.indexOf(String(ctx.file).toLowerCase())<0)continue;\
-                                try{var diagnostics=plugin.fn(ctx);results.push({plugin:plugin.name,diagnostics:diagnostics==null?[]:diagnostics,error:null});}\
-                                catch(error){results.push({plugin:plugin.name,diagnostics:[],error:String(error)});}\
-                            }\
-                            __activePluginName=null;return results;\
-                        })()";
-                        let (raw, timed_out) =
-                            eval_json_with_budget(&mut rt, expr, execution_budget);
-                        let diags = if timed_out {
-                            report_plugin_timeout(&mut rt, &thread_health, "validate");
-                            vec![]
-                        } else {
-                            validation_results(raw, &thread_health)
-                        };
+                        let diags = run_validation_plugins(
+                            &mut rt,
+                            &thread_health,
+                            ctx,
+                            operation_counts.validate,
+                            execution_budget,
+                        );
                         let _ = reply.send(diags);
                     }
                     PluginRequest::Hover {
@@ -364,49 +370,13 @@ impl PluginHost {
                         if debug {
                             eprintln!("[hover-debug] ctx={ctx_json}");
                         }
-                        let expr = format!(
-                            "(function(ctx){{\
-                                var errors=[];\
-                                for(var i=0;i<__hovers.length;i++){{\
-                                    var plugin=__hovers[i];__activePluginName=plugin.name;\
-                                    if(plugin.files!==null&&plugin.files.indexOf(String(ctx.file).toLowerCase())<0)continue;\
-                                    try{{var value=plugin.fn(ctx);if(value!=null)return {{value:value,errors:errors}};}}\
-                                    catch(error){{errors.push({{plugin:plugin.name,error:String(error)}});}}\
-                                }}\
-                                __activePluginName=null;return {{value:null,errors:errors}};\
-                            }})({ctx_json})"
+                        let result = run_hover_plugins(
+                            &mut rt,
+                            &thread_health,
+                            ctx_json,
+                            operation_counts.hover,
+                            execution_budget,
                         );
-                        let (raw, timed_out) =
-                            eval_json_with_budget(&mut rt, &expr, execution_budget);
-                        let result = if timed_out {
-                            report_plugin_timeout(&mut rt, &thread_health, "hover");
-                            None
-                        } else {
-                            plugin_value_result(raw, &thread_health, "hover").and_then(|value| {
-                                match value {
-                                    Value::Null => None,
-                                    Value::Object(_) => serde_json::from_value::<RawHover>(value)
-                                        .map(|hover| hover.content)
-                                        .map_err(|error| {
-                                            thread_health.report_once(
-                                                "hover-shape",
-                                                format!(
-                                                    "plugin hover result has invalid shape: {error}"
-                                                ),
-                                            );
-                                        })
-                                        .ok(),
-                                    Value::String(content) => Some(content),
-                                    _ => {
-                                        thread_health.report_once(
-                                            "hover-shape",
-                                            "plugin hover result has invalid shape",
-                                        );
-                                        None
-                                    }
-                                }
-                            })
-                        };
                         if debug {
                             eprintln!("[hover-debug] result={result:?}");
                         }
@@ -419,56 +389,13 @@ impl PluginHost {
                         reply,
                     } => {
                         install_workspace_view(&mut rt, &mut last_snapshot_ptr, index, snapshot);
-                        let ctx_json = ctx.to_string();
-                        let expr = format!(
-                            "(function(ctx){{\
-                                var errors=[];\
-                                for(var i=0;i<__gotos.length;i++){{\
-                                    var plugin=__gotos[i];__activePluginName=plugin.name;\
-                                    if(plugin.files!==null&&plugin.files.indexOf(String(ctx.file).toLowerCase())<0)continue;\
-                                    try{{var value=plugin.fn(ctx);if(value!=null)return {{value:value,errors:errors}};}}\
-                                    catch(error){{errors.push({{plugin:plugin.name,error:String(error)}});}}\
-                                }}\
-                                __activePluginName=null;return {{value:null,errors:errors}};\
-                            }})({ctx_json})"
+                        let result = run_goto_definition_plugins(
+                            &mut rt,
+                            &thread_health,
+                            ctx.to_string(),
+                            operation_counts.goto_definition,
+                            execution_budget,
                         );
-                        let (raw, timed_out) =
-                            eval_json_with_budget(&mut rt, &expr, execution_budget);
-                        let result = if timed_out {
-                            report_plugin_timeout(&mut rt, &thread_health, "gotoDefinition");
-                            None
-                        } else {
-                            plugin_value_result(raw, &thread_health, "gotoDefinition").and_then(
-                                |value| match value {
-                                    Value::Null => None,
-                                    Value::Object(_) => {
-                                        match serde_json::from_value::<RawGotoTarget>(value) {
-                                            Ok(target) => Some((
-                                                target.target_file,
-                                                target.target_col,
-                                                target.target_value,
-                                            )),
-                                            Err(error) => {
-                                                thread_health.report_once(
-                                                    "goto-shape",
-                                                    format!(
-                                                        "plugin gotoDefinition result has invalid shape: {error}"
-                                                    ),
-                                                );
-                                                None
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        thread_health.report_once(
-                                            "goto-shape",
-                                            "plugin gotoDefinition result has invalid shape",
-                                        );
-                                        None
-                                    }
-                                },
-                            )
-                        };
                         let _ = reply.send(result);
                     }
                 }
@@ -665,6 +592,208 @@ fn install_workspace_view(
     runtime.set_workspace_snapshot(snapshot);
 }
 
+const VALIDATION_PLUGIN_EXPRESSION: &str = "(function(){\
+    var plugin=__plugins[__INDEX__];__activePluginName=plugin.name;\
+    if(plugin.files!==null&&plugin.files.indexOf(String(__requestCtx.file).toLowerCase())<0){__activePluginName=null;return [];}\
+    try{var diagnostics=plugin.fn(__requestCtx);__activePluginName=null;return [{plugin:plugin.name,diagnostics:diagnostics==null?[]:diagnostics,error:null}];}\
+    catch(error){__activePluginName=null;return [{plugin:plugin.name,diagnostics:[],error:String(error)}];}\
+})()";
+
+const PLUGIN_VALUE_EXPRESSION: &str = "(function(){\
+    var plugin=__REGISTRY__[__INDEX__];__activePluginName=plugin.name;\
+    if(plugin.files!==null&&plugin.files.indexOf(String(__requestCtx.file).toLowerCase())<0){__activePluginName=null;return {value:null,errors:[]};}\
+    try{var value=plugin.fn(__requestCtx);__activePluginName=null;return {value:value==null?null:value,errors:[]};}\
+    catch(error){__activePluginName=null;return {value:null,errors:[{plugin:plugin.name,error:String(error)}]};}\
+})()";
+
+fn prepare_plugin_context(
+    runtime: &mut ScriptRuntime,
+    health: &PluginHealth,
+    operation: &str,
+    ctx_json: String,
+    budget: Duration,
+) -> bool {
+    runtime.set_ctx_json(ctx_json);
+    let (result, timed_out) = eval_json_with_budget(
+        runtime,
+        "(function(){__requestCtx=JSON.parse(Deno.core.ops.op_get_ctx_json());return null;})()",
+        budget,
+    );
+    if timed_out {
+        health.report_once(
+            format!("{operation}-context-timeout"),
+            format!("plugin {operation} context preparation exceeded the execution budget"),
+        );
+        clear_plugin_request_state(runtime);
+        return false;
+    }
+    if let Err(error) = result {
+        health.report_once(
+            format!("{operation}-context"),
+            format!("plugin {operation} context preparation failed: {error}"),
+        );
+        clear_plugin_request_state(runtime);
+        return false;
+    }
+    true
+}
+
+fn clear_plugin_request_state(runtime: &mut ScriptRuntime) {
+    let _ = runtime.exec(
+        "__plugin_request_cleanup__",
+        "__activePluginName=null;__requestCtx=null;",
+    );
+}
+
+fn validation_plugin_expression(plugin_index: usize) -> String {
+    VALIDATION_PLUGIN_EXPRESSION.replace("__INDEX__", &plugin_index.to_string())
+}
+
+fn plugin_value_expression(registry: &str, plugin_index: usize) -> String {
+    PLUGIN_VALUE_EXPRESSION
+        .replace("__REGISTRY__", registry)
+        .replace("__INDEX__", &plugin_index.to_string())
+}
+
+fn run_validation_plugins(
+    runtime: &mut ScriptRuntime,
+    health: &PluginHealth,
+    ctx_json: String,
+    plugin_count: usize,
+    budget: Duration,
+) -> Vec<Diagnostic> {
+    if !prepare_plugin_context(runtime, health, "validate", ctx_json, budget) {
+        return vec![];
+    }
+    let mut diagnostics = Vec::new();
+    for plugin_index in 0..plugin_count {
+        let expression = validation_plugin_expression(plugin_index);
+        let (raw, timed_out) = eval_json_with_budget(runtime, &expression, budget);
+        if timed_out {
+            report_plugin_timeout(runtime, health, "validate");
+            continue;
+        }
+        diagnostics.extend(validation_results(raw, health));
+    }
+    clear_plugin_request_state(runtime);
+    diagnostics
+}
+
+fn run_hover_plugins(
+    runtime: &mut ScriptRuntime,
+    health: &PluginHealth,
+    ctx_json: String,
+    plugin_count: usize,
+    budget: Duration,
+) -> Option<String> {
+    if !prepare_plugin_context(runtime, health, "hover", ctx_json, budget) {
+        return None;
+    }
+    let mut result = None;
+    for plugin_index in 0..plugin_count {
+        let expression = plugin_value_expression("__hovers", plugin_index);
+        let (raw, timed_out) = eval_json_with_budget(runtime, &expression, budget);
+        if timed_out {
+            report_plugin_timeout(runtime, health, "hover");
+            continue;
+        }
+        let Some(value) = plugin_value_result(raw, health, "hover") else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        if let Some(content) = hover_value(value, health) {
+            result = Some(content);
+            break;
+        }
+    }
+    clear_plugin_request_state(runtime);
+    result
+}
+
+fn hover_value(value: Value, health: &PluginHealth) -> Option<String> {
+    match value {
+        value @ Value::Object(_) => match serde_json::from_value::<RawHover>(value) {
+            Ok(hover) => Some(hover.content),
+            Err(error) => {
+                health.report_once(
+                    "hover-shape",
+                    format!("plugin hover result has invalid shape: {error}"),
+                );
+                None
+            }
+        },
+        Value::String(content) => Some(content),
+        _ => {
+            health.report_once("hover-shape", "plugin hover result has invalid shape");
+            None
+        }
+    }
+}
+
+fn run_goto_definition_plugins(
+    runtime: &mut ScriptRuntime,
+    health: &PluginHealth,
+    ctx_json: String,
+    plugin_count: usize,
+    budget: Duration,
+) -> Option<(String, String, String)> {
+    if !prepare_plugin_context(runtime, health, "gotoDefinition", ctx_json, budget) {
+        return None;
+    }
+    let mut result = None;
+    for plugin_index in 0..plugin_count {
+        let expression = plugin_value_expression("__gotos", plugin_index);
+        let (raw, timed_out) = eval_json_with_budget(runtime, &expression, budget);
+        if timed_out {
+            report_plugin_timeout(runtime, health, "gotoDefinition");
+            continue;
+        }
+        let Some(value) = plugin_value_result(raw, health, "gotoDefinition") else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        if let Some(target) = goto_definition_value(value, health) {
+            result = Some(target);
+            break;
+        }
+    }
+    clear_plugin_request_state(runtime);
+    result
+}
+
+fn goto_definition_value(
+    value: Value,
+    health: &PluginHealth,
+) -> Option<(String, String, String)> {
+    match value {
+        value @ Value::Object(_) => match serde_json::from_value::<RawGotoTarget>(value) {
+            Ok(target) => Some((
+                target.target_file,
+                target.target_col,
+                target.target_value,
+            )),
+            Err(error) => {
+                health.report_once(
+                    "goto-shape",
+                    format!("plugin gotoDefinition result has invalid shape: {error}"),
+                );
+                None
+            }
+        },
+        _ => {
+            health.report_once(
+                "goto-shape",
+                "plugin gotoDefinition result has invalid shape",
+            );
+            None
+        }
+    }
+}
+
 fn plugin_execution_budget() -> Duration {
     let milliseconds = std::env::var("VLSP_PLUGIN_TIMEOUT_MS")
         .ok()
@@ -740,6 +869,10 @@ fn report_plugin_timeout(runtime: &mut ScriptRuntime, health: &PluginHealth, ope
     health.report_once(
         format!("timeout:{operation}:{plugin}"),
         format!("plugin '{plugin}' {operation} exceeded the execution budget and was interrupted"),
+    );
+    let _ = runtime.exec(
+        "__plugin_timeout_cleanup__",
+        "__activePluginName=null;",
     );
 }
 

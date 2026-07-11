@@ -358,6 +358,46 @@ fn plugin_execution_budget_interrupts_a_loop_and_keeps_the_queue_usable() {
 }
 
 #[test]
+fn timed_out_validate_plugin_does_not_discard_or_block_healthy_plugins_for_the_same_file() {
+    let tree = TempTree::new("plugin-budget-isolation");
+    let plugins = tree.0.join("plugins");
+    tree.write(
+        "plugins/a_before.js",
+        "function validate(){return [{line:0,col:0,message:'BEFORE_TIMEOUT'}];}\n",
+    );
+    tree.write(
+        "plugins/b_timeout.js",
+        "function validate(){while(true){}}\n",
+    );
+    tree.write(
+        "plugins/c_after.js",
+        "function validate(){return [{line:0,col:0,message:'AFTER_TIMEOUT'}];}\n",
+    );
+    tree.write("workspace/sample.txt", "code\nvalue\n");
+
+    let output = run_with_timeout(&tree, &plugins, Duration::from_secs(3))
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        output.stdout.contains("BEFORE_TIMEOUT")
+            && output.stdout.contains("AFTER_TIMEOUT"),
+        "a timed-out plugin must not discard earlier results or block later plugins:\n{}\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("b_timeout.js")
+            && output.stderr.contains("validate exceeded the execution budget"),
+        "the timed-out plugin must remain identifiable:\n{}\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.status.success(),
+        "timeout isolation should preserve a warning-only successful run"
+    );
+}
+
+#[test]
 fn top_level_plugin_loop_fails_startup_with_an_identifiable_timeout() {
     let tree = TempTree::new("plugin-top-level-budget");
     let plugins = tree.0.join("plugins");
