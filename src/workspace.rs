@@ -267,6 +267,25 @@ impl Workspace {
         version: i32,
         document: Arc<DocumentData>,
     ) -> ValidationTicket {
+        self.accept_open_with_dependency_invalidation(uri, version, document, true)
+    }
+
+    pub fn accept_equivalent_open(
+        &mut self,
+        uri: Url,
+        version: i32,
+        document: Arc<DocumentData>,
+    ) -> ValidationTicket {
+        self.accept_open_with_dependency_invalidation(uri, version, document, false)
+    }
+
+    fn accept_open_with_dependency_invalidation(
+        &mut self,
+        uri: Url,
+        version: i32,
+        document: Arc<DocumentData>,
+        invalidate_dependents: bool,
+    ) -> ValidationTicket {
         self.next_document_epoch += 1;
         self.next_document_revision += 1;
         self.workspace_revision += 1;
@@ -276,8 +295,22 @@ impl Workspace {
             .insert(uri.clone(), self.next_document_epoch);
         self.document_revisions
             .insert(uri.clone(), self.next_document_revision);
-        self.published_revisions.clear();
+        if invalidate_dependents {
+            self.published_revisions.clear();
+        } else {
+            self.published_revisions.remove(&uri);
+        }
         self.current_ticket(&uri).expect("accepted open document")
+    }
+
+    pub fn effective_source_has_same_content(&self, uri: &Url, document: &DocumentData) -> bool {
+        let Some(stem) = normalized_file_stem_from_uri(uri) else {
+            return false;
+        };
+        effective_workspace_sources(&self.open_documents, &self.file_cache)
+            .into_iter()
+            .find(|source| source.stem == stem)
+            .is_some_and(|source| source.document.as_ref() == document)
     }
 
     pub fn accept_change(
@@ -471,6 +504,30 @@ mod tests {
             assert!(workspace.mark_published(&ticket));
         }
         assert!(workspace.pending_open_tickets().is_empty());
+    }
+
+    #[test]
+    fn equivalent_open_preserves_unrelated_publications_and_only_queues_the_opened_uri() {
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(7);
+        workspace.begin_scan();
+        workspace
+            .file_cache
+            .insert(PathBuf::from("C:/workspace/items.txt"), doc("SAME"));
+
+        let unrelated_uri = named_uri("other");
+        workspace.accept_open(unrelated_uri.clone(), 1, doc("OTHER"));
+        mark_all_open_documents_published(&mut workspace);
+
+        let items_uri = named_uri("items");
+        assert!(workspace.effective_source_has_same_content(&items_uri, &doc("SAME")));
+        assert!(!workspace.effective_source_has_same_content(&items_uri, &doc("CHANGED")));
+
+        let items_ticket = workspace.accept_equivalent_open(items_uri.clone(), 1, doc("SAME"));
+        let pending = workspace.pending_open_tickets();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0], items_ticket);
+        assert!(!workspace.needs_publish(&workspace.current_ticket(&unrelated_uri).unwrap()));
     }
 
     #[test]

@@ -185,9 +185,13 @@ impl Backend {
         }
     }
 
-    async fn clear_obsolete_disk_diagnostics(&self) {
+    async fn clear_obsolete_disk_diagnostics_except(&self, replacement_uri: Option<&Url>) {
         let obsolete = self.workspace.read().await.obsolete_disk_diagnostic_uris();
         for uri in obsolete {
+            if replacement_uri == Some(&uri) {
+                self.workspace.write().await.forget_disk_diagnostics(&uri);
+                continue;
+            }
             let gate = self.publish_gate(&uri).await;
             let _guard = gate.lock().await;
             if !self
@@ -204,6 +208,10 @@ impl Backend {
                 .await;
             self.workspace.write().await.forget_disk_diagnostics(&uri);
         }
+    }
+
+    async fn clear_obsolete_disk_diagnostics(&self) {
+        self.clear_obsolete_disk_diagnostics_except(None).await;
     }
 
     async fn validate_disk_documents_for_revision(
@@ -805,15 +813,28 @@ impl LanguageServer for Backend {
             &params.text_document.text,
             self.settings.delimiter_char(),
         ));
-        let ready = {
+        let (ready, equivalent_open, ticket) = {
             let mut ws = self.workspace.write().await;
-            ws.accept_open(uri, version, doc);
+            let equivalent_open = ws.effective_source_has_same_content(&uri, &doc);
+            let ticket = if equivalent_open {
+                ws.accept_equivalent_open(uri, version, doc)
+            } else {
+                ws.accept_open(uri, version, doc)
+            };
             ws.rebuild_effective_symbols();
-            ws.phase == WorkspacePhase::Ready
+            (ws.phase == WorkspacePhase::Ready, equivalent_open, ticket)
         };
         drop(mutation_guard);
         if ready {
-            self.revalidate_workspace_after_change().await;
+            if equivalent_open {
+                self.clear_obsolete_disk_diagnostics_except(Some(&ticket.uri))
+                    .await;
+                if !self.validate_and_publish_open(ticket).await {
+                    self.revalidate_workspace_after_change().await;
+                }
+            } else {
+                self.revalidate_workspace_after_change().await;
+            }
         }
     }
 

@@ -27,17 +27,20 @@ pub fn utf16_offset_to_byte_index(text: &str, offset: u32) -> usize {
 /// `col_start` is the UTF-16 character offset of the cell's value within its line,
 /// used as the anchor for LSP diagnostic ranges. Sub-cell parsers add their own
 /// relative offsets to this value to produce precise positions.
+#[derive(PartialEq, Eq)]
 pub struct Cell {
     pub value: String,
     pub col_start: u32,
 }
 
+#[derive(PartialEq, Eq)]
 pub struct Row {
     pub cells: Vec<Cell>,
     /// 0-based line number within the file.
     pub line: u32,
 }
 
+#[derive(PartialEq, Eq)]
 pub struct DocumentData {
     pub headers: Vec<String>,
     pub rows: Vec<Row>,
