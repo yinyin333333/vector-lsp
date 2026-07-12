@@ -40,14 +40,30 @@ fn scan_plugin_dir(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
-            matches!(
-                p.extension().and_then(|e| e.to_str()),
-                Some("ts") | Some("js")
-            ) && p.file_name().map_or(true, |n| n != "_patches.js")
+            p.is_file()
+                && matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("ts") | Some("js")
+                )
+                && p.file_name().map_or(true, |n| n != "_patches.js")
         })
         .collect();
     found.sort();
     out.extend(found);
+}
+
+/// Preserve tier order while collapsing path aliases of the same plugin file.
+fn deduplicate_plugin_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| {
+            let identity = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone());
+            seen.insert(identity)
+        })
+        .collect()
 }
 
 /// Collect plugin file paths in tier order: base → variant → explicit override.
@@ -67,7 +83,7 @@ fn collect_plugin_paths(settings: &VectorLspSettings) -> Vec<std::path::PathBuf>
     if let Some(ref dir) = settings.plugin_path {
         scan_plugin_dir(dir, &mut paths);
     }
-    paths
+    deduplicate_plugin_paths(paths)
 }
 
 fn diagnostic_severity_name(diag: &Diagnostic) -> &'static str {
@@ -346,4 +362,60 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod plugin_discovery_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_plugin_dir(test_name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "vector-lsp-{test_name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn plugin_scan_keeps_only_regular_javascript_and_typescript_files() {
+        let dir = temp_plugin_dir("plugin-scan");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("b.js"), "function validate() { return []; }").unwrap();
+        fs::write(dir.join("a.ts"), "function validate(): unknown[] { return []; }").unwrap();
+        fs::write(dir.join("_patches.js"), "// schema patch").unwrap();
+        fs::write(dir.join("ignored.txt"), "not a plugin").unwrap();
+        fs::create_dir(dir.join("directory.js")).unwrap();
+
+        let mut paths = Vec::new();
+        scan_plugin_dir(&dir, &mut paths);
+        let names = paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["a.ts", "b.js"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plugin_deduplication_preserves_the_first_tier_and_order() {
+        let dir = temp_plugin_dir("plugin-dedup");
+        fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.js");
+        let second = dir.join("second.js");
+        fs::write(&first, "function validate() { return []; }").unwrap();
+        fs::write(&second, "function validate() { return []; }").unwrap();
+        let alias = dir.join(".").join("first.js");
+
+        assert_eq!(
+            deduplicate_plugin_paths(vec![first.clone(), second.clone(), alias]),
+            vec![first, second]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
