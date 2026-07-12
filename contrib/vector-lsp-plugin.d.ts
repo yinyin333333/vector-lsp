@@ -18,6 +18,13 @@
 // Shared types
 // ---------------------------------------------------------------------------
 
+/** Optional per-operation file-stem routing. Omitted metadata means applies to all files. */
+interface PluginMetadata {
+    validateFiles?: string[];
+    hoverFiles?: string[];
+    gotoDefinitionFiles?: string[];
+}
+
 /** A data row with positional metadata included. */
 interface WorkspaceRow {
     [column: string]: string | number | Record<string, number>;

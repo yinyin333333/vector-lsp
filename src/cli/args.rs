@@ -11,4 +11,7 @@ pub struct CliArgs {
     /// Path to the schema directory (overrides the config `schema_path` setting).
     #[arg(long)]
     pub schema_path: Option<PathBuf>,
+    /// Deterministic TXTeditor launch mode: ignore workspace config and force stdio LSP.
+    #[arg(long)]
+    pub editor_mode: bool,
 }

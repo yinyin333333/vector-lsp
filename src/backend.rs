@@ -1,16 +1,54 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, RwLock};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, jsonrpc::Result as LspResult};
 
 use crate::diagnostics;
-use crate::document::DocumentData;
+use crate::document::{DocumentData, utf16_len, utf16_offset_to_byte_index};
 use crate::plugin;
-use crate::runtime;
+use crate::scan::{ScanFailure, ScanPolicy};
 use crate::schema::{FieldTypeName, find_loader, format_description};
 use crate::settings::VectorLspSettings;
-use crate::workspace::Workspace;
+use crate::source_selection::normalized_file_stem_from_uri;
+use crate::workspace::{DocumentChangeError, ValidationTicket, Workspace, WorkspacePhase};
+
+enum VectorLspReady {}
+
+enum VectorLspFailed {}
+
+const SCAN_CONCURRENCY: usize = 4;
+type ParsedWorkspaceDocument = (Url, std::path::PathBuf, String, Arc<DocumentData>);
+type WorkspaceLoadResult = Result<ParsedWorkspaceDocument, ScanFailure>;
+
+impl tower_lsp::lsp_types::notification::Notification for VectorLspReady {
+    type Params = VectorLspReadyParams;
+    const METHOD: &'static str = "vectorLsp/ready";
+}
+
+impl tower_lsp::lsp_types::notification::Notification for VectorLspFailed {
+    type Params = VectorLspFailedParams;
+    const METHOD: &'static str = "vectorLsp/failed";
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VectorLspReadyParams {
+    session_generation: u64,
+    scan_generation: u64,
+    workspace_revision: u64,
+    root_uri: Option<Url>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VectorLspFailedParams {
+    session_generation: u64,
+    root_uri: Option<Url>,
+    reason: String,
+}
 
 pub struct Backend {
     pub client: Client,
@@ -19,12 +57,349 @@ pub struct Backend {
     pub workspace: Arc<RwLock<Workspace>>,
     /// None when no plugins are configured.
     pub plugin_host: Option<plugin::PluginHost>,
+    pub publish_gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl Backend {
+    async fn fail_workspace(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        let params = {
+            let mut workspace = self.workspace.write().await;
+            workspace.mark_failed();
+            VectorLspFailedParams {
+                session_generation: workspace.session_generation,
+                root_uri: workspace.root_uri.clone(),
+                reason: reason.clone(),
+            }
+        };
+        self.client.log_message(MessageType::ERROR, reason).await;
+        self.client
+            .send_notification::<VectorLspFailed>(params)
+            .await;
+    }
+
+    async fn publish_gate(&self, uri: &Url) -> Arc<Mutex<()>> {
+        let key = normalized_file_stem_from_uri(uri)
+            .map(|stem| format!("stem:{stem}"))
+            .unwrap_or_else(|| format!("uri:{uri}"));
+        let mut gates = self.publish_gates.lock().await;
+        Arc::clone(gates.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+    }
+
+    async fn validate_open_ticket(&self, ticket: &ValidationTicket) -> Option<Vec<Diagnostic>> {
+        let (schema_diags, plugin_data) = {
+            let ws = self.workspace.read().await;
+            if !ws.is_current(ticket) {
+                return None;
+            }
+            let doc = ws.open_documents.get(&ticket.uri)?.clone();
+            let stem = Self::file_stem(&ticket.uri);
+            let schema_diags =
+                diagnostics::validate_document(&stem, &doc, ws.schema.as_deref(), &ws.symbols);
+            let plugin_data = self
+                .plugin_host
+                .as_ref()
+                .filter(|host| host.validates_file(&stem))
+                .map(|_| {
+                    let ctx = plugin::build_context(&stem, &doc);
+                    let view = ws.plugin_workspace_view();
+                    (ctx, view.index, view.snapshot)
+                });
+            (schema_diags, plugin_data)
+        };
+        let plugin_diags = match (plugin_data, &self.plugin_host) {
+            (Some((ctx, idx, snap)), Some(host)) => host.run(ctx, idx, snap).await,
+            _ => vec![],
+        };
+        let mut diagnostics = schema_diags;
+        diagnostics.extend(plugin_diags);
+        Some(diagnostics)
+    }
+
+    async fn publish_open_if_current(
+        &self,
+        ticket: &ValidationTicket,
+        diagnostics: Vec<Diagnostic>,
+    ) -> bool {
+        let gate = self.publish_gate(&ticket.uri).await;
+        let _guard = gate.lock().await;
+        if !self.workspace.read().await.needs_publish(ticket) {
+            return false;
+        }
+        self.client
+            .publish_diagnostics(ticket.uri.clone(), diagnostics, Some(ticket.client_version))
+            .await;
+        self.workspace.write().await.mark_published(ticket)
+    }
+
+    async fn validate_and_publish_open(&self, ticket: ValidationTicket) -> bool {
+        let Some(diagnostics) = self.validate_open_ticket(&ticket).await else {
+            return false;
+        };
+        self.publish_open_if_current(&ticket, diagnostics).await
+    }
+
+    async fn publish_disk_if_current(
+        &self,
+        scan_generation: u64,
+        workspace_revision: u64,
+        uri: Url,
+        diagnostics: Vec<Diagnostic>,
+    ) -> bool {
+        let gate = self.publish_gate(&uri).await;
+        let _guard = gate.lock().await;
+        let current = {
+            let ws = self.workspace.read().await;
+            ws.scan_generation == scan_generation
+                && ws.workspace_revision == workspace_revision
+                && matches!(
+                    ws.phase,
+                    WorkspacePhase::Reconciling | WorkspacePhase::Ready
+                )
+                && ws.disk_diagnostics_allowed(&uri)
+        };
+        if current {
+            let has_diagnostics = !diagnostics.is_empty();
+            self.client
+                .publish_diagnostics(uri.clone(), diagnostics, None)
+                .await;
+            let mut ws = self.workspace.write().await;
+            let still_current = ws.scan_generation == scan_generation
+                && ws.workspace_revision == workspace_revision
+                && matches!(
+                    ws.phase,
+                    WorkspacePhase::Reconciling | WorkspacePhase::Ready
+                )
+                && ws.disk_diagnostics_allowed(&uri);
+            if still_current {
+                ws.record_disk_diagnostics(uri, has_diagnostics);
+                true
+            } else {
+                ws.forget_disk_diagnostics(&uri);
+                drop(ws);
+                self.client.publish_diagnostics(uri, vec![], None).await;
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    async fn clear_obsolete_disk_diagnostics_except(&self, replacement_uri: Option<&Url>) {
+        let obsolete = self.workspace.read().await.obsolete_disk_diagnostic_uris();
+        for uri in obsolete {
+            if replacement_uri == Some(&uri) {
+                self.workspace.write().await.forget_disk_diagnostics(&uri);
+                continue;
+            }
+            let gate = self.publish_gate(&uri).await;
+            let _guard = gate.lock().await;
+            if !self
+                .workspace
+                .read()
+                .await
+                .obsolete_disk_diagnostic_uris()
+                .contains(&uri)
+            {
+                continue;
+            }
+            self.client
+                .publish_diagnostics(uri.clone(), vec![], None)
+                .await;
+            self.workspace.write().await.forget_disk_diagnostics(&uri);
+        }
+    }
+
+    async fn clear_obsolete_disk_diagnostics(&self) {
+        self.clear_obsolete_disk_diagnostics_except(None).await;
+    }
+
+    async fn validate_disk_documents_for_revision(
+        &self,
+        scan_generation: u64,
+        workspace_revision: u64,
+    ) -> bool {
+        self.clear_obsolete_disk_diagnostics().await;
+        let (schema, symbols, shared, documents) = {
+            let ws = self.workspace.read().await;
+            if ws.scan_generation != scan_generation
+                || ws.workspace_revision != workspace_revision
+                || !matches!(
+                    ws.phase,
+                    WorkspacePhase::Reconciling | WorkspacePhase::Ready
+                )
+            {
+                return false;
+            }
+            let documents = ws.disk_documents_for_validation();
+            let shared = self
+                .plugin_host
+                .as_ref()
+                .filter(|host| {
+                    documents
+                        .iter()
+                        .any(|(_, stem, _)| host.validates_file(stem))
+                })
+                .map(|_| {
+                    let view = ws.plugin_workspace_view();
+                    (view.index, view.snapshot)
+                });
+            (
+                ws.schema.clone(),
+                Arc::new(ws.symbols.clone()),
+                shared,
+                documents,
+            )
+        };
+
+        let mut schema_tasks = tokio::task::JoinSet::new();
+        for (uri, stem, document) in documents {
+            let schema = schema.clone();
+            let symbols = Arc::clone(&symbols);
+            schema_tasks.spawn_blocking(move || {
+                let diagnostics =
+                    diagnostics::validate_document(&stem, &document, schema.as_deref(), &symbols);
+                (uri, stem, document, diagnostics)
+            });
+        }
+        let mut results = Vec::new();
+        while let Some(result) = schema_tasks.join_next().await {
+            if let Ok(result) = result {
+                results.push(result);
+            }
+        }
+        results.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+
+        for (uri, stem, document, mut diagnostics) in results {
+            if let (Some((index, snapshot)), Some(host)) = (&shared, &self.plugin_host)
+                && host.validates_file(&stem)
+            {
+                diagnostics.extend(
+                    host.run(
+                        plugin::build_context(&stem, &document),
+                        Arc::clone(index),
+                        Arc::clone(snapshot),
+                    )
+                    .await,
+                );
+            }
+            if !self
+                .publish_disk_if_current(scan_generation, workspace_revision, uri, diagnostics)
+                .await
+            {
+                return false;
+            }
+        }
+        let ws = self.workspace.read().await;
+        ws.scan_generation == scan_generation
+            && ws.workspace_revision == workspace_revision
+            && matches!(
+                ws.phase,
+                WorkspacePhase::Reconciling | WorkspacePhase::Ready
+            )
+    }
+
+    async fn revalidate_workspace_after_change(&self) {
+        loop {
+            let (scan_generation, workspace_revision) = {
+                let ws = self.workspace.read().await;
+                if ws.phase != WorkspacePhase::Ready {
+                    return;
+                }
+                (ws.scan_generation, ws.workspace_revision)
+            };
+            if !self
+                .validate_disk_documents_for_revision(scan_generation, workspace_revision)
+                .await
+            {
+                continue;
+            }
+            let pending = self.workspace.read().await.pending_open_tickets();
+            for ticket in pending {
+                self.validate_and_publish_open(ticket).await;
+            }
+            let ws = self.workspace.read().await;
+            if ws.phase == WorkspacePhase::Ready
+                && ws.scan_generation == scan_generation
+                && ws.workspace_revision == workspace_revision
+                && ws.pending_open_tickets().is_empty()
+            {
+                return;
+            }
+        }
+    }
+
+    async fn reconcile_open_documents_until_ready(&self, scan_generation: u64) {
+        loop {
+            let workspace_revision = {
+                let ws = self.workspace.read().await;
+                if ws.scan_generation != scan_generation || ws.phase != WorkspacePhase::Reconciling
+                {
+                    return;
+                }
+                ws.workspace_revision
+            };
+            if !self
+                .validate_disk_documents_for_revision(scan_generation, workspace_revision)
+                .await
+            {
+                continue;
+            }
+            let pending = self.workspace.read().await.pending_open_tickets();
+            if pending.is_empty() {
+                let ready = {
+                    let mut ws = self.workspace.write().await;
+                    if ws.workspace_revision != workspace_revision
+                        || !ws.mark_ready_if_reconciled(scan_generation)
+                    {
+                        None
+                    } else {
+                        Some(VectorLspReadyParams {
+                            session_generation: ws.session_generation,
+                            scan_generation: ws.scan_generation,
+                            workspace_revision: ws.workspace_revision,
+                            root_uri: ws.root_uri.clone(),
+                        })
+                    }
+                };
+                if let Some(params) = ready {
+                    self.client
+                        .send_notification::<VectorLspReady>(params)
+                        .await;
+                }
+                return;
+            }
+            for ticket in pending {
+                self.validate_and_publish_open(ticket).await;
+            }
+        }
+    }
+
+    async fn report_rejected_change(&self, uri: &Url, error: DocumentChangeError) {
+        let message = match error {
+            DocumentChangeError::NotOpen => {
+                format!("Ignored didChange for unopened document {uri}")
+            }
+            DocumentChangeError::StaleVersion { current, incoming } => format!(
+                "Ignored stale didChange for {uri}: incoming version {incoming}, current version {current}"
+            ),
+        };
+        self.client.log_message(MessageType::WARNING, message).await;
+    }
+
     /// Extract the lowercase file stem from a URI (e.g. `"armor"` from `.../armor.txt`).
     fn file_stem(uri: &Url) -> String {
-        let name = uri.path_segments().and_then(|s| s.last()).unwrap_or("");
+        if let Some(stem) = uri.to_file_path().ok().and_then(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_lowercase)
+        }) {
+            return stem;
+        }
+        let name = uri
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .unwrap_or("");
         match name.rfind('.') {
             Some(i) => name[..i].to_lowercase(),
             None => name.to_lowercase(),
@@ -37,223 +412,221 @@ impl Backend {
         self.settings.encoding.decode(&bytes)
     }
 
-    fn collect_workspace_files(
-        root: &std::path::Path,
-        ext: &str,
-    ) -> std::io::Result<Vec<std::path::PathBuf>> {
-        let mut files = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-
-        while let Some(dir) = stack.pop() {
-            let mut entries: Vec<_> = std::fs::read_dir(&dir)?.filter_map(|e| e.ok()).collect();
-            entries.sort_by_key(|e| e.path());
-
-            for entry in entries {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-                    files.push(path);
-                }
-            }
-        }
-
-        files.sort();
-        Ok(files)
-    }
-
     /// Scan all data files in the workspace root, parse and index them.
     /// Called after the schema (and thus ref_targets) is ready.
-    async fn scan_and_index_workspace(&self) {
-        let (root_uri, delimiter, ext) = {
-            let ws = self.workspace.read().await;
+    async fn scan_and_index_workspace(
+        &self,
+        initialized_started: Instant,
+        schema_duration: Duration,
+    ) {
+        let scan_started = Instant::now();
+        let (root_uri, delimiter, ext, scan_generation, session_generation) = {
+            let mut ws = self.workspace.write().await;
             (
                 ws.root_uri.clone(),
                 self.settings.delimiter_char(),
                 self.settings.extension.clone(),
+                ws.begin_scan(),
+                ws.session_generation,
             )
         };
 
         let Some(root_uri) = root_uri else {
+            self.fail_workspace("Workspace scan failed: initialize did not provide a root URI")
+                .await;
             return;
         };
         let Ok(root_path) = root_uri.to_file_path() else {
+            self.fail_workspace(format!(
+                "Workspace scan failed: root URI is not a file path: {root_uri}"
+            ))
+            .await;
             return;
         };
 
-        let paths = match Self::collect_workspace_files(&root_path, &ext) {
-            Ok(paths) => paths,
+        let scan_policy = if self.settings.editor_mode {
+            ScanPolicy::editor()
+        } else {
+            ScanPolicy::standalone(&ext)
+        };
+        let enumerate_started = Instant::now();
+        let discovery = match crate::scan::collect_data_files(&root_path, &scan_policy) {
+            Ok(discovery) => discovery,
             Err(e) => {
-                self.client
-                    .log_message(MessageType::WARNING, format!("Workspace scan failed: {e}"))
+                self.fail_workspace(format!("Workspace scan failed: {e}"))
                     .await;
                 return;
             }
         };
+        let enumerate_duration = enumerate_started.elapsed();
+        let mut failures = discovery.failures;
 
         // Collect directory entries before spawning so we can log errors on the main task.
         let mut entries: Vec<(Url, std::path::PathBuf, String)> = Vec::new();
-        for path in paths {
-            let Ok(uri) = Url::from_file_path(&path) else {
-                continue;
+        for path in discovery.paths {
+            let uri = match Url::from_file_path(&path) {
+                Ok(uri) => uri,
+                Err(_) => {
+                    failures.push(ScanFailure {
+                        path,
+                        reason: "cannot convert path to a file URI".to_string(),
+                    });
+                    continue;
+                }
             };
             let stem = Self::file_stem(&uri);
             entries.push((uri, path, stem));
         }
 
-        // Read and parse all files in parallel. Each file gets its own task so I/O
-        // and CPU-intensive parsing don't serialize behind each other.
+        // Keep only a small, fixed number of read+parse tasks in flight so a large
+        // workspace cannot allocate one task and one source buffer per file.
+        let read_parse_started = Instant::now();
         let settings = Arc::clone(&self.settings);
-        let mut join_set: tokio::task::JoinSet<
-            Option<(Url, std::path::PathBuf, String, Arc<DocumentData>)>,
-        > = tokio::task::JoinSet::new();
-        for (uri, path, stem) in entries {
-            let settings = Arc::clone(&settings);
-            join_set.spawn(async move {
-                let bytes = tokio::fs::read(&path).await.ok()?;
-                let src = settings.encoding.decode(&bytes).ok()?;
-                // Parse is synchronous and CPU-intensive; run it off the async executor.
-                let doc = tokio::task::spawn_blocking(move || {
-                    Arc::new(DocumentData::parse(&src, delimiter))
-                })
-                .await
-                .ok()?;
-                Some((uri, path, stem, doc))
-            });
-        }
-
-        let mut parsed: Vec<(Url, std::path::PathBuf, String, Arc<DocumentData>)> = Vec::new();
-        while let Some(result) = join_set.join_next().await {
-            if let Ok(Some(item)) = result {
-                parsed.push(item);
+        let mut parsed: Vec<ParsedWorkspaceDocument> = Vec::new();
+        let load_results = run_bounded(entries, SCAN_CONCURRENCY, move |entry| {
+            load_workspace_document(Arc::clone(&settings), delimiter, entry)
+        })
+        .await;
+        for result in load_results {
+            match result {
+                Ok(Ok(item)) => parsed.push(item),
+                Ok(Err(failure)) => failures.push(failure),
+                Err(error) => failures.push(ScanFailure {
+                    path: root_path.clone(),
+                    reason: format!("workspace scan task failed: {error}"),
+                }),
             }
         }
-
-        // Retain (uri, stem) pairs before consuming the vec for indexing.
-        let uri_stems: Vec<(Url, String)> = parsed
-            .iter()
-            .map(|(uri, _, stem, _)| (uri.clone(), stem.clone()))
-            .collect();
+        let read_parse_duration = read_parse_started.elapsed();
 
         let count = parsed.len();
+        let index_started = Instant::now();
         {
             let mut ws = self.workspace.write().await;
-            let ref_targets = ws.ref_targets.clone();
-            for (uri, path, stem, doc) in parsed {
-                ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
-                ws.file_cache.insert(path, doc);
+            if !ws.commit_scan_documents(scan_generation, &parsed) {
+                return;
             }
         }
+        let index_duration = index_started.elapsed();
 
-        let t_index = Instant::now();
+        for failure in &failures {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "Workspace scan skipped '{}': {}",
+                        failure.path.display(),
+                        failure.reason
+                    ),
+                )
+                .await;
+        }
         self.client
             .log_message(
                 MessageType::INFO,
-                format!("Indexed {count} workspace files."),
+                format!(
+                    "Indexed {count} workspace files; skipped {} path(s).",
+                    failures.len()
+                ),
             )
             .await;
 
-        // Build workspace snapshot + index once for plugins; shared via Arc.
-        let t_snapshot_start = Instant::now();
-        let shared = if self.plugin_host.is_some() {
-            let ws = self.workspace.read().await;
-            let snapshot = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-            let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-            Some((snapshot, idx))
-        } else {
-            None
-        };
-        let t_snapshot = t_snapshot_start.elapsed();
+        let reconcile_started = Instant::now();
+        self.reconcile_open_documents_until_ready(scan_generation)
+            .await;
+        let reconcile_duration = reconcile_started.elapsed();
 
-        // Snapshot schema + symbol index once under a single read lock, then release it.
-        // Cloning SymbolIndex (one HashMap copy) lets all spawn_blocking tasks validate
-        // in parallel without any of them holding the workspace lock.
-        let (schema_arc, symbols_arc, file_pairs) = {
-            let ws = self.workspace.read().await;
-            let schema = ws.schema.clone();
-            let symbols = Arc::new(ws.symbols.clone());
-            let pairs: Vec<(Url, String, Option<Arc<DocumentData>>)> = uri_stems
-                .iter()
-                .map(|(uri, stem)| {
-                    let doc = uri
-                        .to_file_path()
-                        .ok()
-                        .and_then(|p| ws.file_cache.get(&p))
-                        .cloned();
-                    (uri.clone(), stem.clone(), doc)
-                })
-                .collect();
-            (schema, symbols, pairs)
-        };
-
-        // Validate all files in parallel on the blocking thread pool.
-        let t_schema_start = Instant::now();
-        let mut diag_set: tokio::task::JoinSet<(
-            Url,
-            String,
-            Option<Arc<DocumentData>>,
-            Vec<Diagnostic>,
-        )> = tokio::task::JoinSet::new();
-        for (uri, stem, doc) in file_pairs {
-            let schema = schema_arc.clone();
-            let symbols = Arc::clone(&symbols_arc);
-            diag_set.spawn_blocking(move || {
-                let diags = doc
-                    .as_ref()
-                    .map(|d| diagnostics::validate_document(&stem, d, schema.as_deref(), &*symbols))
-                    .unwrap_or_default();
-                (uri, stem, doc, diags)
-            });
-        }
-        let mut schema_results: Vec<(Url, String, Option<Arc<DocumentData>>, Vec<Diagnostic>)> =
-            Vec::new();
-        while let Some(result) = diag_set.join_next().await {
-            if let Ok(item) = result {
-                schema_results.push(item);
-            }
-        }
-        let schema_total = t_schema_start.elapsed();
-
-        // Plugin diagnostics are async and must remain sequential.
-        let mut plugin_total = std::time::Duration::ZERO;
-        let mut pending_publish: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
-        for (uri, stem, doc, schema_diags) in schema_results {
-            let t = Instant::now();
-            let plugin_diags = match (&shared, doc.as_ref(), &self.plugin_host) {
-                (Some((snap, idx)), Some(d), Some(ph)) => {
-                    let ctx = plugin::build_context(&stem, d);
-                    ph.run(ctx, idx.clone(), snap.clone()).await
-                }
-                _ => vec![],
-            };
-            plugin_total += t.elapsed();
-            let mut diags = schema_diags;
-            diags.extend(plugin_diags);
-            pending_publish.push((uri, diags));
-        }
-
-        // Publish all diagnostics concurrently so they arrive at the client in a
-        // burst rather than trickling in one sequential await at a time.
-        let mut publish_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        for (uri, diags) in pending_publish {
-            let client = self.client.clone();
-            publish_set.spawn(async move {
-                client.publish_diagnostics(uri, diags, None).await;
-            });
-        }
-        while publish_set.join_next().await.is_some() {}
-
-        let total = t_index.elapsed();
         self.client
             .log_message(
                 MessageType::LOG,
                 format!(
-                    "vlsp perf [{count} files]: snapshot={t_snapshot:.0?} \
-                     schema={schema_total:.0?}(parallel) plugins={plugin_total:.0?} total={total:.0?}"
+                    "vlsp perf session={session_generation} files={count} skipped={} schemaMs={:.2} enumerateMs={:.2} readParseMs={:.2} indexMs={:.2} reconcileMs={:.2} scanMs={:.2} startupMs={:.2}",
+                    failures.len(),
+                    milliseconds(schema_duration),
+                    milliseconds(enumerate_duration),
+                    milliseconds(read_parse_duration),
+                    milliseconds(index_duration),
+                    milliseconds(reconcile_duration),
+                    milliseconds(scan_started.elapsed()),
+                    milliseconds(initialized_started.elapsed())
                 ),
             )
             .await;
     }
+}
+
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+async fn load_workspace_document(
+    settings: Arc<VectorLspSettings>,
+    delimiter: char,
+    entry: (Url, std::path::PathBuf, String),
+) -> WorkspaceLoadResult {
+    let (uri, path, stem) = entry;
+    let bytes = tokio::fs::read(&path).await.map_err(|error| ScanFailure {
+        path: path.clone(),
+        reason: error.to_string(),
+    })?;
+    let source = settings
+        .encoding
+        .decode(&bytes)
+        .map_err(|error| ScanFailure {
+            path: path.clone(),
+            reason: error.to_string(),
+        })?;
+    let document =
+        tokio::task::spawn_blocking(move || Arc::new(DocumentData::parse(&source, delimiter)))
+            .await
+            .map_err(|error| ScanFailure {
+                path: path.clone(),
+                reason: format!("parser task failed: {error}"),
+            })?;
+    Ok((uri, path, stem, document))
+}
+
+async fn run_bounded<T, R, F, Fut>(
+    items: Vec<T>,
+    limit: usize,
+    operation: F,
+) -> Vec<Result<R, tokio::task::JoinError>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = R> + Send + 'static,
+{
+    let mut pending = items.into_iter();
+    let mut join_set = tokio::task::JoinSet::new();
+    for _ in 0..limit.max(1) {
+        let Some(item) = pending.next() else { break };
+        join_set.spawn(operation(item));
+    }
+    let mut results = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        results.push(result);
+        if let Some(item) = pending.next() {
+            join_set.spawn(operation(item));
+        }
+    }
+    results
+}
+
+fn resolve_plugin_definition(
+    expected_identity: (u64, u64),
+    current_identity: (u64, u64),
+    symbols: &crate::workspace::SymbolIndex,
+    target: (&str, &str, &str),
+) -> Option<Location> {
+    if !workspace_identity_matches(expected_identity, current_identity) {
+        return None;
+    }
+    symbols.lookup(target.0, target.1, target.2).cloned()
+}
+
+fn workspace_identity_matches(expected: (u64, u64), current: (u64, u64)) -> bool {
+    expected == current
 }
 
 /// Rebuild TSV text from a parsed document. Used to seed incremental change application.
@@ -280,17 +653,17 @@ fn reconstruct_text(doc: &DocumentData, delimiter: char) -> String {
 /// Apply a single LSP incremental content change to a lines buffer.
 fn apply_change(lines: &mut Vec<String>, range: tower_lsp::lsp_types::Range, new_text: &str) {
     let sl = range.start.line as usize;
-    let sc = range.start.character as usize;
+    let sc = range.start.character;
     let el = range.end.line as usize;
-    let ec = range.end.character as usize;
+    let ec = range.end.character;
 
-    let prefix: String = lines
+    let prefix = lines
         .get(sl)
-        .map(|l| l.chars().take(sc).collect())
+        .map(|line| &line[..utf16_offset_to_byte_index(line, sc)])
         .unwrap_or_default();
-    let suffix: String = lines
+    let suffix = lines
         .get(el)
-        .map(|l| l.chars().skip(ec.min(l.chars().count())).collect())
+        .map(|line| &line[utf16_offset_to_byte_index(line, ec)..])
         .unwrap_or_default();
 
     let new_lines: Vec<&str> = new_text.split('\n').collect();
@@ -319,6 +692,12 @@ fn apply_change(lines: &mut Vec<String>, range: tower_lsp::lsp_types::Range, new
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
+        let session_generation = params
+            .initialization_options
+            .as_ref()
+            .and_then(|value| value.get("sessionGeneration"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         let root_uri = params
             .workspace_folders
             .as_deref()
@@ -326,8 +705,10 @@ impl LanguageServer for Backend {
             .map(|f| f.uri.clone())
             .or(params.root_uri);
 
-        if let Some(uri) = root_uri {
-            self.workspace.write().await.root_uri = Some(uri);
+        {
+            let mut ws = self.workspace.write().await;
+            ws.root_uri = root_uri;
+            ws.begin_initialization(session_generation);
         }
 
         Ok(InitializeResult {
@@ -351,9 +732,23 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        let initialized_started = Instant::now();
+        let mut schema_duration = Duration::ZERO;
+        if self.settings.editor_mode {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "Effective vector-lsp config: {}",
+                        self.settings.effective_summary()
+                    ),
+                )
+                .await;
+        }
         let has_schema =
             self.settings.schema_path.is_some() || !self.settings.schema_variant.is_empty();
         if has_schema {
+            let schema_started = Instant::now();
             let loader = match find_loader(
                 &self.settings.schema_loader,
                 self.settings.schema_variant.clone(),
@@ -361,8 +756,7 @@ impl LanguageServer for Backend {
             ) {
                 Ok(l) => l,
                 Err(e) => {
-                    self.client
-                        .log_message(MessageType::ERROR, format!("{e}"))
+                    self.fail_workspace(format!("Schema loader selection failed: {e}"))
                         .await;
                     return;
                 }
@@ -386,19 +780,23 @@ impl LanguageServer for Backend {
                     self.client
                         .log_message(MessageType::INFO, "Schema loaded successfully.")
                         .await;
-                    self.scan_and_index_workspace().await;
+                    schema_duration = schema_started.elapsed();
                 }
                 Ok(Err(e)) => {
-                    self.client
-                        .log_message(MessageType::ERROR, format!("Schema load failed: {e:#}"))
+                    self.fail_workspace(format!("Schema load failed: {e:#}"))
                         .await;
+                    return;
                 }
                 Err(e) => {
-                    self.client
-                        .log_message(MessageType::ERROR, format!("Schema task panicked: {e}"))
+                    self.fail_workspace(format!("Schema task panicked: {e}"))
                         .await;
+                    return;
                 }
             }
+        }
+        if self.workspace.read().await.phase != WorkspacePhase::Failed {
+            self.scan_and_index_workspace(initialized_started, schema_duration)
+                .await;
         }
     }
 
@@ -408,46 +806,47 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
+        let version = params.text_document.version;
+        let mutation_gate = self.publish_gate(&uri).await;
+        let mutation_guard = mutation_gate.lock().await;
         let doc = Arc::new(DocumentData::parse(
             &params.text_document.text,
             self.settings.delimiter_char(),
         ));
-        let stem = Self::file_stem(&uri);
-
-        let (schema_diags, plugin_data) = {
+        let (ready, equivalent_open, ticket) = {
             let mut ws = self.workspace.write().await;
-            let ref_targets = ws.ref_targets.clone();
-            ws.symbols.remove_file(&stem);
-            ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
-            let schema_diags =
-                diagnostics::validate_document(&stem, &doc, ws.schema.as_deref(), &ws.symbols);
-            ws.open_documents.insert(uri.clone(), Arc::clone(&doc));
-            let plugin_data = self.plugin_host.as_ref().map(|_| {
-                let ctx = plugin::build_context(&stem, &doc);
-                let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-                let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-                (ctx, idx, snap)
-            });
-            (schema_diags, plugin_data)
+            let equivalent_open = ws.effective_source_has_same_content(&uri, &doc);
+            let ticket = if equivalent_open {
+                ws.accept_equivalent_open(uri, version, doc)
+            } else {
+                ws.accept_open(uri, version, doc)
+            };
+            ws.rebuild_effective_symbols();
+            (ws.phase == WorkspacePhase::Ready, equivalent_open, ticket)
         };
-
-        let plugin_diags = match (plugin_data, &self.plugin_host) {
-            (Some((ctx, idx, snap)), Some(ph)) => ph.run(ctx, idx, snap).await,
-            _ => vec![],
-        };
-        let mut diags = schema_diags;
-        diags.extend(plugin_diags);
-        self.client.publish_diagnostics(uri, diags, None).await;
+        drop(mutation_guard);
+        if ready {
+            if equivalent_open {
+                self.clear_obsolete_disk_diagnostics_except(Some(&ticket.uri))
+                    .await;
+                if !self.validate_and_publish_open(ticket).await {
+                    self.revalidate_workspace_after_change().await;
+                }
+            } else {
+                self.revalidate_workspace_after_change().await;
+            }
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        let mutation_gate = self.publish_gate(&uri).await;
+        let mutation_guard = mutation_gate.lock().await;
         let delimiter = self.settings.delimiter_char();
-        let stem = Self::file_stem(&uri);
 
         // Reconstruct current text from the stored document, apply each incremental
         // change in order, then re-parse. Avoids receiving the full document over IPC.
-        let doc = {
+        let update_result: Result<bool, DocumentChangeError> = {
             let mut ws = self.workspace.write().await;
 
             let existing_text = ws
@@ -466,36 +865,85 @@ impl LanguageServer for Backend {
 
             let full_text = lines.join("\n");
             let doc = Arc::new(DocumentData::parse(&full_text, delimiter));
-            let ref_targets = ws.ref_targets.clone();
-            ws.symbols.remove_file(&stem);
-            ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
-            let schema_diags =
-                diagnostics::validate_document(&stem, &doc, ws.schema.as_deref(), &ws.symbols);
-            ws.open_documents.insert(uri.clone(), Arc::clone(&doc));
-            let plugin_data = self.plugin_host.as_ref().map(|_| {
-                let ctx = plugin::build_context(&stem, &doc);
-                let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-                let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-                (ctx, idx, snap)
-            });
-            (schema_diags, plugin_data, doc)
+            match ws.accept_change(&uri, params.text_document.version, Arc::clone(&doc)) {
+                Ok(_) => {
+                    ws.rebuild_effective_symbols();
+                    Ok(ws.phase == WorkspacePhase::Ready)
+                }
+                Err(error) => Err(error),
+            }
         };
-
-        let (schema_diags, plugin_data, _doc) = doc;
-        let plugin_diags = match (plugin_data, &self.plugin_host) {
-            (Some((ctx, idx, snap)), Some(ph)) => ph.run(ctx, idx, snap).await,
-            _ => vec![],
-        };
-        let mut diags = schema_diags;
-        diags.extend(plugin_diags);
-        self.client.publish_diagnostics(uri, diags, None).await;
+        drop(mutation_guard);
+        match update_result {
+            Ok(true) => self.revalidate_workspace_after_change().await,
+            Ok(false) => {}
+            Err(error) => self.report_rejected_change(&uri, error).await,
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        self.workspace.write().await.open_documents.remove(&uri);
-        // Clear editor diagnostics; the file-cache copy remains for workspace validation.
-        self.client.publish_diagnostics(uri, vec![], None).await;
+        let mutation_gate = self.publish_gate(&uri).await;
+        let mutation_guard = mutation_gate.lock().await;
+        if !self
+            .workspace
+            .read()
+            .await
+            .open_documents
+            .contains_key(&uri)
+        {
+            return;
+        }
+        let path = uri.to_file_path().ok();
+        let (disk_document, reload_error) = match path.as_deref() {
+            Some(path) => match self.read_file(path).await {
+                Ok(text) => (
+                    Some(Arc::new(DocumentData::parse(
+                        &text,
+                        self.settings.delimiter_char(),
+                    ))),
+                    None,
+                ),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_error| {
+                            io_error.kind() == std::io::ErrorKind::NotFound
+                        }) =>
+                {
+                    (None, None)
+                }
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (None, Some(format!("Cannot convert {uri} to a file path"))),
+        };
+        let ready = {
+            let mut ws = self.workspace.write().await;
+            let restored_document = if reload_error.is_some() {
+                path.as_ref()
+                    .and_then(|path| ws.file_cache.get(path))
+                    .cloned()
+            } else {
+                disk_document
+            };
+            ws.restore_closed_document(&uri, path.clone(), restored_document)
+                && ws.phase == WorkspacePhase::Ready
+        };
+        self.client
+            .publish_diagnostics(uri.clone(), vec![], None)
+            .await;
+        drop(mutation_guard);
+        if let Some(error) = reload_error {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("didClose disk restore failed for {uri}: {error}"),
+                )
+                .await;
+        }
+        if ready {
+            self.revalidate_workspace_after_change().await;
+        }
     }
 
     async fn goto_definition(
@@ -542,18 +990,26 @@ impl LanguageServer for Backend {
             });
 
             let plugin_data = if schema_loc.is_none() {
-                self.plugin_host.as_ref().map(|_| {
-                    let ctx = plugin::build_hover_context(
-                        &file_stem,
-                        &col_name,
-                        &cell_value,
-                        pos.line,
-                        doc,
-                    );
-                    let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-                    let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-                    (ctx, idx, snap)
-                })
+                self.plugin_host
+                    .as_ref()
+                    .filter(|host| host.defines_file(&file_stem))
+                    .map(|_| {
+                        let ctx = plugin::build_hover_context(
+                            &file_stem,
+                            &col_name,
+                            &cell_value,
+                            pos.line,
+                            doc,
+                        );
+                        let view = ws.plugin_workspace_view();
+                        (
+                            ctx,
+                            view.index,
+                            view.snapshot,
+                            (view.session_generation, view.workspace_revision),
+                            Arc::new(ws.symbols.clone()),
+                        )
+                    })
             } else {
                 None
             };
@@ -566,22 +1022,31 @@ impl LanguageServer for Backend {
         }
 
         // Phase 2: try plugin-based goto definition.
-        let plugin_target = match (plugin_data, &self.plugin_host) {
-            (Some((ctx, idx, snap)), Some(ph)) => ph.goto_definition(ctx, idx, snap).await,
-            _ => return Ok(None),
+        let Some((ctx, idx, snap, expected_identity, symbols)) = plugin_data else {
+            return Ok(None);
         };
+        let Some(plugin_host) = &self.plugin_host else {
+            return Ok(None);
+        };
+        let plugin_target = plugin_host.goto_definition(ctx, idx, snap).await;
 
         let Some((target_file, target_col, target_value)) = plugin_target else {
             return Ok(None);
         };
 
-        // Phase 3: resolve the plugin-provided target via the symbol index.
-        let ws = self.workspace.read().await;
-        Ok(ws
-            .symbols
-            .lookup(&target_file, &target_col, &target_value)
-            .cloned()
-            .map(GotoDefinitionResponse::Scalar))
+        // Phase 3: resolve only against the SymbolIndex captured with the same
+        // plugin snapshot. A workspace mutation during the await invalidates it.
+        let current_identity = {
+            let ws = self.workspace.read().await;
+            (ws.session_generation, ws.workspace_revision)
+        };
+        Ok(resolve_plugin_definition(
+            expected_identity,
+            current_identity,
+            &symbols,
+            (&target_file, &target_col, &target_value),
+        )
+        .map(GotoDefinitionResponse::Scalar))
     }
 
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
@@ -604,12 +1069,9 @@ impl LanguageServer for Backend {
                 .map(|s| s.as_str())
                 .unwrap_or("unknown");
 
-            // Compute col_start for the range by summing preceding header lengths.
-            let col_start = doc.headers[..col_index]
-                .iter()
-                .map(|h| h.chars().count() as u32 + 1)
-                .sum::<u32>();
-            let col_len = col_name.chars().count() as u32;
+            let Some((col_start, col_end)) = doc.header_span(col_index) else {
+                return Ok(None);
+            };
 
             let description = ws
                 .schema
@@ -635,7 +1097,7 @@ impl LanguageServer for Backend {
                     },
                     end: Position {
                         line: 0,
-                        character: col_start + col_len,
+                        character: col_end,
                     },
                 }),
             }));
@@ -660,15 +1122,28 @@ impl LanguageServer for Backend {
                 .to_string();
             let cell_value = cell.value.clone();
             let cell_col_start = cell.col_start;
-            let cell_len = cell.value.chars().count() as u32;
+            let cell_len = utf16_len(&cell.value);
 
-            let plugin_hover_data = self.plugin_host.as_ref().map(|_| {
-                let ctx =
-                    plugin::build_hover_context(&file_stem, &col_name, &cell_value, pos.line, doc);
-                let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-                let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-                (ctx, idx, snap)
-            });
+            let plugin_hover_data = self
+                .plugin_host
+                .as_ref()
+                .filter(|host| host.hovers_file(&file_stem))
+                .map(|_| {
+                    let ctx = plugin::build_hover_context(
+                        &file_stem,
+                        &col_name,
+                        &cell_value,
+                        pos.line,
+                        doc,
+                    );
+                    let view = ws.plugin_workspace_view();
+                    (
+                        ctx,
+                        view.index,
+                        view.snapshot,
+                        (view.session_generation, view.workspace_revision),
+                    )
+                });
 
             (
                 cell_col_start,
@@ -680,7 +1155,17 @@ impl LanguageServer for Backend {
         }; // read lock released here
 
         let plugin_content = match (plugin_hover_data, &self.plugin_host) {
-            (Some((ctx, idx, snap)), Some(ph)) => ph.hover(ctx, idx, snap).await,
+            (Some((ctx, idx, snap, expected_identity)), Some(ph)) => {
+                let content = ph.hover(ctx, idx, snap).await;
+                let ws = self.workspace.read().await;
+                if !workspace_identity_matches(
+                    expected_identity,
+                    (ws.session_generation, ws.workspace_revision),
+                ) {
+                    return Ok(None);
+                }
+                content
+            }
             _ => None,
         };
 
@@ -706,5 +1191,126 @@ impl LanguageServer for Backend {
                 },
             }),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn range(start: u32, end: u32) -> Range {
+        Range::new(Position::new(0, start), Position::new(0, end))
+    }
+
+    fn apply(text: &str, start: u32, end: u32, replacement: &str) -> String {
+        let mut lines = vec![text.to_string()];
+        apply_change(&mut lines, range(start, end), replacement);
+        lines.join("\n")
+    }
+
+    #[test]
+    fn incremental_changes_use_utf16_offsets_around_supplementary_characters() {
+        assert_eq!(apply("A🙂B", 1, 1, "X"), "AX🙂B");
+        assert_eq!(apply("A🙂B", 3, 3, "X"), "A🙂XB");
+        assert_eq!(apply("A🙂B", 1, 3, ""), "AB");
+        assert_eq!(apply("A🙂B\told", 5, 8, "new"), "A🙂B\tnew");
+    }
+
+    #[test]
+    fn invalid_half_surrogate_offsets_clamp_to_the_code_point_start() {
+        assert_eq!(apply("A🙂B", 2, 2, "X"), "AX🙂B");
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_runner_never_exceeds_its_concurrency_limit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let release_gate = Arc::clone(&gate);
+        let active_for_tasks = Arc::clone(&active);
+        let maximum_for_tasks = Arc::clone(&maximum);
+
+        let run = tokio::spawn(run_bounded((0..8).collect(), SCAN_CONCURRENCY, move |_| {
+            let active = Arc::clone(&active_for_tasks);
+            let maximum = Arc::clone(&maximum_for_tasks);
+            let gate = Arc::clone(&gate);
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                gate.acquire_owned().await.unwrap().forget();
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }));
+
+        for _ in 0..100 {
+            if maximum.load(Ordering::SeqCst) == SCAN_CONCURRENCY {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(maximum.load(Ordering::SeqCst), SCAN_CONCURRENCY);
+        release_gate.add_permits(8);
+        let results = run.await.unwrap();
+
+        assert_eq!(results.len(), 8);
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(maximum.load(Ordering::SeqCst) <= SCAN_CONCURRENCY);
+    }
+
+    #[test]
+    fn plugin_definition_never_mixes_snapshot_and_later_symbol_revisions() {
+        let uri = Url::parse("file:///workspace/items.txt").unwrap();
+        let document = DocumentData::parse("id\nKEY", '\t');
+        let targets = HashSet::from([("items".to_string(), "id".to_string())]);
+        let mut symbols = crate::workspace::SymbolIndex::new();
+        symbols.index_document(&uri, "items", &document, &targets);
+
+        assert!(
+            resolve_plugin_definition((1, 7), (1, 8), &symbols, ("items", "id", "KEY")).is_none()
+        );
+        assert!(
+            resolve_plugin_definition((1, 7), (2, 7), &symbols, ("items", "id", "KEY")).is_none()
+        );
+        assert_eq!(
+            resolve_plugin_definition((1, 7), (1, 7), &symbols, ("items", "id", "KEY"))
+                .unwrap()
+                .uri,
+            uri
+        );
+    }
+
+    #[test]
+    fn plugin_hover_identity_rejects_revision_or_session_changes() {
+        assert!(workspace_identity_matches((4, 9), (4, 9)));
+        assert!(!workspace_identity_matches((4, 9), (4, 10)));
+        assert!(!workspace_identity_matches((4, 9), (5, 9)));
+    }
+
+    #[tokio::test]
+    async fn workspace_load_failure_preserves_the_skipped_path_and_decode_reason() {
+        let path =
+            std::env::temp_dir().join(format!("vector-lsp-odd-utf16-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, [0x41]).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let mut settings = VectorLspSettings::default();
+        settings.encoding = crate::settings::Encoding::Utf16Le;
+
+        let result = load_workspace_document(
+            Arc::new(settings),
+            '\t',
+            (uri, path.clone(), "odd-utf16".to_string()),
+        )
+        .await;
+        let Err(failure) = result else {
+            panic!("odd UTF-16 input must be reported as a skipped path");
+        };
+
+        assert_eq!(failure.path, path);
+        assert!(failure.reason.contains("odd byte count"));
+        let _ = std::fs::remove_file(failure.path);
     }
 }

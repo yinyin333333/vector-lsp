@@ -83,8 +83,30 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     let Ok(entries) = std::fs::read_dir(src) else {
         return;
     };
+    let entries: Vec<_> = entries.flatten().collect();
     std::fs::create_dir_all(dst).expect("failed to create output dir");
-    for entry in entries.flatten() {
+    let source_names: std::collections::HashSet<_> =
+        entries.iter().map(std::fs::DirEntry::file_name).collect();
+    if let Ok(destination_entries) = std::fs::read_dir(dst) {
+        for entry in destination_entries.flatten() {
+            if source_names.contains(&entry.file_name()) {
+                continue;
+            }
+            let stale_path = entry.path();
+            let removal = if stale_path.is_dir() {
+                std::fs::remove_dir_all(&stale_path)
+            } else {
+                std::fs::remove_file(&stale_path)
+            };
+            if let Err(error) = removal {
+                panic!(
+                    "failed to prune stale contrib asset '{}': {error}",
+                    stale_path.display()
+                );
+            }
+        }
+    }
+    for entry in entries {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
         if src_path.is_dir() {

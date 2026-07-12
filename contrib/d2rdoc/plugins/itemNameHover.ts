@@ -1,5 +1,9 @@
 /// <reference path="../../vector-lsp-plugin.d.ts" />
 
+const pluginMetadata: PluginMetadata = {
+    hoverFiles: ["weapons", "armor", "misc"],
+};
+
 // Shows the item code when hovering over the "name" column in weapons, armor,
 // or misc, where the code is the lookup key used in cross-file references.
 

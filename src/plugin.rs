@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -10,6 +11,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Posit
 use crate::document::DocumentData;
 use crate::runtime::{ScriptRuntime, WorkspaceFileSnapshot, WorkspaceIndex};
 use crate::schema::Schema;
+use crate::source_selection::effective_workspace_sources;
 
 // ---------------------------------------------------------------------------
 // Wire types for validate()
@@ -88,6 +90,95 @@ struct RawGotoTarget {
     target_value: String,
 }
 
+#[derive(Deserialize)]
+struct RawPluginValidation {
+    plugin: String,
+    diagnostics: Value,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawPluginIssue {
+    plugin: String,
+    error: String,
+}
+
+#[derive(Deserialize)]
+struct RawPluginValueResult {
+    value: Value,
+    #[serde(default)]
+    errors: Vec<RawPluginIssue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPluginApplicability {
+    validate: Vec<Option<Vec<String>>>,
+    hover: Vec<Option<Vec<String>>>,
+    goto_definition: Vec<Option<Vec<String>>>,
+}
+
+#[derive(Clone, Debug)]
+enum OperationApplicability {
+    All,
+    Files(HashSet<String>),
+}
+
+impl OperationApplicability {
+    fn from_plugins(plugins: Vec<Option<Vec<String>>>) -> Self {
+        if plugins.iter().any(Option::is_none) {
+            return Self::All;
+        }
+        Self::Files(
+            plugins
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|file| file.trim().to_lowercase())
+                .filter(|file| !file.is_empty())
+                .collect(),
+        )
+    }
+
+    fn applies_to(&self, file_stem: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Files(files) => files.contains(&file_stem.trim().to_lowercase()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PluginOperationCounts {
+    validate: usize,
+    hover: usize,
+    goto_definition: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PluginApplicability {
+    validate: OperationApplicability,
+    hover: OperationApplicability,
+    goto_definition: OperationApplicability,
+    counts: PluginOperationCounts,
+}
+
+impl From<RawPluginApplicability> for PluginApplicability {
+    fn from(raw: RawPluginApplicability) -> Self {
+        let counts = PluginOperationCounts {
+            validate: raw.validate.len(),
+            hover: raw.hover.len(),
+            goto_definition: raw.goto_definition.len(),
+        };
+        Self {
+            validate: OperationApplicability::from_plugins(raw.validate),
+            hover: OperationApplicability::from_plugins(raw.hover),
+            goto_definition: OperationApplicability::from_plugins(raw.goto_definition),
+            counts,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plugin host (owns the JS runtime on a dedicated non-Send thread)
 // ---------------------------------------------------------------------------
@@ -95,6 +186,7 @@ struct RawGotoTarget {
 enum PluginRequest {
     SetSchema {
         schema: Arc<Schema>,
+        reply: oneshot::Sender<()>,
     },
     Validate {
         ctx: String,
@@ -121,27 +213,48 @@ enum PluginRequest {
 #[derive(Clone)]
 pub struct PluginHost {
     tx: mpsc::Sender<PluginRequest>,
+    health: Arc<PluginHealth>,
+    applicability: Arc<PluginApplicability>,
+}
+
+#[derive(Default)]
+struct PluginHealth {
+    reported: Mutex<HashSet<String>>,
+}
+
+impl PluginHealth {
+    fn report_once(&self, key: impl Into<String>, message: impl AsRef<str>) {
+        if self.reported.lock().unwrap().insert(key.into()) {
+            eprintln!("vector-lsp: {}", message.as_ref());
+        }
+    }
 }
 
 impl PluginHost {
     /// Spawn the dedicated plugin thread, load all plugin files, and return a handle.
-    pub fn new(paths: Vec<PathBuf>) -> Self {
+    pub fn new(paths: Vec<PathBuf>) -> anyhow::Result<Self> {
         let (tx, mut rx) = mpsc::channel::<PluginRequest>(32);
+        let health = Arc::new(PluginHealth::default());
+        let thread_health = Arc::clone(&health);
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let execution_budget = plugin_execution_budget();
+        let startup_budget = plugin_startup_budget(execution_budget, paths.len());
 
         std::thread::spawn(move || {
             let mut rt = match ScriptRuntime::new() {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("vector-lsp: plugin runtime init failed: {e}");
+                    let _ = startup_tx.send(Err(format!("plugin runtime init failed: {e}")));
                     return;
                 }
             };
 
             // Seed plugin registries and host-provided utility functions.
-            let _ = rt.exec(
+            if let Err(error) = rt.exec(
                 "__seed__",
                 "var __plugins = []; var __hovers = []; var __gotos = [];\
-                 var validate; var hover; var gotoDefinition;\
+                 var __activePluginName=null;\
+                 var __requestCtx=null;\
                  var __lookupCache={};\
                  var __colCache={};\
                  var __cvCache={};\
@@ -174,13 +287,49 @@ impl PluginHost {
                  }\
                  function getEnumTable(file,col){\
                      return Deno.core.ops.op_get_enum_table(file,col)||null;\
+                 }\
+                 function __pluginFiles(metadata,key){\
+                     try{\
+                         var files=metadata&&metadata[key];\
+                         if(!Array.isArray(files))return null;\
+                         return files.map(function(file){return String(file).trim().toLowerCase();});\
+                     }catch(error){return null;}\
                  }",
-            );
+            ) {
+                let _ = startup_tx.send(Err(format!("plugin runtime seed failed: {error}")));
+                return;
+            }
 
             for path in &paths {
-                if let Err(e) = load_plugin(&mut rt, path) {
-                    eprintln!("vector-lsp: plugin '{}': {e}", path.display());
+                if let Err(error) = load_plugin(&mut rt, path, execution_budget) {
+                    let _ = startup_tx.send(Err(format!(
+                        "plugin '{}' failed to load: {error}",
+                        path.display()
+                    )));
+                    return;
                 }
+            }
+            let (applicability, metadata_timed_out) = eval_json_with_budget(
+                &mut rt,
+                "({validate:__plugins.map(function(plugin){return plugin.files;}),\
+                   hover:__hovers.map(function(plugin){return plugin.files;}),\
+                   gotoDefinition:__gotos.map(function(plugin){return plugin.files;})})",
+                execution_budget,
+            );
+            let applicability = if metadata_timed_out {
+                Err("plugin applicability metadata exceeded the execution budget".to_string())
+            } else {
+                applicability
+                    .and_then(|value| Ok(serde_json::from_value::<RawPluginApplicability>(value)?))
+                    .map(PluginApplicability::from)
+                    .map_err(|error| format!("plugin applicability metadata failed: {error}"))
+            };
+            let operation_counts = applicability
+                .as_ref()
+                .map(|value| value.counts)
+                .unwrap_or_default();
+            if startup_tx.send(applicability).is_err() {
+                return;
             }
 
             // Tracks the last snapshot seen so the column-value cache can be
@@ -189,8 +338,9 @@ impl PluginHost {
 
             while let Some(req) = rx.blocking_recv() {
                 match req {
-                    PluginRequest::SetSchema { schema } => {
+                    PluginRequest::SetSchema { schema, reply } => {
                         rt.set_schema(schema);
+                        let _ = reply.send(());
                     }
                     PluginRequest::Validate {
                         ctx,
@@ -198,40 +348,14 @@ impl PluginHost {
                         snapshot,
                         reply,
                     } => {
-                        let ptr = Arc::as_ptr(&snapshot) as usize;
-                        if ptr != last_snapshot_ptr {
-                            let _ = rt.exec("__cache_reset__", "var __lookupCache={}; var __colCache={}; var __cvCache={}; var __filteredCvCache={};");
-                            last_snapshot_ptr = ptr;
-                        }
-                        rt.set_workspace_index(index);
-                        rt.set_workspace_snapshot(snapshot);
-                        rt.set_ctx_json(ctx);
-                        let debug = std::env::var("VLSP_DEBUG_LOGGING").is_ok();
-                        let expr = if debug {
-                            "(function(){\
-                             var __c__=JSON.parse(Deno.core.ops.op_get_ctx_json());\
-                             return \
-                             __plugins.flatMap(function(fn,i){\
-                                 try{return fn(__c__)||[];}catch(e){Deno.core.print('[validate-err-'+i+'] '+String(e)+'\\n',true);return []}\
-                             });\
-                             })()"
-                        } else {
-                            "(function(){\
-                             var __c__=JSON.parse(Deno.core.ops.op_get_ctx_json());\
-                             return \
-                             __plugins.flatMap(function(fn){\
-                                 try{return fn(__c__)||[];}catch(e){return []}\
-                             });\
-                             })()"
-                        };
-                        let diags = rt
-                            .eval_json(expr)
-                            .ok()
-                            .and_then(|v| serde_json::from_value::<Vec<RawDiag>>(v).ok())
-                            .into_iter()
-                            .flatten()
-                            .map(RawDiag::into_lsp)
-                            .collect();
+                        install_workspace_view(&mut rt, &mut last_snapshot_ptr, index, snapshot);
+                        let diags = run_validation_plugins(
+                            &mut rt,
+                            &thread_health,
+                            ctx,
+                            operation_counts.validate,
+                            execution_budget,
+                        );
                         let _ = reply.send(diags);
                     }
                     PluginRequest::Hover {
@@ -240,54 +364,19 @@ impl PluginHost {
                         snapshot,
                         reply,
                     } => {
-                        rt.set_workspace_index(index);
-                        rt.set_workspace_snapshot(snapshot);
+                        install_workspace_view(&mut rt, &mut last_snapshot_ptr, index, snapshot);
                         let ctx_json = ctx.to_string();
-                        // Call each hover function in turn; return the first non-null result.
                         let debug = std::env::var("VLSP_DEBUG_LOGGING").is_ok();
                         if debug {
                             eprintln!("[hover-debug] ctx={ctx_json}");
-                            let len = rt
-                                .eval_json("__hovers.length")
-                                .ok()
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            eprintln!("[hover-debug] __hovers.length={len}");
                         }
-                        let expr = if debug {
-                            format!(
-                                "(function(ctx){{\
-                                    for(var i=0;i<__hovers.length;i++){{\
-                                        try{{var r=__hovers[i](ctx);if(r!=null)return r;}}\
-                                        catch(e){{Deno.core.print('[hover-err-'+i+'] '+String(e)+'\\n',true);}}\
-                                    }}\
-                                    return null;\
-                                }})({ctx_json})"
-                            )
-                        } else {
-                            format!(
-                                "(function(ctx){{\
-                                    for(var i=0;i<__hovers.length;i++){{\
-                                        try{{var r=__hovers[i](ctx);if(r!=null)return r;}}catch(e){{}}\
-                                    }}\
-                                    return null;\
-                                }})({ctx_json})"
-                            )
-                        };
-                        let raw = rt.eval_json(&expr);
-                        if debug {
-                            eprintln!("[hover-debug] raw={raw:?}");
-                        }
-                        let result = raw.ok().and_then(|v| match v {
-                            Value::Null => None,
-                            // Plugin returned { content: "..." }
-                            Value::Object(_) => serde_json::from_value::<RawHover>(v)
-                                .ok()
-                                .map(|h| h.content),
-                            // Plugin returned a plain string
-                            Value::String(s) => Some(s),
-                            _ => None,
-                        });
+                        let result = run_hover_plugins(
+                            &mut rt,
+                            &thread_health,
+                            ctx_json,
+                            operation_counts.hover,
+                            execution_budget,
+                        );
                         if debug {
                             eprintln!("[hover-debug] result={result:?}");
                         }
@@ -299,39 +388,77 @@ impl PluginHost {
                         snapshot,
                         reply,
                     } => {
-                        rt.set_workspace_index(index);
-                        rt.set_workspace_snapshot(snapshot);
-                        let ctx_json = ctx.to_string();
-                        // Call each gotoDefinition function in turn; return the first non-null result.
-                        let expr = format!(
-                            "(function(ctx){{\
-                                for(var i=0;i<__gotos.length;i++){{\
-                                    try{{var r=__gotos[i](ctx);if(r!=null)return r;}}catch(e){{}}\
-                                }}\
-                                return null;\
-                            }})({ctx_json})"
+                        install_workspace_view(&mut rt, &mut last_snapshot_ptr, index, snapshot);
+                        let result = run_goto_definition_plugins(
+                            &mut rt,
+                            &thread_health,
+                            ctx.to_string(),
+                            operation_counts.goto_definition,
+                            execution_budget,
                         );
-                        let result = rt.eval_json(&expr).ok().and_then(|v| match v {
-                            Value::Null => None,
-                            Value::Object(_) => serde_json::from_value::<RawGotoTarget>(v)
-                                .ok()
-                                .map(|t| (t.target_file, t.target_col, t.target_value)),
-                            _ => None,
-                        });
                         let _ = reply.send(result);
                     }
                 }
             }
         });
 
-        Self { tx }
+        let applicability = match startup_rx.recv_timeout(startup_budget) {
+            Ok(result) => result.map_err(anyhow::Error::msg)?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                anyhow::bail!(
+                    "plugin runtime startup exceeded its {:?} deadline",
+                    startup_budget
+                )
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("plugin runtime startup channel closed")
+            }
+        };
+        Ok(Self {
+            tx,
+            health,
+            applicability: Arc::new(applicability),
+        })
+    }
+
+    pub fn validates_file(&self, file_stem: &str) -> bool {
+        self.applicability.validate.applies_to(file_stem)
+    }
+
+    pub fn hovers_file(&self, file_stem: &str) -> bool {
+        self.applicability.hover.applies_to(file_stem)
+    }
+
+    pub fn defines_file(&self, file_stem: &str) -> bool {
+        self.applicability.goto_definition.applies_to(file_stem)
     }
 
     /// Push the loaded schema to the plugin thread so `getEnumTable` has data.
-    /// Fire-and-forget: the schema is immutable after loading so ordering with
-    /// subsequent validate/hover calls (which are queued after this) is fine.
+    /// Return only after the worker has installed it, so callers can measure the
+    /// completed schema phase rather than just the queue insertion.
     pub async fn set_schema(&self, schema: Arc<Schema>) {
-        let _ = self.tx.send(PluginRequest::SetSchema { schema }).await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(PluginRequest::SetSchema {
+                schema,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            self.health.report_once(
+                "channel-closed",
+                "plugin runtime channel closed while setting schema",
+            );
+            return;
+        }
+        if reply_rx.await.is_err() {
+            self.health.report_once(
+                "reply-closed",
+                "plugin runtime closed the schema reply channel",
+            );
+        }
     }
 
     /// Run all `validate` plugin functions and return any diagnostics.
@@ -353,9 +480,22 @@ impl PluginHost {
             .await
             .is_err()
         {
+            self.health.report_once(
+                "channel-closed",
+                "plugin runtime channel closed before validate",
+            );
             return vec![];
         }
-        reply_rx.await.unwrap_or_default()
+        match reply_rx.await {
+            Ok(diagnostics) => diagnostics,
+            Err(_) => {
+                self.health.report_once(
+                    "reply-closed",
+                    "plugin runtime closed the validate reply channel",
+                );
+                vec![]
+            }
+        }
     }
 
     /// Run all `hover` plugin functions and return the first non-null markdown content.
@@ -366,7 +506,8 @@ impl PluginHost {
         snapshot: Arc<WorkspaceFileSnapshot>,
     ) -> Option<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
+        if self
+            .tx
             .send(PluginRequest::Hover {
                 ctx,
                 index,
@@ -374,8 +515,24 @@ impl PluginHost {
                 reply: reply_tx,
             })
             .await
-            .ok()?;
-        reply_rx.await.ok().flatten()
+            .is_err()
+        {
+            self.health.report_once(
+                "channel-closed",
+                "plugin runtime channel closed before hover",
+            );
+            return None;
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                self.health.report_once(
+                    "reply-closed",
+                    "plugin runtime closed the hover reply channel",
+                );
+                None
+            }
+        }
     }
 
     /// Run all `gotoDefinition` plugin functions and return the first non-null
@@ -387,7 +544,8 @@ impl PluginHost {
         snapshot: Arc<WorkspaceFileSnapshot>,
     ) -> Option<(String, String, String)> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
+        if self
+            .tx
             .send(PluginRequest::GotoDefinition {
                 ctx,
                 index,
@@ -395,22 +553,414 @@ impl PluginHost {
                 reply: reply_tx,
             })
             .await
-            .ok()?;
-        reply_rx.await.ok().flatten()
+            .is_err()
+        {
+            self.health.report_once(
+                "channel-closed",
+                "plugin runtime channel closed before gotoDefinition",
+            );
+            return None;
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                self.health.report_once(
+                    "reply-closed",
+                    "plugin runtime closed the gotoDefinition reply channel",
+                );
+                None
+            }
+        }
     }
 }
 
-fn load_plugin(rt: &mut ScriptRuntime, path: &Path) -> anyhow::Result<()> {
+fn install_workspace_view(
+    runtime: &mut ScriptRuntime,
+    last_snapshot_ptr: &mut usize,
+    index: Arc<WorkspaceIndex>,
+    snapshot: Arc<WorkspaceFileSnapshot>,
+) {
+    let snapshot_ptr = Arc::as_ptr(&snapshot) as usize;
+    if snapshot_ptr != *last_snapshot_ptr {
+        let _ = runtime.exec(
+            "__cache_reset__",
+            "var __lookupCache={}; var __colCache={}; var __cvCache={}; var __filteredCvCache={};",
+        );
+        *last_snapshot_ptr = snapshot_ptr;
+    }
+    runtime.set_workspace_index(index);
+    runtime.set_workspace_snapshot(snapshot);
+}
+
+const VALIDATION_PLUGIN_EXPRESSION: &str = "(function(){\
+    var plugin=__plugins[__INDEX__];__activePluginName=plugin.name;\
+    if(plugin.files!==null&&plugin.files.indexOf(String(__requestCtx.file).toLowerCase())<0){__activePluginName=null;return [];}\
+    try{var diagnostics=plugin.fn(__requestCtx);__activePluginName=null;return [{plugin:plugin.name,diagnostics:diagnostics==null?[]:diagnostics,error:null}];}\
+    catch(error){__activePluginName=null;return [{plugin:plugin.name,diagnostics:[],error:String(error)}];}\
+})()";
+
+const PLUGIN_VALUE_EXPRESSION: &str = "(function(){\
+    var plugin=__REGISTRY__[__INDEX__];__activePluginName=plugin.name;\
+    if(plugin.files!==null&&plugin.files.indexOf(String(__requestCtx.file).toLowerCase())<0){__activePluginName=null;return {value:null,errors:[]};}\
+    try{var value=plugin.fn(__requestCtx);__activePluginName=null;return {value:value==null?null:value,errors:[]};}\
+    catch(error){__activePluginName=null;return {value:null,errors:[{plugin:plugin.name,error:String(error)}]};}\
+})()";
+
+fn prepare_plugin_context(
+    runtime: &mut ScriptRuntime,
+    health: &PluginHealth,
+    operation: &str,
+    ctx_json: String,
+    budget: Duration,
+) -> bool {
+    runtime.set_ctx_json(ctx_json);
+    let (result, timed_out) = eval_json_with_budget(
+        runtime,
+        "(function(){__requestCtx=JSON.parse(Deno.core.ops.op_get_ctx_json());return null;})()",
+        budget,
+    );
+    if timed_out {
+        health.report_once(
+            format!("{operation}-context-timeout"),
+            format!("plugin {operation} context preparation exceeded the execution budget"),
+        );
+        clear_plugin_request_state(runtime);
+        return false;
+    }
+    if let Err(error) = result {
+        health.report_once(
+            format!("{operation}-context"),
+            format!("plugin {operation} context preparation failed: {error}"),
+        );
+        clear_plugin_request_state(runtime);
+        return false;
+    }
+    true
+}
+
+fn clear_plugin_request_state(runtime: &mut ScriptRuntime) {
+    let _ = runtime.exec(
+        "__plugin_request_cleanup__",
+        "__activePluginName=null;__requestCtx=null;",
+    );
+}
+
+fn validation_plugin_expression(plugin_index: usize) -> String {
+    VALIDATION_PLUGIN_EXPRESSION.replace("__INDEX__", &plugin_index.to_string())
+}
+
+fn plugin_value_expression(registry: &str, plugin_index: usize) -> String {
+    PLUGIN_VALUE_EXPRESSION
+        .replace("__REGISTRY__", registry)
+        .replace("__INDEX__", &plugin_index.to_string())
+}
+
+fn run_validation_plugins(
+    runtime: &mut ScriptRuntime,
+    health: &PluginHealth,
+    ctx_json: String,
+    plugin_count: usize,
+    budget: Duration,
+) -> Vec<Diagnostic> {
+    if !prepare_plugin_context(runtime, health, "validate", ctx_json, budget) {
+        return vec![];
+    }
+    let mut diagnostics = Vec::new();
+    for plugin_index in 0..plugin_count {
+        let expression = validation_plugin_expression(plugin_index);
+        let (raw, timed_out) = eval_json_with_budget(runtime, &expression, budget);
+        if timed_out {
+            report_plugin_timeout(runtime, health, "validate");
+            continue;
+        }
+        diagnostics.extend(validation_results(raw, health));
+    }
+    clear_plugin_request_state(runtime);
+    diagnostics
+}
+
+fn run_hover_plugins(
+    runtime: &mut ScriptRuntime,
+    health: &PluginHealth,
+    ctx_json: String,
+    plugin_count: usize,
+    budget: Duration,
+) -> Option<String> {
+    if !prepare_plugin_context(runtime, health, "hover", ctx_json, budget) {
+        return None;
+    }
+    let mut result = None;
+    for plugin_index in 0..plugin_count {
+        let expression = plugin_value_expression("__hovers", plugin_index);
+        let (raw, timed_out) = eval_json_with_budget(runtime, &expression, budget);
+        if timed_out {
+            report_plugin_timeout(runtime, health, "hover");
+            continue;
+        }
+        let Some(value) = plugin_value_result(raw, health, "hover") else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        if let Some(content) = hover_value(value, health) {
+            result = Some(content);
+            break;
+        }
+    }
+    clear_plugin_request_state(runtime);
+    result
+}
+
+fn hover_value(value: Value, health: &PluginHealth) -> Option<String> {
+    match value {
+        value @ Value::Object(_) => match serde_json::from_value::<RawHover>(value) {
+            Ok(hover) => Some(hover.content),
+            Err(error) => {
+                health.report_once(
+                    "hover-shape",
+                    format!("plugin hover result has invalid shape: {error}"),
+                );
+                None
+            }
+        },
+        Value::String(content) => Some(content),
+        _ => {
+            health.report_once("hover-shape", "plugin hover result has invalid shape");
+            None
+        }
+    }
+}
+
+fn run_goto_definition_plugins(
+    runtime: &mut ScriptRuntime,
+    health: &PluginHealth,
+    ctx_json: String,
+    plugin_count: usize,
+    budget: Duration,
+) -> Option<(String, String, String)> {
+    if !prepare_plugin_context(runtime, health, "gotoDefinition", ctx_json, budget) {
+        return None;
+    }
+    let mut result = None;
+    for plugin_index in 0..plugin_count {
+        let expression = plugin_value_expression("__gotos", plugin_index);
+        let (raw, timed_out) = eval_json_with_budget(runtime, &expression, budget);
+        if timed_out {
+            report_plugin_timeout(runtime, health, "gotoDefinition");
+            continue;
+        }
+        let Some(value) = plugin_value_result(raw, health, "gotoDefinition") else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        if let Some(target) = goto_definition_value(value, health) {
+            result = Some(target);
+            break;
+        }
+    }
+    clear_plugin_request_state(runtime);
+    result
+}
+
+fn goto_definition_value(
+    value: Value,
+    health: &PluginHealth,
+) -> Option<(String, String, String)> {
+    match value {
+        value @ Value::Object(_) => match serde_json::from_value::<RawGotoTarget>(value) {
+            Ok(target) => Some((
+                target.target_file,
+                target.target_col,
+                target.target_value,
+            )),
+            Err(error) => {
+                health.report_once(
+                    "goto-shape",
+                    format!("plugin gotoDefinition result has invalid shape: {error}"),
+                );
+                None
+            }
+        },
+        _ => {
+            health.report_once(
+                "goto-shape",
+                "plugin gotoDefinition result has invalid shape",
+            );
+            None
+        }
+    }
+}
+
+fn plugin_execution_budget() -> Duration {
+    let milliseconds = std::env::var("VLSP_PLUGIN_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(750)
+        .clamp(10, 60_000);
+    Duration::from_millis(milliseconds)
+}
+
+fn plugin_startup_budget(execution_budget: Duration, plugin_count: usize) -> Duration {
+    let budgeted_steps = plugin_count.saturating_add(3).min(u32::MAX as usize) as u32;
+    let aggregate_budget = execution_budget
+        .checked_mul(budgeted_steps)
+        .unwrap_or(Duration::MAX);
+    aggregate_budget.max(Duration::from_secs(5))
+}
+
+fn exec_with_budget(
+    runtime: &mut ScriptRuntime,
+    name: &'static str,
+    source: String,
+    budget: Duration,
+) -> (anyhow::Result<()>, bool) {
+    let isolate = runtime.execution_handle();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(budget).is_err() {
+            isolate.terminate_execution();
+            true
+        } else {
+            false
+        }
+    });
+    let result = runtime.exec(name, source);
+    let _ = done_tx.send(());
+    let timed_out = watchdog.join().unwrap_or(true);
+    if timed_out {
+        runtime.cancel_terminate_execution();
+    }
+    (result, timed_out)
+}
+
+fn eval_json_with_budget(
+    runtime: &mut ScriptRuntime,
+    expression: &str,
+    budget: Duration,
+) -> (anyhow::Result<Value>, bool) {
+    let isolate = runtime.execution_handle();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(budget).is_err() {
+            isolate.terminate_execution();
+            true
+        } else {
+            false
+        }
+    });
+    let result = runtime.eval_json(expression);
+    let _ = done_tx.send(());
+    let timed_out = watchdog.join().unwrap_or(true);
+    if timed_out {
+        runtime.cancel_terminate_execution();
+    }
+    (result, timed_out)
+}
+
+fn report_plugin_timeout(runtime: &mut ScriptRuntime, health: &PluginHealth, operation: &str) {
+    let plugin = runtime
+        .eval_json("__activePluginName")
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown plugin".to_string());
+    health.report_once(
+        format!("timeout:{operation}:{plugin}"),
+        format!("plugin '{plugin}' {operation} exceeded the execution budget and was interrupted"),
+    );
+    let _ = runtime.exec(
+        "__plugin_timeout_cleanup__",
+        "__activePluginName=null;",
+    );
+}
+
+fn validation_results(raw: anyhow::Result<Value>, health: &PluginHealth) -> Vec<Diagnostic> {
+    let runs = match raw.and_then(|value| {
+        serde_json::from_value::<Vec<RawPluginValidation>>(value).map_err(Into::into)
+    }) {
+        Ok(runs) => runs,
+        Err(error) => {
+            health.report_once(
+                "validate-host-result",
+                format!("plugin validate host result failed: {error}"),
+            );
+            return vec![];
+        }
+    };
+    let mut diagnostics = Vec::new();
+    for run in runs {
+        if let Some(error) = run.error {
+            health.report_once(
+                format!("validate-error:{}", run.plugin),
+                format!("plugin '{}' validate failed: {error}", run.plugin),
+            );
+            continue;
+        }
+        match serde_json::from_value::<Vec<RawDiag>>(run.diagnostics) {
+            Ok(raw_diagnostics) => {
+                diagnostics.extend(raw_diagnostics.into_iter().map(RawDiag::into_lsp))
+            }
+            Err(error) => health.report_once(
+                format!("validate-shape:{}", run.plugin),
+                format!(
+                    "plugin '{}' returned an invalid diagnostic shape: {error}",
+                    run.plugin
+                ),
+            ),
+        }
+    }
+    diagnostics
+}
+
+fn plugin_value_result(
+    raw: anyhow::Result<Value>,
+    health: &PluginHealth,
+    operation: &str,
+) -> Option<Value> {
+    let result = match raw
+        .and_then(|value| serde_json::from_value::<RawPluginValueResult>(value).map_err(Into::into))
+    {
+        Ok(result) => result,
+        Err(error) => {
+            health.report_once(
+                format!("{operation}-host-result"),
+                format!("plugin {operation} host result failed: {error}"),
+            );
+            return None;
+        }
+    };
+    for issue in result.errors {
+        health.report_once(
+            format!("{operation}-error:{}", issue.plugin),
+            format!(
+                "plugin '{}' {operation} failed: {}",
+                issue.plugin, issue.error
+            ),
+        );
+    }
+    Some(result.value)
+}
+
+fn load_plugin(rt: &mut ScriptRuntime, path: &Path, budget: Duration) -> anyhow::Result<()> {
     let src = std::fs::read_to_string(path)?;
     let src = strip_typescript(&src);
-    rt.exec("<plugin>", src)?;
-    // Auto-register top-level `validate` and/or `hover` functions if defined.
-    rt.exec(
-        "__register__",
-        "if(typeof validate==='function'){__plugins.push(validate);validate=undefined;}\
-         if(typeof hover==='function'){__hovers.push(hover);hover=undefined;}\
-         if(typeof gotoDefinition==='function'){__gotos.push(gotoDefinition);gotoDefinition=undefined;}",
-    )?;
+    let name = serde_json::to_string(&path.display().to_string())?;
+    let wrapped = format!(
+        "(function(){{\n{src}\n\
+         var __pluginName={name};\
+         var __pluginMetadata=typeof pluginMetadata==='object'&&pluginMetadata!==null?pluginMetadata:null;\
+         if(typeof validate==='function'){{__plugins.push({{name:__pluginName,fn:validate,files:__pluginFiles(__pluginMetadata,'validateFiles')}});}}\
+         if(typeof hover==='function'){{__hovers.push({{name:__pluginName,fn:hover,files:__pluginFiles(__pluginMetadata,'hoverFiles')}});}}\
+         if(typeof gotoDefinition==='function'){{__gotos.push({{name:__pluginName,fn:gotoDefinition,files:__pluginFiles(__pluginMetadata,'gotoDefinitionFiles')}});}}\
+         }})();"
+    );
+    let (result, timed_out) = exec_with_budget(rt, "<plugin>", wrapped, budget);
+    if timed_out {
+        anyhow::bail!("top-level/metadata evaluation exceeded the execution budget");
+    }
+    result?;
     Ok(())
 }
 
@@ -563,26 +1113,8 @@ pub fn build_workspace_snapshot(
     file_cache: &HashMap<PathBuf, Arc<DocumentData>>,
 ) -> Arc<WorkspaceFileSnapshot> {
     let mut snap = WorkspaceFileSnapshot::new();
-
-    for (path, doc) in file_cache {
-        if let Some(stem) = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_lowercase())
-        {
-            snap.files.entry(stem).or_insert_with(|| Arc::clone(doc));
-        }
-    }
-
-    for (uri, doc) in open_docs {
-        let stem = uri
-            .path_segments()
-            .and_then(|s| s.last())
-            .and_then(|n| n.rfind('.').map(|i| n[..i].to_lowercase()))
-            .unwrap_or_default();
-        if !stem.is_empty() {
-            snap.files.insert(stem, Arc::clone(doc));
-        }
+    for source in effective_workspace_sources(open_docs, file_cache) {
+        snap.files.insert(source.stem, source.document);
     }
 
     Arc::new(snap)
@@ -1081,16 +1613,35 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::json;
-    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Url};
 
     use super::{
-        PluginHost, RawDiag, build_context, build_hover_context, strip_ts_declarations,
+        OperationApplicability, PluginApplicability, PluginHost, RawDiag, RawPluginApplicability,
+        build_context, build_hover_context, build_workspace_snapshot, strip_ts_declarations,
         strip_typescript,
     };
     use crate::document::DocumentData;
     use crate::runtime::{WorkspaceFileSnapshot, build_workspace_index};
 
     // --- Structural (pass 1) -------------------------------------------------
+
+    #[test]
+    fn applicability_is_operation_specific_normalized_and_custom_safe() {
+        let applicability = PluginApplicability::from(RawPluginApplicability {
+            validate: vec![Some(vec!["  CubeMain ".to_string()])],
+            hover: vec![Some(vec!["Skills".to_string()])],
+            goto_definition: vec![None],
+        });
+        assert!(applicability.validate.applies_to("cubemain"));
+        assert!(!applicability.validate.applies_to("skills"));
+        assert!(applicability.hover.applies_to("SKILLS"));
+        assert!(!applicability.hover.applies_to("cubemain"));
+        assert!(matches!(
+            applicability.goto_definition,
+            OperationApplicability::All
+        ));
+        assert!(applicability.goto_definition.applies_to("any-custom-file"));
+    }
 
     #[test]
     fn strips_interface_block() {
@@ -1390,8 +1941,150 @@ function validate(ctx: PluginContext): string[] {
         }
     }
 
+    #[tokio::test]
+    async fn hover_and_definition_reset_workspace_caches_without_validate_requests() {
+        let path =
+            std::env::temp_dir().join(format!("vector-lsp-hover-cache-{}.js", std::process::id()));
+        std::fs::write(
+            &path,
+            "const pluginMetadata={hoverFiles:['target'],gotoDefinitionFiles:['target']};\n\
+             function hover(){return {content:getColumnValues('source','code')[0]};}\n\
+             function gotoDefinition(){return {targetFile:'source',targetCol:'code',targetValue:getColumnValues('source','code')[0]};}\n",
+        )
+        .unwrap();
+        let host = PluginHost::new(vec![path.clone()]).unwrap();
+        let old = fixture(&[("target", "id\n1"), ("source", "code\nOLD")]);
+        let new = fixture(&[("target", "id\n1"), ("source", "code\nNEW")]);
+        let newest = fixture(&[("target", "id\n1"), ("source", "code\nNEWEST")]);
+        let ctx = json!({"file":"target"});
+
+        assert_eq!(
+            host.hover(ctx.clone(), old.index, old.snapshot)
+                .await
+                .as_deref(),
+            Some("OLD")
+        );
+        assert_eq!(
+            host.hover(ctx.clone(), new.index, new.snapshot)
+                .await
+                .as_deref(),
+            Some("NEW")
+        );
+        assert_eq!(
+            host.goto_definition(ctx, newest.index, newest.snapshot)
+                .await,
+            Some((
+                "source".to_string(),
+                "code".to_string(),
+                "NEWEST".to_string()
+            ))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn open_shadow_sources() -> (
+        HashMap<Url, Arc<DocumentData>>,
+        HashMap<PathBuf, Arc<DocumentData>>,
+        Arc<DocumentData>,
+    ) {
+        let disk = Arc::new(DocumentData::parse("code\tremoved\nOLD\tDISK_ONLY\n", '\t'));
+        let live = Arc::new(DocumentData::parse("code\nNEW\n", '\t'));
+        let file_cache = HashMap::from([(PathBuf::from("workspace/weapons.txt"), disk)]);
+        let open_docs = HashMap::from([(
+            Url::parse("file:///workspace/weapons.txt").expect("valid test URI"),
+            Arc::clone(&live),
+        )]);
+        (open_docs, file_cache, live)
+    }
+
+    // V-VLSP-01: an open document is the sole authority for its stem.
+    #[test]
+    fn workspace_index_open_document_removes_shadowed_disk_values() {
+        let (open_docs, file_cache, _) = open_shadow_sources();
+        let index = build_workspace_index(&open_docs, &file_cache);
+
+        assert!(index.lookup("weapons", "code", "NEW"));
+        assert!(
+            !index.lookup("weapons", "code", "OLD"),
+            "disk OLD must not remain visible while the same-stem live document contains NEW"
+        );
+    }
+
+    // V-VLSP-01: columns removed in the open document cannot survive from disk.
+    #[test]
+    fn workspace_index_open_document_removes_shadowed_disk_columns() {
+        let (open_docs, file_cache, _) = open_shadow_sources();
+        let index = build_workspace_index(&open_docs, &file_cache);
+
+        assert!(index.has_lookup_target("weapons", "code"));
+        assert!(
+            !index.has_lookup_target("weapons", "removed"),
+            "a disk-only column must disappear from the live workspace index"
+        );
+        assert!(
+            !index.lookup("weapons", "removed", "DISK_ONLY"),
+            "values from a removed disk-only column must not remain lookup-visible"
+        );
+    }
+
+    // V-VLSP-02: the plugin snapshot and lookup index built for one request
+    // must expose the same document generation.
+    #[test]
+    fn workspace_snapshot_and_index_observe_the_same_live_generation() {
+        let (open_docs, file_cache, live) = open_shadow_sources();
+        let snapshot = build_workspace_snapshot(&open_docs, &file_cache);
+        let index = build_workspace_index(&open_docs, &file_cache);
+        let snap_doc = snapshot
+            .files
+            .get("weapons")
+            .expect("snapshot should contain the live weapons document");
+
+        assert!(
+            Arc::ptr_eq(snap_doc, &live),
+            "snapshot should retain the exact live document generation"
+        );
+        for value in ["OLD", "NEW"] {
+            let snapshot_contains = snap_doc.rows.iter().any(|row| {
+                row.cells
+                    .first()
+                    .map(|cell| cell.value == value)
+                    .unwrap_or(false)
+            });
+            assert_eq!(
+                index.lookup("weapons", "code", value),
+                snapshot_contains,
+                "snapshot and index disagree for value {value}"
+            );
+        }
+        assert_eq!(
+            index.has_lookup_target("weapons", "removed"),
+            snap_doc.headers.iter().any(|header| header == "removed"),
+            "snapshot and index disagree about the removed column"
+        );
+    }
+
+    #[test]
+    fn workspace_shadow_normalizes_case_and_percent_encoded_file_stems() {
+        let disk = Arc::new(DocumentData::parse("code\nOLD", '\t'));
+        let live = Arc::new(DocumentData::parse("code\nNEW", '\t'));
+        let file_cache = HashMap::from([(PathBuf::from("C:/workspace/Weapon Set.txt"), disk)]);
+        let open_docs = HashMap::from([(
+            Url::parse("file:///C:/workspace/weapon%20set.txt").unwrap(),
+            Arc::clone(&live),
+        )]);
+        let index = build_workspace_index(&open_docs, &file_cache);
+        let snapshot = build_workspace_snapshot(&open_docs, &file_cache);
+
+        assert!(index.lookup("weapon set", "code", "NEW"));
+        assert!(!index.lookup("weapon set", "code", "OLD"));
+        assert!(Arc::ptr_eq(
+            snapshot.files.get("weapon set").unwrap(),
+            &live
+        ));
+    }
+
     async fn run_plugin(plugin_name: &str, file: &str, fx: &PluginFixture) -> Vec<Diagnostic> {
-        let host = PluginHost::new(vec![plugin_path(plugin_name)]);
+        let host = PluginHost::new(vec![plugin_path(plugin_name)]).unwrap();
         let doc = fx.docs.get(file).expect("test document should exist");
         host.run(
             build_context(file, doc),
@@ -1874,7 +2567,7 @@ function validate(ctx: PluginContext): string[] {
     async fn cube_input_hover_and_definition_still_use_the_base_token() {
         let files = with_base_files(("cubemain", "desc\tinput 1\nr\thpot,qty=3\n"));
         let fx = fixture(&files);
-        let host = PluginHost::new(vec![plugin_path("cubeInputCheck.ts")]);
+        let host = PluginHost::new(vec![plugin_path("cubeInputCheck.ts")]).unwrap();
         let doc = fx.docs.get("cubemain").expect("cubemain fixture");
         let ctx = build_hover_context("cubemain", "input 1", "hpot,qty=3", 1, doc);
 

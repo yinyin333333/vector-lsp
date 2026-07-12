@@ -1,5 +1,16 @@
 /// <reference path="../../vector-lsp-plugin.d.ts" />
 
+const pluginMetadata: PluginMetadata = {
+    validateFiles: [
+        "automagic", "magicprefix", "magicsuffix", "gems", "qualityitems", "cubemain",
+        "monprop", "setitems", "uniqueitems", "runes", "sets",
+    ],
+    gotoDefinitionFiles: [
+        "automagic", "magicprefix", "magicsuffix", "gems", "qualityitems", "cubemain",
+        "monprop", "setitems", "uniqueitems", "runes", "sets",
+    ],
+};
+
 // Validates fields that must contain a valid property code (properties.txt or
 // propertygroups.txt).
 //

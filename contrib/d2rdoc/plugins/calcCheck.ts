@@ -1,5 +1,12 @@
 /// <reference path="../../vector-lsp-plugin.d.ts" />
 
+const pluginMetadata: PluginMetadata = {
+    validateFiles: [
+        "misc", "armor", "weapons", "shareditems", "setitems", "uniqueitems",
+        "treasureclassex", "missiles", "monpet", "skills", "skilldesc",
+    ],
+};
+
 // Validates BBE calc formula syntax for every column listed in the BBE field
 // map below.  Scope identifiers (Skill / Missile / Monster) are read live from
 // the workspace's skillcalc / misscalc / moncalc files so they adapt to each
