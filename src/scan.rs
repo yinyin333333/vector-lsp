@@ -9,6 +9,7 @@ pub const EDITOR_EXTENSIONS: &[&str] = &["txt", "tsv", "tbl", "csv"];
 pub struct ScanPolicy {
     extensions: Vec<String>,
     case_insensitive: bool,
+    recursive: bool,
 }
 
 impl ScanPolicy {
@@ -16,6 +17,7 @@ impl ScanPolicy {
         Self {
             extensions: vec![extension.to_string()],
             case_insensitive: false,
+            recursive: true,
         }
     }
 
@@ -26,6 +28,17 @@ impl ScanPolicy {
                 .map(|value| value.to_string())
                 .collect(),
             case_insensitive: true,
+            recursive: true,
+        }
+    }
+
+    /// Hidden reference context for a standalone editor tab: direct `*.txt`
+    /// siblings only. Avoid traversing nested mods, backups, or other versions.
+    pub fn sibling_txt() -> Self {
+        Self {
+            extensions: vec!["txt".to_string()],
+            case_insensitive: true,
+            recursive: false,
         }
     }
 
@@ -111,7 +124,9 @@ pub fn collect_data_files(root: &Path, policy: &ScanPolicy) -> io::Result<ScanDi
         for entry in entries {
             let path = entry.path();
             if path.is_dir() {
-                stack.push(path);
+                if policy.recursive {
+                    stack.push(path);
+                }
                 continue;
             }
             if !policy.includes(&path) {
@@ -156,5 +171,35 @@ mod tests {
             assert!(policy.includes(Path::new(path)), "{path}");
         }
         assert!(!policy.includes(Path::new("ignored.md")));
+    }
+
+    #[test]
+    fn sibling_policy_collects_only_direct_txt_children() {
+        let unique = format!(
+            "vector-lsp-sibling-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("direct.txt"), b"id\nvalue\n").unwrap();
+        fs::write(root.join("upper.TXT"), b"id\nvalue\n").unwrap();
+        fs::write(root.join("ignored.tsv"), b"id\nvalue\n").unwrap();
+        fs::write(nested.join("nested.txt"), b"id\nvalue\n").unwrap();
+
+        let discovery = collect_data_files(&root, &ScanPolicy::sibling_txt()).unwrap();
+        let names = discovery
+            .paths
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["direct.txt", "upper.TXT"]);
+        assert!(discovery.failures.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

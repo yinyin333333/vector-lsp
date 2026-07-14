@@ -10,10 +10,13 @@ use crate::diagnostics;
 use crate::document::{DocumentData, utf16_len, utf16_offset_to_byte_index};
 use crate::plugin;
 use crate::scan::{ScanFailure, ScanPolicy};
-use crate::schema::{FieldTypeName, find_loader, format_description};
+use crate::schema::{FieldTypeName, ReferenceResolver, find_loader, format_description};
 use crate::settings::VectorLspSettings;
-use crate::source_selection::normalized_file_stem_from_uri;
-use crate::workspace::{DocumentChangeError, ValidationTicket, Workspace, WorkspacePhase};
+use crate::source_selection::{SourceKind, normalized_file_stem_from_uri};
+use crate::workspace::{
+    DocumentChangeError, ReferenceContextMode, ValidationTicket, Workspace, WorkspacePhase,
+    fixed4_display,
+};
 
 enum VectorLspReady {}
 
@@ -22,6 +25,27 @@ enum VectorLspFailed {}
 const SCAN_CONCURRENCY: usize = 4;
 type ParsedWorkspaceDocument = (Url, std::path::PathBuf, String, Arc<DocumentData>);
 type WorkspaceLoadResult = Result<ParsedWorkspaceDocument, ScanFailure>;
+
+fn mark_edge_whitespace(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let first_visible = chars.iter().position(|ch| !ch.is_whitespace());
+    let last_visible = chars.iter().rposition(|ch| !ch.is_whitespace());
+    chars
+        .iter()
+        .enumerate()
+        .map(|(index, ch)| {
+            let at_edge = first_visible.map_or(true, |first| index < first)
+                || last_visible.map_or(true, |last| index > last);
+            if at_edge && *ch == ' ' {
+                '␠'
+            } else if at_edge && *ch == '\t' {
+                '⇥'
+            } else {
+                *ch
+            }
+        })
+        .collect()
+}
 
 impl tower_lsp::lsp_types::notification::Notification for VectorLspReady {
     type Params = VectorLspReadyParams;
@@ -94,8 +118,13 @@ impl Backend {
             }
             let doc = ws.open_documents.get(&ticket.uri)?.clone();
             let stem = Self::file_stem(&ticket.uri);
-            let schema_diags =
-                diagnostics::validate_document(&stem, &doc, ws.schema.as_deref(), &ws.symbols);
+            let schema_diags = diagnostics::validate_document_for_version(
+                &stem,
+                &doc,
+                ws.schema.as_deref(),
+                &ws.symbols,
+                ws.reference_version.as_deref(),
+            );
             let plugin_data = self
                 .plugin_host
                 .as_ref()
@@ -220,7 +249,7 @@ impl Backend {
         workspace_revision: u64,
     ) -> bool {
         self.clear_obsolete_disk_diagnostics().await;
-        let (schema, symbols, shared, documents) = {
+        let (schema, symbols, shared, documents, reference_version) = {
             let ws = self.workspace.read().await;
             if ws.scan_generation != scan_generation
                 || ws.workspace_revision != workspace_revision
@@ -249,6 +278,7 @@ impl Backend {
                 Arc::new(ws.symbols.clone()),
                 shared,
                 documents,
+                ws.reference_version.clone(),
             )
         };
 
@@ -256,9 +286,15 @@ impl Backend {
         for (uri, stem, document) in documents {
             let schema = schema.clone();
             let symbols = Arc::clone(&symbols);
+            let reference_version = reference_version.clone();
             schema_tasks.spawn_blocking(move || {
-                let diagnostics =
-                    diagnostics::validate_document(&stem, &document, schema.as_deref(), &symbols);
+                let diagnostics = diagnostics::validate_document_for_version(
+                    &stem,
+                    &document,
+                    schema.as_deref(),
+                    &symbols,
+                    reference_version.as_deref(),
+                );
                 (uri, stem, document, diagnostics)
             });
         }
@@ -420,12 +456,22 @@ impl Backend {
         schema_duration: Duration,
     ) {
         let scan_started = Instant::now();
-        let (root_uri, delimiter, ext, scan_generation, session_generation) = {
+        let (
+            root_uri,
+            reference_root_uri,
+            delimiter,
+            ext,
+            reference_context_mode,
+            scan_generation,
+            session_generation,
+        ) = {
             let mut ws = self.workspace.write().await;
             (
                 ws.root_uri.clone(),
+                ws.reference_root_uri.clone(),
                 self.settings.delimiter_char(),
                 self.settings.extension.clone(),
+                ws.reference_context_mode,
                 ws.begin_scan(),
                 ws.session_generation,
             )
@@ -444,7 +490,9 @@ impl Backend {
             return;
         };
 
-        let scan_policy = if self.settings.editor_mode {
+        let scan_policy = if reference_context_mode == ReferenceContextMode::Sibling {
+            ScanPolicy::sibling_txt()
+        } else if self.settings.editor_mode {
             ScanPolicy::editor()
         } else {
             ScanPolicy::standalone(&ext)
@@ -477,6 +525,59 @@ impl Backend {
             let stem = Self::file_stem(&uri);
             entries.push((uri, path, stem));
         }
+        let mut reference_entries: Vec<(Url, std::path::PathBuf, String)> = Vec::new();
+        if reference_context_mode == ReferenceContextMode::Sibling {
+            if let Some(reference_root_uri) = reference_root_uri {
+                match reference_root_uri.to_file_path() {
+                    Ok(reference_root_path) if reference_root_path != root_path => {
+                        match crate::scan::collect_data_files(
+                            &reference_root_path,
+                            &ScanPolicy::editor(),
+                        ) {
+                            Ok(reference_discovery) => {
+                                failures.extend(reference_discovery.failures);
+                                for path in reference_discovery.paths {
+                                    match Url::from_file_path(&path) {
+                                        Ok(uri) => {
+                                            let stem = Self::file_stem(&uri);
+                                            reference_entries.push((uri, path, stem));
+                                        }
+                                        Err(_) => failures.push(ScanFailure {
+                                            path,
+                                            reason: "cannot convert explicit reference-root path to a file URI".to_string(),
+                                        }),
+                                    }
+                                }
+                            }
+                            Err(error) => failures.push(ScanFailure {
+                                path: reference_root_path,
+                                reason: format!("explicit reference-root scan failed: {error}"),
+                            }),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => failures.push(ScanFailure {
+                        path: root_path.clone(),
+                        reason: format!(
+                            "explicit reference root is not a file path: {reference_root_uri}"
+                        ),
+                    }),
+                }
+            }
+        }
+        let present_paths = entries
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let reference_present_paths = reference_entries
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        {
+            let mut workspace = self.workspace.write().await;
+            workspace.set_workspace_present_paths(present_paths);
+            workspace.set_reference_root_present_paths(reference_present_paths);
+        }
 
         // Keep only a small, fixed number of read+parse tasks in flight so a large
         // workspace cannot allocate one task and one source buffer per file.
@@ -497,13 +598,34 @@ impl Backend {
                 }),
             }
         }
+        let reference_settings = Arc::clone(&self.settings);
+        let mut reference_parsed: Vec<ParsedWorkspaceDocument> = Vec::new();
+        let reference_load_results =
+            run_bounded(reference_entries, SCAN_CONCURRENCY, move |entry| {
+                load_workspace_document(Arc::clone(&reference_settings), delimiter, entry)
+            })
+            .await;
+        for result in reference_load_results {
+            match result {
+                Ok(Ok(item)) => reference_parsed.push(item),
+                Ok(Err(failure)) => failures.push(failure),
+                Err(error) => failures.push(ScanFailure {
+                    path: root_path.clone(),
+                    reason: format!("explicit reference-root scan task failed: {error}"),
+                }),
+            }
+        }
         let read_parse_duration = read_parse_started.elapsed();
 
-        let count = parsed.len();
+        let count = parsed.len() + reference_parsed.len();
         let index_started = Instant::now();
         {
             let mut ws = self.workspace.write().await;
-            if !ws.commit_scan_documents(scan_generation, &parsed) {
+            if !ws.commit_scan_documents_with_reference_root(
+                scan_generation,
+                &parsed,
+                &reference_parsed,
+            ) {
                 return;
             }
         }
@@ -581,7 +703,7 @@ async fn load_workspace_document(
             .await
             .map_err(|error| ScanFailure {
                 path: path.clone(),
-                reason: format!("parser task failed: {error}"),
+                reason: format!("could not read this TXT file in the background: {error}"),
             })?;
     Ok((uri, path, stem, document))
 }
@@ -698,6 +820,20 @@ impl LanguageServer for Backend {
             .and_then(|value| value.get("sessionGeneration"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
+        let reference_context_mode = ReferenceContextMode::from_initialization_value(
+            params
+                .initialization_options
+                .as_ref()
+                .and_then(|value| value.get("referenceContextMode"))
+                .and_then(serde_json::Value::as_str),
+        );
+        let reference_root_uri = params
+            .initialization_options
+            .as_ref()
+            .and_then(|value| value.get("referenceRootUri"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Url::parse(value).ok())
+            .filter(|uri| uri.scheme() == "file");
         let root_uri = params
             .workspace_folders
             .as_deref()
@@ -708,6 +844,8 @@ impl LanguageServer for Backend {
         {
             let mut ws = self.workspace.write().await;
             ws.root_uri = root_uri;
+            ws.set_reference_context_mode(reference_context_mode);
+            ws.set_reference_root_uri(reference_root_uri);
             ws.begin_initialization(session_generation);
         }
 
@@ -756,7 +894,7 @@ impl LanguageServer for Backend {
             ) {
                 Ok(l) => l,
                 Err(e) => {
-                    self.fail_workspace(format!("Schema loader selection failed: {e}"))
+                    self.fail_workspace(format!("Could not select the schema: {e}"))
                         .await;
                     return;
                 }
@@ -783,15 +921,69 @@ impl LanguageServer for Backend {
                     schema_duration = schema_started.elapsed();
                 }
                 Ok(Err(e)) => {
-                    self.fail_workspace(format!("Schema load failed: {e:#}"))
+                    self.fail_workspace(format!("Could not load the schema: {e:#}"))
                         .await;
                     return;
                 }
                 Err(e) => {
-                    self.fail_workspace(format!("Schema task panicked: {e}"))
-                        .await;
+                    self.fail_workspace(format!(
+                        "Could not load the schema because its background task stopped: {e}"
+                    ))
+                    .await;
                     return;
                 }
+            }
+        }
+        let reference_settings = Arc::clone(&self.settings);
+        match tokio::task::spawn_blocking(move || {
+            crate::reference_data::load_selected_reference_dataset(&reference_settings)
+        })
+        .await
+        {
+            Ok(Ok(Some(dataset))) => {
+                let count = dataset.documents.len();
+                let version = dataset.game_version.clone();
+                let digest = dataset.canonical_sha256.clone();
+                self.workspace.write().await.install_reference_dataset(
+                    dataset.game_version,
+                    dataset.canonical_sha256,
+                    dataset.documents,
+                );
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "Loaded {count} hidden reference tables for game version {version} ({digest})."
+                        ),
+                    )
+                    .await;
+            }
+            Ok(Ok(None)) => {
+                self.workspace.write().await.clear_reference_dataset();
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        "Bundled reference fallback disabled: no explicit or inferable game version.",
+                    )
+                    .await;
+            }
+            Ok(Err(error)) => {
+                self.workspace.write().await.clear_reference_dataset();
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Bundled reference fallback disabled for this session: {error:#}"),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                self.workspace.write().await.clear_reference_dataset();
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Bundled reference data could not be loaded: {error}"),
+                    )
+                    .await;
             }
         }
         if self.workspace.read().await.phase != WorkspacePhase::Failed {
@@ -919,15 +1111,18 @@ impl LanguageServer for Backend {
         };
         let ready = {
             let mut ws = self.workspace.write().await;
+            let path_present = disk_document.is_some() || reload_error.is_some();
             let restored_document = if reload_error.is_some() {
-                path.as_ref()
-                    .and_then(|path| ws.file_cache.get(path))
-                    .cloned()
+                path.as_ref().and_then(|path| ws.cached_disk_document(path))
             } else {
                 disk_document
             };
-            ws.restore_closed_document(&uri, path.clone(), restored_document)
-                && ws.phase == WorkspacePhase::Ready
+            ws.restore_closed_document_with_presence(
+                &uri,
+                path.clone(),
+                restored_document,
+                path_present,
+            ) && ws.phase == WorkspacePhase::Ready
         };
         self.client
             .publish_diagnostics(uri.clone(), vec![], None)
@@ -982,12 +1177,20 @@ impl LanguageServer for Backend {
                 .and_then(|s| s.find_field(&file_stem, &col_name))
                 .and_then(|f| f.field_type.as_ref())
                 .filter(|ft| ft.type_name == FieldTypeName::Reference)
-                .and_then(|ft| ft.file.as_ref().zip(ft.field.as_ref()))
-                .map(|(f, c)| (f.to_lowercase(), c.clone()));
+                .and_then(|ft| {
+                    ft.file
+                        .as_ref()
+                        .zip(ft.field.as_ref())
+                        .map(|(file, field)| (file.to_lowercase(), field.clone(), ft.resolver))
+                });
 
-            let schema_loc = ref_target.as_ref().and_then(|(ref_file, ref_col)| {
-                ws.symbols.lookup(ref_file, ref_col, &cell_value).cloned()
-            });
+            let schema_loc = ref_target
+                .as_ref()
+                .and_then(|(ref_file, ref_col, resolver)| {
+                    ws.symbols
+                        .lookup_resolved(ref_file, ref_col, &cell_value, *resolver)
+                        .cloned()
+                });
 
             let plugin_data = if schema_loc.is_none() {
                 self.plugin_host
@@ -1105,7 +1308,16 @@ impl LanguageServer for Backend {
 
         // Data row hover: return the cell value plus any plugin-provided context.
         // Column documentation is intentionally omitted here — it belongs on the header.
-        let (cell_col_start, cell_len, _col_name, cell_value, plugin_hover_data) = {
+        let (
+            cell_col_start,
+            cell_len,
+            _col_name,
+            cell_value,
+            reference_content,
+            type29_content,
+            hit_summon_mode_content,
+            plugin_hover_data,
+        ) = {
             let ws = self.workspace.read().await;
             let Some(doc) = ws.open_documents.get(uri) else {
                 return Ok(None);
@@ -1123,6 +1335,170 @@ impl LanguageServer for Backend {
             let cell_value = cell.value.clone();
             let cell_col_start = cell.col_start;
             let cell_len = utf16_len(&cell.value);
+            let current_row = doc.rows.iter().find(|row| row.line == pos.line);
+            let reference_cell_is_consumed = current_row.is_none_or(|row| {
+                diagnostics::reference_cell_is_consumed(&file_stem, doc, row, &col_name)
+            });
+            let properties_stat_func = current_row.and_then(|row| {
+                diagnostics::properties_stat_dispatch_func(&file_stem, doc, row, &col_name)
+            });
+
+            let reference_content = ws
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.find_field(&file_stem, &col_name))
+                .and_then(|field| field.field_type.as_ref())
+                .filter(|field_type| field_type.type_name == FieldTypeName::Reference)
+                .and_then(|field_type| {
+                    if !reference_cell_is_consumed {
+                        return None;
+                    }
+                    let reference_file = field_type.file.as_deref()?;
+                    let reference_column = field_type.field.as_deref()?;
+                    let resolved = ws.symbols.resolve(
+                        reference_file,
+                        reference_column,
+                        &cell_value,
+                        field_type.resolver,
+                    );
+                    if resolved.is_none()
+                        && diagnostics::is_monpet_consumestat_reference(&file_stem, &col_name)
+                        && ws.symbols.has_file(reference_file)
+                        && ws.symbols.has_column(reference_file, reference_column)
+                    {
+                        return Some(format!(
+                            "**Unknown stat name**\n\n`{}` is not a known stat. This Consume bonus is not applied; other Consume slots still work. Use the exact Stat name from `itemstatcost.txt`.",
+                            cell_value
+                        ));
+                    }
+                    if resolved.is_none()
+                        && diagnostics::is_properties_stat_reference(&file_stem, &col_name)
+                        && ws.symbols.has_file(reference_file)
+                        && ws.symbols.has_column(reference_file, reference_column)
+                    {
+                        return Some(if properties_stat_func == Some(17) {
+                            format!(
+                                "**Unknown stat name**\n\n`{}` is not a known stat. This property has no effect. Use the exact Stat name from `itemstatcost.txt`.",
+                                cell_value
+                            )
+                        } else {
+                            format!(
+                                "**Unknown stat name**\n\n`{}` is not a known stat. Use the exact Stat name from `itemstatcost.txt`.",
+                                cell_value
+                            )
+                        });
+                    }
+                    let resolved = resolved?;
+                    let lookup_value = match field_type.resolver {
+                        ReferenceResolver::AsciiCi => cell_value.clone(),
+                        ReferenceResolver::Fixed4 => fixed4_display(&cell_value),
+                    };
+                    let source = match resolved.source_kind {
+                        SourceKind::Open => match ws.reference_version.as_deref() {
+                            Some(version) => {
+                                format!("Open document (game version {version})")
+                            }
+                            None => "Open document".to_string(),
+                        },
+                        SourceKind::Workspace => match ws.reference_version.as_deref() {
+                            Some(version) => {
+                                format!("TXT file in the current workspace (game version {version})")
+                            }
+                            None => "TXT file in the current workspace".to_string(),
+                        },
+                        SourceKind::Sibling => match ws.reference_version.as_deref() {
+                            Some(version) => {
+                                format!("TXT file in the same folder (game version {version})")
+                            }
+                            None => "TXT file in the same folder".to_string(),
+                        },
+                        SourceKind::Bundled => format!(
+                            "Built-in reference data (game version {})",
+                            resolved
+                                .bundled_version
+                                .as_deref()
+                                .unwrap_or("unknown")
+                        ),
+                    };
+                    if file_stem.eq_ignore_ascii_case("skills")
+                        && col_name.eq_ignore_ascii_case("range")
+                        && field_type.resolver == ReferenceResolver::Fixed4
+                    {
+                        Some(format!(
+                            "**Range code**\n\n`{}` is valid. The game uses range code `{}`.\n\nSource: {}",
+                            mark_edge_whitespace(&cell_value),
+                            resolved.stored_value,
+                            source
+                        ))
+                    } else {
+                        let shown_cell = if field_type.resolver == ReferenceResolver::Fixed4 {
+                            mark_edge_whitespace(&cell_value)
+                        } else {
+                            cell_value.clone()
+                        };
+                        Some(format!(
+                            "**Reference resolved**\n\n`{}` → `{}` in `{}.{}`\n\nSource: {}",
+                            shown_cell,
+                            if field_type.resolver == ReferenceResolver::Fixed4 {
+                                lookup_value.as_str()
+                            } else {
+                                resolved.stored_value.as_str()
+                            },
+                            reference_file,
+                            reference_column,
+                            source
+                        ))
+                    }
+                });
+
+            let type29_content = if diagnostics::is_confirmed_type29_boolean(&file_stem, &col_name)
+            {
+                diagnostics::parse_type29_boolean(&cell_value).map(|value| {
+                    let version = ws.reference_version.as_deref().map_or_else(
+                        || "Game version: not selected".to_string(),
+                        |version| format!("Game version: {version}"),
+                    );
+                    format!(
+                        "**Boolean value**\n\n`{}` → **{}** (0 means false; any nonzero number means true)\n\n{}",
+                        cell_value,
+                        if value { "true" } else { "false" },
+                        version
+                    )
+                })
+            } else {
+                None
+            };
+
+            let hit_summon_mode_content = current_row
+                .filter(|row| {
+                    diagnostics::is_hit_summon_mode_cell(
+                        &file_stem,
+                        doc,
+                        row,
+                        &col_name,
+                        ws.reference_version.as_deref(),
+                    )
+                })
+                .map(|_| {
+                    let result = diagnostics::hit_summon_mode_result(&cell_value);
+                    let current = if result.fallback_applied {
+                        format!("Current value: `{}` -> 1 (NU)", mark_edge_whitespace(&cell_value))
+                    } else {
+                        format!(
+                            "Current value: `{}` -> {} ({})",
+                            if cell_value.is_empty() {
+                                "blank".to_string()
+                            } else {
+                                mark_edge_whitespace(&cell_value)
+                            },
+                            result.effective,
+                            diagnostics::HIT_SUMMON_MODE_CODES[result.effective as usize]
+                        )
+                    };
+                    format!(
+                        "**HitSummon monster mode**\n\nThe second server parameter uses a monster mode number from 0 through 15.\n\n0=DT, 1=NU, 2=WL, 3=GH, 4=A1, 5=A2, 6=BL, 7=SC, 8=S1, 9=S2, 10=S3, 11=S4, 12=DD, 13=KB, 14=xx, 15=RN.\n\nValues outside 0 through 15 use 1=NU.\n\n{current}"
+                    )
+                });
 
             let plugin_hover_data = self
                 .plugin_host
@@ -1150,6 +1526,9 @@ impl LanguageServer for Backend {
                 cell_len,
                 col_name,
                 cell_value,
+                reference_content,
+                type29_content,
+                hit_summon_mode_content,
                 plugin_hover_data,
             )
         }; // read lock released here
@@ -1169,8 +1548,25 @@ impl LanguageServer for Backend {
             _ => None,
         };
 
-        let combined = match plugin_content {
-            Some(extra) if !extra.is_empty() => extra,
+        let combined = match (
+            plugin_content,
+            reference_content,
+            type29_content,
+            hit_summon_mode_content,
+        ) {
+            (Some(plugin), Some(reference), _, _) if !plugin.is_empty() => {
+                format!("{plugin}\n\n---\n\n{reference}")
+            }
+            (Some(plugin), _, Some(type29), _) if !plugin.is_empty() => {
+                format!("{plugin}\n\n---\n\n{type29}")
+            }
+            (Some(plugin), _, _, Some(hit_summon)) if !plugin.is_empty() => {
+                format!("{plugin}\n\n---\n\n{hit_summon}")
+            }
+            (Some(plugin), _, _, _) if !plugin.is_empty() => plugin,
+            (_, Some(reference), _, _) => reference,
+            (_, _, Some(type29), _) => type29,
+            (_, _, _, Some(hit_summon)) => hit_summon,
             _ if cell_value.is_empty() => return Ok(None),
             _ => cell_value.clone(),
         };
@@ -1260,6 +1656,41 @@ mod tests {
         assert!(maximum.load(Ordering::SeqCst) <= SCAN_CONCURRENCY);
     }
 
+    #[tokio::test]
+    async fn initialize_consumes_sibling_reference_context_without_guessing_other_values() {
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        let settings = Arc::new(VectorLspSettings::default());
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+        let mut params = InitializeParams::default();
+        params.root_uri = Some(Url::parse("file:///E:/mod").unwrap());
+        params.initialization_options = Some(serde_json::json!({
+            "sessionGeneration": 42,
+            "referenceContextMode": "sibling",
+            "referenceRootUri": "file:///E:/explicit-workspace"
+        }));
+        service.inner().initialize(params).await.unwrap();
+
+        let ws = workspace.read().await;
+        assert_eq!(ws.reference_context_mode, ReferenceContextMode::Sibling);
+        assert_eq!(ws.session_generation, 42);
+        assert_eq!(
+            ws.root_uri.as_ref().map(Url::as_str),
+            Some("file:///E:/mod")
+        );
+        assert_eq!(
+            ws.reference_root_uri.as_ref().map(Url::as_str),
+            Some("file:///E:/explicit-workspace")
+        );
+    }
+
     #[test]
     fn plugin_definition_never_mixes_snapshot_and_later_symbol_revisions() {
         let uri = Url::parse("file:///workspace/items.txt").unwrap();
@@ -1287,6 +1718,655 @@ mod tests {
         assert!(workspace_identity_matches((4, 9), (4, 9)));
         assert!(!workspace_identity_matches((4, 9), (4, 10)));
         assert!(!workspace_identity_matches((4, 9), (5, 9)));
+    }
+
+    #[tokio::test]
+    async fn d2rdoc_binary_patches_reach_the_actual_header_hover_path() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("3.2").join("schema");
+        let loader = find_loader("d2rdoc", "3.2".to_string(), Some(contrib)).unwrap();
+        let schema = Arc::new(loader.load(Some(&schema_dir)).unwrap());
+
+        let documents = [
+            (
+                Url::parse("file:///workspace/monstats.txt").unwrap(),
+                "NextInClass\n",
+            ),
+            (
+                Url::parse("file:///workspace/treasureclassex.txt").unwrap(),
+                "Picks\tProb1\n",
+            ),
+            (
+                Url::parse("file:///workspace/cubemain.txt").unwrap(),
+                "output\toutput b\toutput c\tmod 1\tb mod 1\tc mod 1\tilvl\tb ilvl\tc ilvl\n",
+            ),
+            (
+                Url::parse("file:///workspace/missiles.txt").unwrap(),
+                "Explosion\tNoMultiShot\n2\t-1\n",
+            ),
+        ];
+
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        {
+            let mut ws = workspace.write().await;
+            ws.schema = Some(schema);
+            ws.reference_version = Some("3.2".to_string());
+            for (uri, text) in &documents {
+                ws.open_documents
+                    .insert(uri.clone(), Arc::new(DocumentData::parse(text, '\t')));
+            }
+        }
+
+        let settings = Arc::new(VectorLspSettings::default());
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+
+        let cases = [
+            (
+                "file:///workspace/monstats.txt",
+                0,
+                "contiguous row order are not required",
+            ),
+            (
+                "file:///workspace/treasureclassex.txt",
+                0,
+                "does not have to equal the Prob# total",
+            ),
+            (
+                "file:///workspace/treasureclassex.txt",
+                7,
+                "positive Prob# values select numbered positions",
+            ),
+            (
+                "file:///workspace/cubemain.txt",
+                1,
+                "use input 1, input 2, or input 3",
+            ),
+            (
+                "file:///workspace/cubemain.txt",
+                8,
+                "use input 1, input 2, or input 3",
+            ),
+            (
+                "file:///workspace/cubemain.txt",
+                17,
+                "use input 1, input 2, or input 3",
+            ),
+            (
+                "file:///workspace/cubemain.txt",
+                26,
+                "Letter case does not matter",
+            ),
+            (
+                "file:///workspace/cubemain.txt",
+                31,
+                "Letter case does not matter",
+            ),
+            (
+                "file:///workspace/cubemain.txt",
+                39,
+                "Letter case does not matter",
+            ),
+            ("file:///workspace/cubemain.txt", 47, "ilvl uses input 1"),
+            ("file:///workspace/cubemain.txt", 52, "b ilvl uses input 2"),
+            ("file:///workspace/cubemain.txt", 59, "c ilvl uses input 3"),
+            (
+                "file:///workspace/missiles.txt",
+                1,
+                "Numeric 0 means false. Any numeric nonzero value means true",
+            ),
+            (
+                "file:///workspace/missiles.txt",
+                12,
+                "including negative values",
+            ),
+        ];
+
+        for (uri, character, expected) in cases {
+            let hover = service
+                .inner()
+                .hover(HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: Url::parse(uri).unwrap(),
+                        },
+                        position: Position::new(0, character),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap()
+                .expect("patched header hover");
+            let HoverContents::Markup(markup) = hover.contents else {
+                panic!("header hover should be Markdown markup");
+            };
+            assert!(
+                markup.value.contains(expected),
+                "header hover at {uri}:{character} did not contain {expected:?}: {}",
+                markup.value
+            );
+        }
+
+        for (character, expected_value, expected_truth) in
+            [(0, "`2`", "**true**"), (3, "`-1`", "**true**")]
+        {
+            let hover = service
+                .inner()
+                .hover(HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: Url::parse("file:///workspace/missiles.txt").unwrap(),
+                        },
+                        position: Position::new(1, character),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap()
+                .expect("type-29 value hover");
+            let HoverContents::Markup(markup) = hover.contents else {
+                panic!("type-29 hover should be Markdown markup");
+            };
+            assert!(markup.value.contains(expected_value), "{}", markup.value);
+            assert!(markup.value.contains(expected_truth), "{}", markup.value);
+            assert!(
+                markup.value.contains("Game version: 3.2"),
+                "{}",
+                markup.value
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hit_summon_mode_hover_is_limited_to_server_parameter_two_in_3_2() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("3.2").join("schema");
+        let loader = find_loader("d2rdoc", "3.2".to_string(), Some(contrib)).unwrap();
+        let schema = Arc::new(loader.load(Some(&schema_dir)).unwrap());
+        let uri = Url::parse("file:///workspace/missiles.txt").unwrap();
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        {
+            let mut ws = workspace.write().await;
+            ws.schema = Some(schema);
+            ws.reference_version = Some("3.2".to_string());
+            ws.open_documents.insert(
+                uri.clone(),
+                Arc::new(DocumentData::parse(
+                    "pSrvHitFunc\tsHitPar2\tcHitPar2\n6\tNU\tNU",
+                    '\t',
+                )),
+            );
+        }
+        let settings = Arc::new(VectorLspSettings::default());
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+
+        let hover_at = |character| HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(1, character),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let hover = service
+            .inner()
+            .hover(hover_at(2))
+            .await
+            .unwrap()
+            .expect("HitSummon sHitPar2 hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("HitSummon hover should be Markdown markup");
+        };
+        assert!(
+            markup.value.contains("HitSummon monster mode"),
+            "{}",
+            markup.value
+        );
+        assert!(markup.value.contains("0=DT, 1=NU"), "{}", markup.value);
+        assert!(markup.value.contains("15=RN"), "{}", markup.value);
+        assert!(
+            markup.value.contains("outside 0 through 15 use 1=NU"),
+            "{}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Current value: `NU` -> 1 (NU)"),
+            "{}",
+            markup.value
+        );
+
+        let client_hover = service
+            .inner()
+            .hover(hover_at(5))
+            .await
+            .unwrap()
+            .expect("generic cHitPar2 hover");
+        let HoverContents::Markup(client_markup) = client_hover.contents else {
+            panic!("cHitPar2 hover should be Markdown markup");
+        };
+        assert!(!client_markup.value.contains("HitSummon monster mode"));
+    }
+
+    #[tokio::test]
+    async fn monpet_consumestat_miss_hover_uses_plain_slot_skip_explanation() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("3.1").join("schema");
+        let loader = find_loader("d2rdoc", "3.1".to_string(), Some(contrib)).unwrap();
+        let schema = Arc::new(loader.load(Some(&schema_dir)).unwrap());
+        let uri = Url::parse("file:///workspace/monpet.txt").unwrap();
+
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        {
+            let mut ws = workspace.write().await;
+            ws.schema = Some(schema);
+            ws.reference_version = Some("3.1".to_string());
+            ws.open_documents.insert(
+                uri.clone(),
+                Arc::new(DocumentData::parse(
+                    "monster\tconsumestat1\nrow\titem_addsksrc _tab\n",
+                    '\t',
+                )),
+            );
+            let targets = HashSet::from([("itemstatcost".to_string(), "stat".to_string())]);
+            ws.symbols.index_effective_document(
+                None,
+                "itemstatcost",
+                &DocumentData::parse("Stat\nstrength\n", '\t'),
+                &targets,
+                SourceKind::Bundled,
+                Some("3.1"),
+            );
+        }
+
+        let settings = Arc::new(VectorLspSettings::default());
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+
+        let hover = service
+            .inner()
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(1, 6),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap()
+            .expect("unresolved consumestat hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("consumestat hover should be Markdown");
+        };
+        assert!(markup.value.contains("Unknown stat name"));
+        assert!(markup.value.contains("This Consume bonus is not applied"));
+        assert!(markup.value.contains("other Consume slots still work"));
+        assert!(markup.value.contains("Use the exact Stat name"));
+        assert!(!markup.value.contains("0xFFFF"));
+        assert!(!markup.value.contains("loader"));
+    }
+
+    #[tokio::test]
+    async fn properties_stat_hover_reports_only_reachable_active_slots() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("3.2").join("schema");
+        let loader = find_loader("d2rdoc", "3.2".to_string(), Some(contrib)).unwrap();
+        let schema = Arc::new(loader.load(Some(&schema_dir)).unwrap());
+        let uri = Url::parse("file:///workspace/properties.txt").unwrap();
+
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        {
+            let mut ws = workspace.write().await;
+            ws.schema = Some(schema);
+            ws.reference_version = Some("3.2".to_string());
+            ws.open_documents.insert(
+                uri.clone(),
+                Arc::new(DocumentData::parse(
+                    "code\tfunc1\tstat1\nactive\t17\tunknown\ninactive\t0\tunknown\ngeneric\t1\tunknown\n",
+                    '\t',
+                )),
+            );
+            let targets = HashSet::from([("itemstatcost".to_string(), "stat".to_string())]);
+            ws.symbols.index_effective_document(
+                None,
+                "itemstatcost",
+                &DocumentData::parse("Stat\nstrength\n", '\t'),
+                &targets,
+                SourceKind::Bundled,
+                Some("3.2"),
+            );
+        }
+
+        let settings = Arc::new(VectorLspSettings::default());
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+
+        let hover_at = |line| HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(line, 12),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let active = service
+            .inner()
+            .hover(hover_at(1))
+            .await
+            .unwrap()
+            .expect("active unresolved property stat hover");
+        let HoverContents::Markup(active_markup) = active.contents else {
+            panic!("property stat hover should be Markdown");
+        };
+        assert!(active_markup.value.contains("Unknown stat name"));
+        assert!(active_markup.value.contains("This property has no effect"));
+        assert!(active_markup.value.contains("Use the exact Stat name"));
+
+        let inactive = service
+            .inner()
+            .hover(hover_at(2))
+            .await
+            .unwrap()
+            .expect("inactive cell still returns its plain cell value");
+        let HoverContents::Markup(inactive_markup) = inactive.contents else {
+            panic!("inactive cell hover should be Markdown");
+        };
+        assert_eq!(inactive_markup.value, "unknown");
+
+        let generic = service
+            .inner()
+            .hover(hover_at(3))
+            .await
+            .unwrap()
+            .expect("reachable non-func17 property stat hover");
+        let HoverContents::Markup(generic_markup) = generic.contents else {
+            panic!("generic property stat hover should be Markdown");
+        };
+        assert!(generic_markup.value.contains("Unknown stat name"));
+        assert!(generic_markup.value.contains("Use the exact Stat name"));
+        assert!(!generic_markup.value.contains("has no effect"));
+    }
+
+    #[tokio::test]
+    async fn skills_range_hover_marks_trailing_space_and_reports_effective_code() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("3.2").join("schema");
+        let loader = find_loader("d2rdoc", "3.2".to_string(), Some(contrib)).unwrap();
+        let schema = Arc::new(loader.load(Some(&schema_dir)).unwrap());
+        let uri = Url::parse("file:///workspace/skills.txt").unwrap();
+
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        {
+            let mut ws = workspace.write().await;
+            ws.schema = Some(schema);
+            ws.reference_version = Some("3.2".to_string());
+            ws.open_documents.insert(
+                uri.clone(),
+                Arc::new(DocumentData::parse("skill|range\nrow|rng \n", '|')),
+            );
+            let targets = HashSet::from([("enums".to_string(), "skill ranges".to_string())]);
+            ws.symbols.index_effective_document(
+                None,
+                "enums",
+                &DocumentData::parse("Skill Ranges\nrng\n", '\t'),
+                &targets,
+                SourceKind::Bundled,
+                Some("3.2"),
+            );
+        }
+
+        let settings = Arc::new(VectorLspSettings::default());
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+
+        let hover = service
+            .inner()
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(1, 4),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap()
+            .expect("range hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("range hover should be Markdown");
+        };
+        assert!(markup.value.contains("`rng␠` is valid"), "{}", markup.value);
+        assert!(
+            markup.value.contains("game uses range code `rng`"),
+            "{}",
+            markup.value
+        );
+        assert!(
+            markup
+                .value
+                .contains("Built-in reference data (game version 3.2)"),
+            "{}",
+            markup.value
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed4_reference_hover_reports_selected_bundled_version_and_open_shadow() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("3.2").join("schema");
+        let loader = find_loader("d2rdoc", "3.2".to_string(), Some(contrib.clone())).unwrap();
+        let schema = Arc::new(loader.load(Some(&schema_dir)).unwrap());
+        let reference_dataset =
+            crate::reference_data::load_reference_dataset(&contrib, "3.2").unwrap();
+        assert_eq!(reference_dataset.documents.len(), 91);
+        assert!(reference_dataset.documents.contains_key("itemtypes"));
+        let source_uri = Url::parse("file:///workspace/magicprefix.txt").unwrap();
+        let target_uri = Url::parse("file:///workspace/itemtypes.txt").unwrap();
+        let target_path = std::path::PathBuf::from("C:/workspace/itemtypes.txt");
+
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        {
+            let mut ws = workspace.write().await;
+            ws.ref_targets = schema.reference_targets();
+            ws.schema = Some(schema);
+            ws.open_documents.insert(
+                source_uri.clone(),
+                Arc::new(DocumentData::parse("Name\titype1\nrow\tstaff\n", '\t')),
+            );
+            ws.install_reference_dataset(
+                reference_dataset.game_version,
+                reference_dataset.canonical_sha256,
+                reference_dataset.documents,
+            );
+            ws.rebuild_effective_symbols();
+        }
+
+        let settings = Arc::new(VectorLspSettings::default());
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+        let params = || HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: source_uri.clone(),
+                },
+                position: Position::new(1, 5),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let definition_params = || GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: source_uri.clone(),
+                },
+                position: Position::new(1, 5),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let hover = service.inner().hover(params()).await.unwrap().unwrap();
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("fixed4 hover must be Markdown");
+        };
+        assert!(
+            markup.value.contains("`staff` → `staf`"),
+            "{}",
+            markup.value
+        );
+        assert!(
+            markup
+                .value
+                .contains("Built-in reference data (game version 3.2)"),
+            "{}",
+            markup.value
+        );
+
+        {
+            let mut ws = workspace.write().await;
+            ws.set_reference_context_mode(ReferenceContextMode::Sibling);
+            ws.set_workspace_present_paths([target_path.clone()]);
+            ws.file_cache.insert(
+                target_path.clone(),
+                Arc::new(DocumentData::parse("Code\nstaf\n", '\t')),
+            );
+            ws.rebuild_effective_symbols();
+        }
+        let sibling = service.inner().hover(params()).await.unwrap().unwrap();
+        let HoverContents::Markup(sibling_markup) = sibling.contents else {
+            panic!("sibling hover must be Markdown");
+        };
+        assert!(
+            sibling_markup
+                .value
+                .contains("TXT file in the same folder (game version 3.2)"),
+            "{}",
+            sibling_markup.value
+        );
+        assert!(
+            service
+                .inner()
+                .goto_definition(definition_params())
+                .await
+                .unwrap()
+                .is_none(),
+            "hidden sibling references must not open an editor tab via go-to-definition"
+        );
+
+        {
+            let mut ws = workspace.write().await;
+            ws.set_reference_context_mode(ReferenceContextMode::Workspace);
+            ws.rebuild_effective_symbols();
+        }
+        assert!(
+            service
+                .inner()
+                .goto_definition(definition_params())
+                .await
+                .unwrap()
+                .is_some(),
+            "ordinary workspace references must retain go-to-definition"
+        );
+        {
+            let mut ws = workspace.write().await;
+            ws.set_reference_context_mode(ReferenceContextMode::Sibling);
+            ws.rebuild_effective_symbols();
+        }
+
+        {
+            let mut ws = workspace.write().await;
+            ws.open_documents.insert(
+                target_uri.clone(),
+                Arc::new(DocumentData::parse("Code\nxxxx\n", '\t')),
+            );
+            ws.rebuild_effective_symbols();
+        }
+        let shadowed = service.inner().hover(params()).await.unwrap().unwrap();
+        let HoverContents::Markup(shadowed_markup) = shadowed.contents else {
+            panic!("shadowed hover must be Markdown");
+        };
+        assert!(!shadowed_markup.value.contains("Reference resolved"));
+
+        {
+            let mut ws = workspace.write().await;
+            ws.open_documents.remove(&target_uri);
+            ws.rebuild_effective_symbols();
+        }
+        let restored = service.inner().hover(params()).await.unwrap().unwrap();
+        let HoverContents::Markup(restored_markup) = restored.contents else {
+            panic!("restored hover must be Markdown");
+        };
+        assert!(
+            restored_markup
+                .value
+                .contains("TXT file in the same folder")
+        );
+
+        {
+            let mut ws = workspace.write().await;
+            ws.file_cache.remove(&target_path);
+            ws.set_workspace_present_paths(std::iter::empty::<std::path::PathBuf>());
+            ws.rebuild_effective_symbols();
+        }
+        let deleted = service.inner().hover(params()).await.unwrap().unwrap();
+        let HoverContents::Markup(deleted_markup) = deleted.contents else {
+            panic!("bundled restore hover must be Markdown");
+        };
+        assert!(
+            deleted_markup
+                .value
+                .contains("Built-in reference data (game version 3.2)")
+        );
     }
 
     #[tokio::test]

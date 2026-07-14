@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 
 use crate::runtime::ScriptRuntime;
 use crate::schema::registry::LoaderEntry;
-use crate::schema::{Schema, SchemaFile, SchemaLoader};
+use crate::schema::{ReferenceResolver, Schema, SchemaFile, SchemaLoader};
 
 /// Variant names that cannot be used as `schema_variant` values because they
 /// conflict with reserved subdirectory names in the contrib layout.
@@ -42,7 +42,7 @@ pub struct D2rDocLoader {
 
 impl D2rDocLoader {
     /// Root of the d2rdoc contrib tree: `{exe_dir}/contrib/d2rdoc/`.
-    fn contrib_root() -> PathBuf {
+    pub(crate) fn contrib_root() -> PathBuf {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_owned()))
@@ -105,7 +105,11 @@ impl SchemaLoader for D2rDocLoader {
 
         let patches_dir = self.effective_patches_dir();
         let mut rt = ScriptRuntime::new()?;
-        load_js(&mut rt, &schema_dir, patches_dir.as_deref())
+        let mut schema = load_js(&mut rt, &schema_dir, patches_dir.as_deref())?;
+        if self.variant == "3.2" {
+            patch_3_2_reference_semantics(&mut schema);
+        }
+        Ok(schema)
     }
 
     /// Returns plugin directories in load order (base first, then variant).
@@ -117,6 +121,22 @@ impl SchemaLoader for D2rDocLoader {
             dirs.push(root.join(&self.variant).join("plugins"));
         }
         dirs
+    }
+}
+
+fn patch_3_2_reference_semantics(schema: &mut Schema) {
+    let Some(skills) = schema.files.get_mut("skills") else {
+        return;
+    };
+    let Some(range) = skills
+        .fields
+        .iter_mut()
+        .find(|field| field.name.eq_ignore_ascii_case("range"))
+    else {
+        return;
+    };
+    if let Some(field_type) = range.field_type.as_mut() {
+        field_type.resolver = ReferenceResolver::Fixed4;
     }
 }
 

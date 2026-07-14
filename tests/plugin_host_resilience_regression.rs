@@ -143,13 +143,13 @@ fn all_bundled_plugins_load_together_for_a_representative_fixture() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(stderr.contains("Loaded 7 plugin file(s)."), "{stderr}");
+    assert!(stderr.contains("Loaded 8 plugin file(s)."), "{stderr}");
     assert!(
         !stderr.contains("vector-lsp: plugin '"),
         "bundled plugins must load without errors:\n{stderr}"
     );
     assert!(
-        stdout.contains("not a valid cubemain input"),
+        stdout.contains("couldn't find 'badbase' for input 1"),
         "combined host must preserve the representative cube rule result:\n{stdout}\n{stderr}"
     );
 }
@@ -378,15 +378,16 @@ fn timed_out_validate_plugin_does_not_discard_or_block_healthy_plugins_for_the_s
     let output = run_with_timeout(&tree, &plugins, Duration::from_secs(3))
         .unwrap_or_else(|error| panic!("{error}"));
     assert!(
-        output.stdout.contains("BEFORE_TIMEOUT")
-            && output.stdout.contains("AFTER_TIMEOUT"),
+        output.stdout.contains("BEFORE_TIMEOUT") && output.stdout.contains("AFTER_TIMEOUT"),
         "a timed-out plugin must not discard earlier results or block later plugins:\n{}\n{}",
         output.stdout,
         output.stderr
     );
     assert!(
         output.stderr.contains("b_timeout.js")
-            && output.stderr.contains("validate exceeded the execution budget"),
+            && output
+                .stderr
+                .contains("validate exceeded the execution budget"),
         "the timed-out plugin must remain identifiable:\n{}\n{}",
         output.stdout,
         output.stderr

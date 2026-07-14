@@ -6,6 +6,7 @@ mod document;
 #[cfg(test)]
 mod performance_measurement_tests;
 mod plugin;
+mod reference_data;
 mod runtime;
 mod scan;
 mod schema;
@@ -25,10 +26,10 @@ use tower_lsp::{LspService, Server};
 
 use cli::CliArgs;
 use document::DocumentData;
-use runtime::build_workspace_index;
+use runtime::build_workspace_index_with_fallback;
 use schema::find_loader;
 use settings::{IoType, VectorLspSettings};
-use source_selection::effective_workspace_sources;
+use source_selection::{SourceKind, effective_workspace_sources_with_fallback};
 use workspace::{SymbolIndex, Workspace};
 
 /// Append sorted .ts/.js plugin files from `dir` to `out`, skipping `_patches.js`.
@@ -58,9 +59,7 @@ fn deduplicate_plugin_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
         .into_iter()
         .filter(|path| {
-            let identity = path
-                .canonicalize()
-                .unwrap_or_else(|_| path.clone());
+            let identity = path.canonicalize().unwrap_or_else(|_| path.clone());
             seen.insert(identity)
         })
         .collect()
@@ -167,6 +166,24 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
     }
     eprintln!("Loaded {} plugin file(s).", plugin_paths.len());
 
+    let reference_dataset = match reference_data::load_selected_reference_dataset(settings) {
+        Ok(dataset) => dataset,
+        Err(error) => {
+            eprintln!("warning: bundled reference fallback disabled for this run: {error:#}");
+            None
+        }
+    };
+    if let Some(dataset) = &reference_dataset {
+        eprintln!(
+            "Loaded {} hidden reference tables for game version {} ({}).",
+            dataset.documents.len(),
+            dataset.game_version,
+            dataset.canonical_sha256
+        );
+    } else {
+        eprintln!("Bundled reference fallback is disabled for this run.");
+    }
+
     let ref_targets: HashSet<(String, String)> = schema_result
         .as_ref()
         .map(|s| s.reference_targets())
@@ -195,6 +212,12 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
     }
 
     let mut parsed: Vec<(std::path::PathBuf, String, Arc<DocumentData>)> = Vec::new();
+    let workspace_present_stems = discovery
+        .paths
+        .iter()
+        .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+        .map(str::to_ascii_lowercase)
+        .collect::<HashSet<_>>();
     for path in discovery.paths {
         let stem = path
             .file_stem()
@@ -216,25 +239,65 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
         file_cache.insert(path.clone(), Arc::clone(doc));
     }
     let open_documents = HashMap::new();
-    let effective_sources = effective_workspace_sources(&open_documents, &file_cache);
+    let empty_fallback = HashMap::new();
+    let fallback_cache = reference_dataset
+        .as_ref()
+        .map(|dataset| &dataset.documents)
+        .unwrap_or(&empty_fallback);
+    let fallback_version = reference_dataset
+        .as_ref()
+        .map(|dataset| dataset.game_version.as_str());
+    let effective_sources = effective_workspace_sources_with_fallback(
+        &open_documents,
+        &file_cache,
+        fallback_cache,
+        &workspace_present_stems,
+        fallback_version,
+    );
     let mut symbols = SymbolIndex::new();
     for source in &effective_sources {
-        let Some(uri) = &source.uri else { continue };
-        symbols.index_document(uri, &source.stem, &source.document, &ref_targets);
+        symbols.index_effective_document(
+            source.uri.as_ref(),
+            &source.stem,
+            &source.document,
+            &ref_targets,
+            source.kind,
+            source.bundled_version.as_deref(),
+        );
     }
-    let workspace_index = build_workspace_index(&open_documents, &file_cache);
-    let snapshot = plugin::build_workspace_snapshot(&open_documents, &file_cache);
+    let workspace_index = build_workspace_index_with_fallback(
+        &open_documents,
+        &file_cache,
+        fallback_cache,
+        &workspace_present_stems,
+        fallback_version,
+    );
+    let snapshot = plugin::build_workspace_snapshot_with_fallback(
+        &open_documents,
+        &file_cache,
+        fallback_cache,
+        &workspace_present_stems,
+        fallback_version,
+    );
 
     // Validate and collect diagnostics.
     let mut counts = (0usize, 0usize, 0usize, 0usize);
     let mut file_count = 0usize;
 
     for source in &effective_sources {
+        if source.kind == SourceKind::Bundled {
+            continue;
+        }
         let Some(path) = &source.path else { continue };
         let stem = &source.stem;
         let doc = &source.document;
-        let mut diags =
-            diagnostics::validate_document(stem, doc, schema_result.as_deref(), &symbols);
+        let mut diags = diagnostics::validate_document_for_version(
+            stem,
+            doc,
+            schema_result.as_deref(),
+            &symbols,
+            fallback_version,
+        );
         if let Some(ph) = &plugin_host
             && ph.validates_file(stem)
         {
@@ -386,7 +449,11 @@ mod plugin_discovery_tests {
         let dir = temp_plugin_dir("plugin-scan");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("b.js"), "function validate() { return []; }").unwrap();
-        fs::write(dir.join("a.ts"), "function validate(): unknown[] { return []; }").unwrap();
+        fs::write(
+            dir.join("a.ts"),
+            "function validate(): unknown[] { return []; }",
+        )
+        .unwrap();
         fs::write(dir.join("_patches.js"), "// schema patch").unwrap();
         fs::write(dir.join("ignored.txt"), "not a plugin").unwrap();
         fs::create_dir(dir.join("directory.js")).unwrap();

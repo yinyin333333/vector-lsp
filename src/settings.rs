@@ -146,6 +146,11 @@ pub struct VectorLspSettings {
     /// reserved and cannot be used as a variant name.
     #[serde(default)]
     pub schema_variant: String,
+    /// Selects one bundled D2 reference dataset for cross-file fallback lookups.
+    /// Empty means infer from a supported schema_variant; if neither is known,
+    /// fallback remains disabled instead of guessing a game version.
+    #[serde(default)]
+    pub reference_variant: String,
     /// Workspace directory to use in single-shot mode (and optionally in LSP mode).
     pub workspace_path: Option<PathBuf>,
     /// When true, validate the workspace and exit instead of starting the LSP server.
@@ -191,7 +196,7 @@ impl VectorLspSettings {
             .map(|path| format!("path:{}", path.display()))
             .unwrap_or_else(|| format!("variant:{}", self.schema_variant));
         format!(
-            "editorMode={} transport={} singleShot={} encoding={:?} schema={} pluginPath={}",
+            "editorMode={} transport={} singleShot={} encoding={:?} schema={} referenceVariant={} pluginPath={}",
             self.editor_mode,
             if matches!(self.io_type, IoType::Stdio) {
                 "stdio"
@@ -201,6 +206,11 @@ impl VectorLspSettings {
             self.single_shot,
             self.encoding,
             schema,
+            if self.reference_variant.trim().is_empty() {
+                "inferred-or-disabled"
+            } else {
+                self.reference_variant.as_str()
+            },
             self.plugin_path
                 .as_ref()
                 .map(|path| path.display().to_string())
@@ -223,6 +233,7 @@ impl Default for VectorLspSettings {
             single_shot: false,
             schema_loader: default_schema_loader(),
             schema_variant: String::new(),
+            reference_variant: String::new(),
         }
     }
 }
