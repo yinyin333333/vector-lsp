@@ -3508,6 +3508,79 @@ function validate(ctx: PluginContext): string[] {
     }
 
     #[tokio::test]
+    async fn skill_param_aliases_are_explained_only_for_3_1_and_3_2_skill_scopes() {
+        fn versioned_fixture(file: &str, text: &str, version: &str) -> PluginFixture {
+            let skillcalc = "code\npar1\npar2\npa10\npa11\npa12\npa13\npa14\npa15\npa16\npa17\npa18\npa19\npa20\n";
+            let mut fx = fixture(&[("skillcalc", skillcalc), (file, text)]);
+            Arc::get_mut(&mut fx.snapshot)
+                .expect("unshared fixture snapshot")
+                .sources
+                .get_mut(file)
+                .expect("versioned source")
+                .version = Some(version.into());
+            fx
+        }
+
+        for version in ["3.1", "3.2"] {
+            for parameter in 10..=20 {
+                let identifier = format!("par{parameter}");
+                let text = format!("skill\tcalc1\nrow\t{identifier}\n");
+                let fx = versioned_fixture("skills", &text, version);
+                let diags = run_plugin("calcCheck.ts", "skills", &fx).await;
+                assert_eq!(diags.len(), 1, "{version} {identifier}: {diags:#?}");
+                let diag = &diags[0];
+                let interpreted_as = if parameter == 20 { "par2" } else { "par1" };
+                assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
+                assert_code(diag, "calc.skill-param-alias");
+                assert_eq!(
+                    diag.message,
+                    format!(
+                        "{identifier} is interpreted as {interpreted_as} because SkillCalc identifiers use only the first four characters. Use pa{parameter} to reference Param{parameter}."
+                    )
+                );
+                assert_eq!(range(diag), (1, 4, 4 + identifier.len() as u32));
+                assert_eq!(data_str(diag, "kind"), "identifier-alias");
+                assert_eq!(data_str(diag, "scope"), "Skill scope BBE");
+                assert_eq!(data_str(diag, "identifier"), identifier);
+                assert_eq!(data_str(diag, "interpretedAs"), interpreted_as);
+                assert_eq!(data_str(diag, "suggestion"), format!("pa{parameter}"));
+                assert_eq!(data_str(diag, "parameter"), format!("Param{parameter}"));
+            }
+        }
+
+        let skilldesc =
+            versioned_fixture("skilldesc", "skilldesc\tdsc3calca1\nrow\tpar20\n", "3.2");
+        let skilldesc_diags = run_plugin("calcCheck.ts", "skilldesc", &skilldesc).await;
+        assert_code(&skilldesc_diags[0], "calc.skill-param-alias");
+        assert_eq!(data_str(&skilldesc_diags[0], "interpretedAs"), "par2");
+
+        let older = versioned_fixture("skills", "skill\tcalc1\nrow\tpar10\n", "2.4");
+        let older_diags = run_plugin("calcCheck.ts", "skills", &older).await;
+        assert_eq!(older_diags.len(), 1, "{older_diags:#?}");
+        assert_eq!(older_diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_code(&older_diags[0], "unknownIdentifier");
+        assert_eq!(
+            older_diags[0].message,
+            "Invalid calculation: Unknown identifier 'par10' for this BBE scope"
+        );
+
+        let uppercase = versioned_fixture("skills", "skill\tcalc1\nrow\tPAR10\n", "3.2");
+        let uppercase_diags = run_plugin("calcCheck.ts", "skills", &uppercase).await;
+        assert_code(&uppercase_diags[0], "unknownIdentifier");
+
+        let missile = fixture(&[
+            ("misscalc", "code\npar1\n"),
+            ("missiles", "Missile\tSrvCalc1\nrow\tpar10\n"),
+        ]);
+        assert!(
+            run_plugin("calcCheck.ts", "missiles", &missile)
+                .await
+                .is_empty(),
+            "Missile first-four lookup remains valid without a Skill-param warning"
+        );
+    }
+
+    #[tokio::test]
     async fn skilldesc_3_2_decimal_warning_reports_used_prefix_and_ignored_suffix() {
         async fn run(formula: &str) -> Vec<Diagnostic> {
             let text = format!("skilldesc\tdsc3calca1\tdsc3calca2\nrow\t\t{formula}\n");

@@ -1051,6 +1051,53 @@ function calcDiagnosticData(err: CalcParseError): Record<string, string | number
     return data;
 }
 
+type SkillParamAlias = {
+    identifier: string;
+    interpretedAs: string;
+    suggestion: string;
+    parameter: string;
+};
+
+function skillParamAlias(
+    identifier: string,
+    selectedVersion: string | undefined,
+    skillIds: Set<string>,
+): SkillParamAlias | null {
+    if (selectedVersion !== "3.1" && selectedVersion !== "3.2") return null;
+    const match = /^par(1[0-9]|20)$/.exec(identifier);
+    if (!match) return null;
+    const parameterNumber = Number(match[1]);
+    const interpretedAs = identifier.slice(0, 4);
+    const suggestion = `pa${parameterNumber}`;
+    if (!skillIds.has(interpretedAs) || !skillIds.has(suggestion)) return null;
+    return {
+        identifier,
+        interpretedAs,
+        suggestion,
+        parameter: `Param${parameterNumber}`,
+    };
+}
+
+function skillParamAliasMessage(alias: SkillParamAlias): string {
+    return `${alias.identifier} is interpreted as ${alias.interpretedAs} because SkillCalc identifiers use only the first four characters. Use ${alias.suggestion} to reference ${alias.parameter}.`;
+}
+
+function skillParamAliasDiagnosticData(
+    err: CalcParseError,
+    alias: SkillParamAlias,
+): Record<string, string | number> {
+    const data = calcDiagnosticData(err);
+    data.kind = "identifier-alias";
+    data.scope = "Skill scope BBE";
+    data.identifier = alias.identifier;
+    data.interpretedAs = alias.interpretedAs;
+    data.suggestion = alias.suggestion;
+    data.parameter = alias.parameter;
+    data.lookup = "first-four-byte exact case-sensitive";
+    data.hint = `Use ${alias.suggestion} to reference ${alias.parameter}.`;
+    return data;
+}
+
 function missileUnknownDiagnosticData(
     err: CalcParseError,
     identifier: string,
@@ -1145,11 +1192,14 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                 if (err) {
                     const c = row.__colstarts[col] ?? 0;
                     const length = err.length ?? 1;
-                    const missileUnknown = scope === "Missile scope BBE"
-                        && err.code === "unknownIdentifier";
-                    const unknownIdentifier = missileUnknown
+                    const unknownIdentifier = err.code === "unknownIdentifier"
                         ? val.slice(err.pos, err.pos + length)
                         : "";
+                    const paramAlias = scope === "Skill scope BBE"
+                        ? skillParamAlias(unknownIdentifier, selectedVersion, skillIds)
+                        : null;
+                    const missileUnknown = scope === "Missile scope BBE"
+                        && err.code === "unknownIdentifier";
                     const policyWarning = revalidatedScope && (
                         err.code === "calc.expected-rparen.eof"
                         || err.code === "calc.prefix-stop"
@@ -1160,18 +1210,22 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                         line:     row.__line,
                         col:      c + err.pos,
                         endCol:   c + err.pos + length,
-                        severity: policyWarning ? "warning" : "error",
-                        message: missileUnknown
+                        severity: paramAlias || policyWarning ? "warning" : "error",
+                        message: paramAlias
+                            ? skillParamAliasMessage(paramAlias)
+                            : (missileUnknown
                             ? `Unknown missile value '${unknownIdentifier}'. The game treats it as 0, so this part of the calculation has no effect.`
                             : (err.code === "calc.skilldesc-decimal-prefix"
                                 ? err.message
                             : (policyWarning && err.code === "calc.expected-rparen.eof"
                                 ? `${err.message}. The game may still use the valid part before this point. Add the missing ')'.`
-                                : (policyWarning ? err.message : `Invalid calculation: ${err.message}`))),
-                        code:     err.code,
-                        data:     missileUnknown
+                                : (policyWarning ? err.message : `Invalid calculation: ${err.message}`)))),
+                        code:     paramAlias ? "calc.skill-param-alias" : err.code,
+                        data:     paramAlias
+                            ? skillParamAliasDiagnosticData(err, paramAlias)
+                            : (missileUnknown
                             ? missileUnknownDiagnosticData(err, unknownIdentifier)
-                            : calcDiagnosticData(err),
+                            : calcDiagnosticData(err)),
                     });
                 }
             }
