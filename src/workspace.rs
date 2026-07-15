@@ -34,6 +34,28 @@ fn same_local_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     local_path_identity(left) == local_path_identity(right)
 }
 
+fn path_parent_is(path: &std::path::Path, parent: &std::path::Path) -> bool {
+    path.parent()
+        .is_some_and(|candidate| same_local_path(candidate, parent))
+}
+
+fn uri_parent_is(uri: &Url, parent: &std::path::Path) -> bool {
+    uri.to_file_path()
+        .ok()
+        .is_some_and(|path| path_parent_is(&path, parent))
+}
+
+fn uri_parents_match(left: &Url, right: &Url) -> bool {
+    let Some(left_parent) = left
+        .to_file_path()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+    else {
+        return false;
+    };
+    uri_parent_is(right, &left_parent)
+}
+
 #[cfg(windows)]
 fn local_path_is_within(path: &std::path::Path, root: &std::path::Path) -> bool {
     let path = local_path_identity(path);
@@ -56,6 +78,13 @@ pub struct PluginWorkspaceView {
     pub workspace_revision: u64,
     pub index: Arc<WorkspaceIndex>,
     pub snapshot: Arc<WorkspaceFileSnapshot>,
+}
+
+#[derive(Clone)]
+struct DirectorySymbolView {
+    session_generation: u64,
+    workspace_revision: u64,
+    index: Arc<SymbolIndex>,
 }
 
 /// Cross-file symbol index.
@@ -312,6 +341,12 @@ pub struct Workspace {
     pub root_uri: Option<Url>,
     pub reference_root_uri: Option<Url>,
     pub reference_context_mode: ReferenceContextMode,
+    /// Editor sessions may opt out of recursive discovery while keeping the
+    /// workspace root as the session identity.
+    pub include_subfolders: bool,
+    /// In an editor workspace, each physical directory is an independent
+    /// lookup and diagnostics context.
+    pub workspace_directory_scopes: bool,
     /// Documents currently open in the editor (managed via didOpen/didChange).
     pub open_documents: HashMap<Url, Arc<DocumentData>>,
     /// All other workspace files parsed from disk on startup.
@@ -351,6 +386,8 @@ pub struct Workspace {
     next_document_epoch: u64,
     next_document_revision: u64,
     plugin_workspace_view: Mutex<Option<PluginWorkspaceView>>,
+    plugin_directory_views: Mutex<HashMap<String, PluginWorkspaceView>>,
+    directory_symbol_views: Mutex<HashMap<String, DirectorySymbolView>>,
 }
 
 impl Workspace {
@@ -359,6 +396,8 @@ impl Workspace {
             root_uri: None,
             reference_root_uri: None,
             reference_context_mode: ReferenceContextMode::Workspace,
+            include_subfolders: true,
+            workspace_directory_scopes: false,
             open_documents: HashMap::new(),
             file_cache: HashMap::new(),
             reference_root_cache: HashMap::new(),
@@ -384,6 +423,8 @@ impl Workspace {
             next_document_epoch: 0,
             next_document_revision: 0,
             plugin_workspace_view: Mutex::new(None),
+            plugin_directory_views: Mutex::new(HashMap::new()),
+            directory_symbol_views: Mutex::new(HashMap::new()),
         }
     }
 
@@ -396,8 +437,33 @@ impl Workspace {
             return view.clone();
         }
         let sources = self.effective_sources();
-        let index = runtime::build_workspace_index_from_sources(&sources);
-        let mut snapshot = plugin::build_workspace_snapshot_from_sources(&sources);
+        let view = self.build_plugin_workspace_view(&sources);
+        *cached = Some(view.clone());
+        view
+    }
+
+    pub fn plugin_workspace_view_for_uri(&self, uri: &Url) -> PluginWorkspaceView {
+        if !self.uses_directory_scopes() {
+            return self.plugin_workspace_view();
+        }
+        let Some(key) = self.directory_scope_key_for_uri(uri) else {
+            return self.plugin_workspace_view();
+        };
+        let mut cached = self.plugin_directory_views.lock().unwrap();
+        if let Some(view) = cached.get(&key)
+            && view.session_generation == self.session_generation
+            && view.workspace_revision == self.workspace_revision
+        {
+            return view.clone();
+        }
+        let view = self.build_plugin_workspace_view(&self.effective_sources_for_uri(uri));
+        cached.insert(key, view.clone());
+        view
+    }
+
+    fn build_plugin_workspace_view(&self, sources: &[EffectiveSource]) -> PluginWorkspaceView {
+        let index = runtime::build_workspace_index_from_sources(sources);
+        let mut snapshot = plugin::build_workspace_snapshot_from_sources(sources);
         let snapshot_data = Arc::get_mut(&mut snapshot)
             .expect("new plugin workspace snapshot must be uniquely owned");
         for source in snapshot_data.sources.values_mut() {
@@ -405,14 +471,12 @@ impl Workspace {
             // hover providers, even when a local/open document supplies data.
             source.version = self.reference_version.clone();
         }
-        let view = PluginWorkspaceView {
+        PluginWorkspaceView {
             session_generation: self.session_generation,
             workspace_revision: self.workspace_revision,
             index,
             snapshot,
-        };
-        *cached = Some(view.clone());
-        view
+        }
     }
 
     pub fn begin_initialization(&mut self, session_generation: u64) {
@@ -422,7 +486,17 @@ impl Workspace {
 
     pub fn set_reference_context_mode(&mut self, mode: ReferenceContextMode) {
         self.reference_context_mode = mode;
-        *self.plugin_workspace_view.lock().unwrap() = None;
+        self.clear_contextual_views();
+    }
+
+    pub fn set_editor_workspace_options(
+        &mut self,
+        include_subfolders: bool,
+        workspace_directory_scopes: bool,
+    ) {
+        self.include_subfolders = include_subfolders;
+        self.workspace_directory_scopes = workspace_directory_scopes;
+        self.clear_contextual_views();
     }
 
     pub fn set_reference_root_uri(&mut self, uri: Option<Url>) {
@@ -430,7 +504,7 @@ impl Workspace {
         self.reference_root_cache.clear();
         self.reference_root_present_paths.clear();
         self.reference_root_present_stems.clear();
-        *self.plugin_workspace_view.lock().unwrap() = None;
+        self.clear_contextual_views();
     }
 
     pub fn begin_scan(&mut self) -> u64 {
@@ -490,6 +564,7 @@ impl Workspace {
                 source.bundled_version.as_deref(),
             );
         }
+        self.clear_contextual_views();
     }
 
     pub fn mark_failed(&mut self) {
@@ -514,14 +589,14 @@ impl Workspace {
         self.reference_version = Some(game_version);
         self.reference_digest = Some(canonical_sha256);
         self.fallback_cache = documents;
-        *self.plugin_workspace_view.lock().unwrap() = None;
+        self.clear_contextual_views();
     }
 
     pub fn clear_reference_dataset(&mut self) {
         self.reference_version = None;
         self.reference_digest = None;
         self.fallback_cache.clear();
-        *self.plugin_workspace_view.lock().unwrap() = None;
+        self.clear_contextual_views();
     }
 
     pub fn set_workspace_present_paths<I>(&mut self, paths: I)
@@ -530,7 +605,7 @@ impl Workspace {
     {
         self.workspace_present_paths = paths.into_iter().collect();
         self.rebuild_workspace_present_stems();
-        *self.plugin_workspace_view.lock().unwrap() = None;
+        self.clear_contextual_views();
     }
 
     pub fn set_reference_root_present_paths<I>(&mut self, paths: I)
@@ -539,7 +614,7 @@ impl Workspace {
     {
         self.reference_root_present_paths = paths.into_iter().collect();
         self.rebuild_reference_root_present_stems();
-        *self.plugin_workspace_view.lock().unwrap() = None;
+        self.clear_contextual_views();
     }
 
     fn rebuild_reference_root_present_stems(&mut self) {
@@ -597,7 +672,7 @@ impl Workspace {
         let Some(stem) = normalized_file_stem_from_uri(uri) else {
             return false;
         };
-        self.effective_sources()
+        self.effective_sources_for_uri(uri)
             .into_iter()
             .find(|source| source.stem == stem)
             .is_some_and(|source| source.document.as_ref() == document)
@@ -614,6 +689,112 @@ impl Workspace {
             &self.fallback_cache,
             self.reference_version.as_deref(),
         )
+    }
+
+    fn uses_directory_scopes(&self) -> bool {
+        self.workspace_directory_scopes
+            && self.reference_context_mode == ReferenceContextMode::Workspace
+    }
+
+    fn directory_scope_key_for_uri(&self, uri: &Url) -> Option<String> {
+        uri.to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(local_path_identity))
+    }
+
+    fn clear_contextual_views(&self) {
+        *self.plugin_workspace_view.lock().unwrap() = None;
+        self.plugin_directory_views.lock().unwrap().clear();
+        self.directory_symbol_views.lock().unwrap().clear();
+    }
+
+    fn effective_sources_for_uri(&self, uri: &Url) -> Vec<EffectiveSource> {
+        if !self.uses_directory_scopes() {
+            return self.effective_sources();
+        }
+        let Some(target_parent) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        else {
+            return self.effective_sources();
+        };
+        let open_documents = self
+            .open_documents
+            .iter()
+            .filter(|(source_uri, _)| uri_parent_is(source_uri, &target_parent))
+            .map(|(source_uri, document)| (source_uri.clone(), Arc::clone(document)))
+            .collect::<HashMap<_, _>>();
+        let file_cache = self
+            .file_cache
+            .iter()
+            .filter(|(path, _)| path_parent_is(path, &target_parent))
+            .map(|(path, document)| (path.clone(), Arc::clone(document)))
+            .collect::<HashMap<_, _>>();
+        let present_stems = self
+            .workspace_present_paths
+            .iter()
+            .filter(|path| path_parent_is(path, &target_parent))
+            .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+            .map(str::to_ascii_lowercase)
+            .collect::<HashSet<_>>();
+        effective_workspace_sources_with_priority_tiers(
+            &open_documents,
+            &file_cache,
+            &present_stems,
+            SourceKind::Workspace,
+            &HashMap::new(),
+            &HashSet::new(),
+            &self.fallback_cache,
+            self.reference_version.as_deref(),
+        )
+    }
+
+    pub fn symbols_for_uri(&self, uri: &Url) -> Arc<SymbolIndex> {
+        if !self.uses_directory_scopes() {
+            return self.cached_symbols_for_key("", || self.symbols.clone());
+        }
+        let Some(key) = self.directory_scope_key_for_uri(uri) else {
+            return self.cached_symbols_for_key("", || self.symbols.clone());
+        };
+        self.cached_symbols_for_key(&key, || {
+            let mut symbols = SymbolIndex::new();
+            for source in self.effective_sources_for_uri(uri) {
+                symbols.index_effective_document(
+                    source.uri.as_ref(),
+                    &source.stem,
+                    &source.document,
+                    &self.ref_targets,
+                    source.kind,
+                    source.bundled_version.as_deref(),
+                );
+            }
+            symbols
+        })
+    }
+
+    fn cached_symbols_for_key(
+        &self,
+        key: &str,
+        build: impl FnOnce() -> SymbolIndex,
+    ) -> Arc<SymbolIndex> {
+        let mut cached = self.directory_symbol_views.lock().unwrap();
+        if let Some(view) = cached.get(key)
+            && view.session_generation == self.session_generation
+            && view.workspace_revision == self.workspace_revision
+        {
+            return Arc::clone(&view.index);
+        }
+        let index = Arc::new(build());
+        cached.insert(
+            key.to_string(),
+            DirectorySymbolView {
+                session_generation: self.session_generation,
+                workspace_revision: self.workspace_revision,
+                index: Arc::clone(&index),
+            },
+        );
+        index
     }
 
     pub fn accept_change(
@@ -742,15 +923,39 @@ impl Workspace {
             return false;
         }
         let stem = normalized_file_stem_from_uri(uri);
-        !self
-            .open_documents
-            .keys()
-            .any(|open_uri| stem.is_some() && normalized_file_stem_from_uri(open_uri) == stem)
+        !self.open_documents.keys().any(|open_uri| {
+            stem.is_some()
+                && normalized_file_stem_from_uri(open_uri) == stem
+                && (!self.uses_directory_scopes() || uri_parents_match(open_uri, uri))
+        })
     }
 
     pub fn disk_documents_for_validation(&self) -> Vec<(Url, String, Arc<DocumentData>)> {
         if self.reference_context_mode == ReferenceContextMode::Sibling {
             return Vec::new();
+        }
+        if self.uses_directory_scopes() {
+            let mut paths = self.file_cache.keys().cloned().collect::<Vec<_>>();
+            paths.sort_by(|left, right| local_path_identity(left).cmp(&local_path_identity(right)));
+            let mut seen = HashSet::new();
+            return paths
+                .into_iter()
+                .filter_map(|path| {
+                    let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+                    let parent = path.parent()?;
+                    let key = (local_path_identity(parent), stem.clone());
+                    if !seen.insert(key) {
+                        return None;
+                    }
+                    let uri = Url::from_file_path(&path).ok()?;
+                    if !self.disk_diagnostics_allowed(&uri) {
+                        return None;
+                    }
+                    self.file_cache
+                        .get(&path)
+                        .map(|document| (uri, stem, Arc::clone(document)))
+                })
+                .collect();
         }
         // Choose the lexical winner before any consumer-specific filtering so a
         // duplicate loser can never replace the shared source.
@@ -943,6 +1148,65 @@ mod tests {
             next_session.workspace_revision,
             workspace.workspace_revision
         );
+    }
+
+    #[test]
+    fn editor_workspace_directory_scopes_keep_same_named_tables_independent() {
+        let mut workspace = Workspace::new();
+        workspace.set_editor_workspace_options(true, true);
+        workspace
+            .ref_targets
+            .insert(("items".to_string(), "id".to_string()));
+        let root_path = std::env::temp_dir().join("vector-lsp-directory-scopes");
+        let root_items_path = root_path.join("items.txt");
+        let base_items_path = root_path.join("base").join("items.txt");
+        workspace
+            .file_cache
+            .insert(root_items_path.clone(), doc("ROOT"));
+        workspace
+            .file_cache
+            .insert(base_items_path.clone(), doc("BASE"));
+        workspace.set_workspace_present_paths([root_items_path, base_items_path]);
+
+        let root_uri = Url::from_file_path(root_path.join("consumer.txt")).unwrap();
+        let base_uri = Url::from_file_path(root_path.join("base").join("consumer.txt")).unwrap();
+        let root_symbols = workspace.symbols_for_uri(&root_uri);
+        let base_symbols = workspace.symbols_for_uri(&base_uri);
+        assert!(Arc::ptr_eq(
+            &root_symbols,
+            &workspace.symbols_for_uri(&root_uri)
+        ));
+        assert!(root_symbols.contains_resolved("items", "id", "ROOT", ReferenceResolver::AsciiCi));
+        assert!(!root_symbols.contains_resolved("items", "id", "BASE", ReferenceResolver::AsciiCi));
+        assert!(base_symbols.contains_resolved("items", "id", "BASE", ReferenceResolver::AsciiCi));
+        assert!(!base_symbols.contains_resolved("items", "id", "ROOT", ReferenceResolver::AsciiCi));
+
+        let disk_uris = workspace
+            .disk_documents_for_validation()
+            .into_iter()
+            .map(|(uri, _, _)| uri.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            disk_uris,
+            vec![
+                Url::from_file_path(root_path.join("base").join("items.txt"))
+                    .unwrap()
+                    .to_string(),
+                Url::from_file_path(root_path.join("items.txt"))
+                    .unwrap()
+                    .to_string()
+            ]
+        );
+
+        let base_items_uri = Url::from_file_path(root_path.join("base").join("items.txt")).unwrap();
+        workspace.accept_open(base_items_uri, 1, doc("OPEN_BASE"));
+        let root_view = workspace.plugin_workspace_view_for_uri(&root_uri);
+        let base_view = workspace.plugin_workspace_view_for_uri(&base_uri);
+        assert!(root_view.index.lookup("items", "id", "ROOT"));
+        assert!(!root_view.index.lookup("items", "id", "OPEN_BASE"));
+        assert!(base_view.index.lookup("items", "id", "OPEN_BASE"));
+        assert!(!base_view.index.lookup("items", "id", "ROOT"));
+        assert_eq!(workspace.disk_documents_for_validation().len(), 1);
     }
 
     #[test]

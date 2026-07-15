@@ -21,14 +21,19 @@ impl ScanPolicy {
         }
     }
 
+    #[cfg(test)]
     pub fn editor() -> Self {
+        Self::editor_with_subfolders(true)
+    }
+
+    pub fn editor_with_subfolders(include_subfolders: bool) -> Self {
         Self {
             extensions: EDITOR_EXTENSIONS
                 .iter()
                 .map(|value| value.to_string())
                 .collect(),
             case_insensitive: true,
-            recursive: true,
+            recursive: include_subfolders,
         }
     }
 
@@ -198,6 +203,36 @@ mod tests {
             .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["direct.txt", "upper.TXT"]);
+        assert!(discovery.failures.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn editor_policy_can_exclude_subfolders() {
+        let unique = format!(
+            "vector-lsp-editor-flat-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("direct.txt"), b"id\nvalue\n").unwrap();
+        fs::write(nested.join("nested.txt"), b"id\nvalue\n").unwrap();
+
+        let discovery =
+            collect_data_files(&root, &ScanPolicy::editor_with_subfolders(false)).unwrap();
+        assert_eq!(discovery.paths.len(), 1);
+        assert_eq!(
+            discovery.paths[0]
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("direct.txt")
+        );
         assert!(discovery.failures.is_empty());
 
         fs::remove_dir_all(root).unwrap();

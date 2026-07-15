@@ -118,11 +118,12 @@ impl Backend {
             }
             let doc = ws.open_documents.get(&ticket.uri)?.clone();
             let stem = Self::file_stem(&ticket.uri);
+            let symbols = ws.symbols_for_uri(&ticket.uri);
             let schema_diags = diagnostics::validate_document_for_version(
                 &stem,
                 &doc,
                 ws.schema.as_deref(),
-                &ws.symbols,
+                &symbols,
                 ws.reference_version.as_deref(),
             );
             let plugin_data = self
@@ -131,7 +132,7 @@ impl Backend {
                 .filter(|host| host.validates_file(&stem))
                 .map(|_| {
                     let ctx = plugin::build_context(&stem, &doc);
-                    let view = ws.plugin_workspace_view();
+                    let view = ws.plugin_workspace_view_for_uri(&ticket.uri);
                     (ctx, view.index, view.snapshot)
                 });
             (schema_diags, plugin_data)
@@ -249,7 +250,7 @@ impl Backend {
         workspace_revision: u64,
     ) -> bool {
         self.clear_obsolete_disk_diagnostics().await;
-        let (schema, symbols, shared, documents, reference_version) = {
+        let (schema, documents, reference_version) = {
             let ws = self.workspace.read().await;
             if ws.scan_generation != scan_generation
                 || ws.workspace_revision != workspace_revision
@@ -261,31 +262,24 @@ impl Backend {
                 return false;
             }
             let documents = ws.disk_documents_for_validation();
-            let shared = self
-                .plugin_host
-                .as_ref()
-                .filter(|host| {
-                    documents
-                        .iter()
-                        .any(|(_, stem, _)| host.validates_file(stem))
+            let documents = documents
+                .into_iter()
+                .map(|(uri, stem, document)| {
+                    let symbols = ws.symbols_for_uri(&uri);
+                    let plugin_view = self
+                        .plugin_host
+                        .as_ref()
+                        .filter(|host| host.validates_file(&stem))
+                        .map(|_| ws.plugin_workspace_view_for_uri(&uri));
+                    (uri, stem, document, symbols, plugin_view)
                 })
-                .map(|_| {
-                    let view = ws.plugin_workspace_view();
-                    (view.index, view.snapshot)
-                });
-            (
-                ws.schema.clone(),
-                Arc::new(ws.symbols.clone()),
-                shared,
-                documents,
-                ws.reference_version.clone(),
-            )
+                .collect::<Vec<_>>();
+            (ws.schema.clone(), documents, ws.reference_version.clone())
         };
 
         let mut schema_tasks = tokio::task::JoinSet::new();
-        for (uri, stem, document) in documents {
+        for (uri, stem, document, symbols, plugin_view) in documents {
             let schema = schema.clone();
-            let symbols = Arc::clone(&symbols);
             let reference_version = reference_version.clone();
             schema_tasks.spawn_blocking(move || {
                 let diagnostics = diagnostics::validate_document_for_version(
@@ -295,7 +289,7 @@ impl Backend {
                     &symbols,
                     reference_version.as_deref(),
                 );
-                (uri, stem, document, diagnostics)
+                (uri, stem, document, plugin_view, diagnostics)
             });
         }
         let mut results = Vec::new();
@@ -306,15 +300,13 @@ impl Backend {
         }
         results.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
 
-        for (uri, stem, document, mut diagnostics) in results {
-            if let (Some((index, snapshot)), Some(host)) = (&shared, &self.plugin_host)
-                && host.validates_file(&stem)
-            {
+        for (uri, stem, document, plugin_view, mut diagnostics) in results {
+            if let (Some(view), Some(host)) = (plugin_view, &self.plugin_host) {
                 diagnostics.extend(
                     host.run(
                         plugin::build_context(&stem, &document),
-                        Arc::clone(index),
-                        Arc::clone(snapshot),
+                        view.index,
+                        view.snapshot,
                     )
                     .await,
                 );
@@ -462,6 +454,7 @@ impl Backend {
             delimiter,
             ext,
             reference_context_mode,
+            include_subfolders,
             scan_generation,
             session_generation,
         ) = {
@@ -472,6 +465,7 @@ impl Backend {
                 self.settings.delimiter_char(),
                 self.settings.extension.clone(),
                 ws.reference_context_mode,
+                ws.include_subfolders,
                 ws.begin_scan(),
                 ws.session_generation,
             )
@@ -493,7 +487,7 @@ impl Backend {
         let scan_policy = if reference_context_mode == ReferenceContextMode::Sibling {
             ScanPolicy::sibling_txt()
         } else if self.settings.editor_mode {
-            ScanPolicy::editor()
+            ScanPolicy::editor_with_subfolders(include_subfolders)
         } else {
             ScanPolicy::standalone(&ext)
         };
@@ -532,7 +526,7 @@ impl Backend {
                     Ok(reference_root_path) if reference_root_path != root_path => {
                         match crate::scan::collect_data_files(
                             &reference_root_path,
-                            &ScanPolicy::editor(),
+                            &ScanPolicy::editor_with_subfolders(include_subfolders),
                         ) {
                             Ok(reference_discovery) => {
                                 failures.extend(reference_discovery.failures);
@@ -834,6 +828,18 @@ impl LanguageServer for Backend {
             .and_then(serde_json::Value::as_str)
             .and_then(|value| Url::parse(value).ok())
             .filter(|uri| uri.scheme() == "file");
+        let include_subfolders = params
+            .initialization_options
+            .as_ref()
+            .and_then(|value| value.get("includeSubfolders"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let workspace_directory_scopes = params
+            .initialization_options
+            .as_ref()
+            .and_then(|value| value.get("workspaceDirectoryScopes"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let root_uri = params
             .workspace_folders
             .as_deref()
@@ -845,6 +851,7 @@ impl LanguageServer for Backend {
             let mut ws = self.workspace.write().await;
             ws.root_uri = root_uri;
             ws.set_reference_context_mode(reference_context_mode);
+            ws.set_editor_workspace_options(include_subfolders, workspace_directory_scopes);
             ws.set_reference_root_uri(reference_root_uri);
             ws.begin_initialization(session_generation);
         }
@@ -1170,6 +1177,7 @@ impl LanguageServer for Backend {
                 None => return Ok(None),
             };
             let cell_value = cell.value.clone();
+            let symbols = ws.symbols_for_uri(uri);
 
             let ref_target = ws
                 .schema
@@ -1187,7 +1195,7 @@ impl LanguageServer for Backend {
             let schema_loc = ref_target
                 .as_ref()
                 .and_then(|(ref_file, ref_col, resolver)| {
-                    ws.symbols
+                    symbols
                         .lookup_resolved(ref_file, ref_col, &cell_value, *resolver)
                         .cloned()
                 });
@@ -1204,13 +1212,13 @@ impl LanguageServer for Backend {
                             pos.line,
                             doc,
                         );
-                        let view = ws.plugin_workspace_view();
+                        let view = ws.plugin_workspace_view_for_uri(uri);
                         (
                             ctx,
                             view.index,
                             view.snapshot,
                             (view.session_generation, view.workspace_revision),
-                            Arc::new(ws.symbols.clone()),
+                            Arc::clone(&symbols),
                         )
                     })
             } else {
@@ -1333,6 +1341,7 @@ impl LanguageServer for Backend {
                 .unwrap_or("unknown")
                 .to_string();
             let cell_value = cell.value.clone();
+            let symbols = ws.symbols_for_uri(uri);
             let cell_col_start = cell.col_start;
             let cell_len = utf16_len(&cell.value);
             let current_row = doc.rows.iter().find(|row| row.line == pos.line);
@@ -1355,7 +1364,7 @@ impl LanguageServer for Backend {
                     }
                     let reference_file = field_type.file.as_deref()?;
                     let reference_column = field_type.field.as_deref()?;
-                    let resolved = ws.symbols.resolve(
+                    let resolved = symbols.resolve(
                         reference_file,
                         reference_column,
                         &cell_value,
@@ -1363,8 +1372,8 @@ impl LanguageServer for Backend {
                     );
                     if resolved.is_none()
                         && diagnostics::is_monpet_consumestat_reference(&file_stem, &col_name)
-                        && ws.symbols.has_file(reference_file)
-                        && ws.symbols.has_column(reference_file, reference_column)
+                        && symbols.has_file(reference_file)
+                        && symbols.has_column(reference_file, reference_column)
                     {
                         return Some(format!(
                             "**Unknown stat name**\n\n`{}` is not a known stat. This Consume bonus is not applied; other Consume slots still work. Use the exact Stat name from `itemstatcost.txt`.",
@@ -1373,8 +1382,8 @@ impl LanguageServer for Backend {
                     }
                     if resolved.is_none()
                         && diagnostics::is_properties_stat_reference(&file_stem, &col_name)
-                        && ws.symbols.has_file(reference_file)
-                        && ws.symbols.has_column(reference_file, reference_column)
+                        && symbols.has_file(reference_file)
+                        && symbols.has_column(reference_file, reference_column)
                     {
                         return Some(if properties_stat_func == Some(17) {
                             format!(
@@ -1512,7 +1521,7 @@ impl LanguageServer for Backend {
                         pos.line,
                         doc,
                     );
-                    let view = ws.plugin_workspace_view();
+                    let view = ws.plugin_workspace_view_for_uri(uri);
                     (
                         ctx,
                         view.index,
@@ -1674,13 +1683,17 @@ mod tests {
         params.initialization_options = Some(serde_json::json!({
             "sessionGeneration": 42,
             "referenceContextMode": "sibling",
-            "referenceRootUri": "file:///E:/explicit-workspace"
+            "referenceRootUri": "file:///E:/explicit-workspace",
+            "includeSubfolders": false,
+            "workspaceDirectoryScopes": true
         }));
         service.inner().initialize(params).await.unwrap();
 
         let ws = workspace.read().await;
         assert_eq!(ws.reference_context_mode, ReferenceContextMode::Sibling);
         assert_eq!(ws.session_generation, 42);
+        assert!(!ws.include_subfolders);
+        assert!(ws.workspace_directory_scopes);
         assert_eq!(
             ws.root_uri.as_ref().map(Url::as_str),
             Some("file:///E:/mod")
