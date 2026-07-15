@@ -87,6 +87,11 @@ Configuration is loaded from a JSON file (default: `config.json` in the working 
 | `plugin_path` | path | _(none)_ | Directory of additional plugin files (`.ts`/`.js`); loaded on top of any bundled plugins |
 | `workspace_path` | path | _(none)_ | Root directory of the data file workspace; required for single-shot mode |
 | `single_shot` | bool | `false` | Validate the workspace and exit instead of starting the LSP server |
+| `json_diagnostics` | bool | `false` | In LSP mode, enable d2rlint-compatible diagnostics for physical top-level `local/lng/strings/*.json` files beside the primary mod's `global/excel` directory; reference and bundled data are never substituted |
+| `json_duplicate_ids_action` | `"ignore"` \| `"warn"` | `"warn"` | Action for `Json/DuplicateIds` |
+| `json_string_format_action` | `"ignore"` \| `"warn"` | `"warn"` | Action for `Json/StringFormat` |
+| `json_key_usage_action` | `"ignore"` \| `"warn"` | `"ignore"` | Action for `Json/KeyUsage` |
+| `json_key_usage_id_start` | finite number | `40000` | Report unused keys only when their JavaScript-coerced ID is strictly greater than this value |
 
 **CLI flags** (override their config equivalents):
 
@@ -121,7 +126,16 @@ vector-lsp [--config-file <path>] [--single-shot] [--schema-path <path>]
 
 ```bash
 VLSP_SCHEMA_PATH=/alt/schema vector-lsp
+VLSP_JSON_DIAGNOSTICS=true vector-lsp --editor-mode
+VLSP_JSON_KEY_USAGE_ACTION=warn VLSP_JSON_KEY_USAGE_ID_START=50000 vector-lsp --editor-mode
 ```
+
+When localization JSON diagnostics are enabled, vector-lsp dynamically registers
+standard `workspace/didChangeWatchedFiles` patterns with capable LSP clients for
+the physical top-level string JSON and layout JSON inputs in the active mod
+scope. External saves, creation and deletion trigger a debounced refresh without
+continuous polling; reference and bundled JSON inputs remain excluded. The same
+event path refreshes unopened workspace and sibling TXT snapshots.
 
 ---
 

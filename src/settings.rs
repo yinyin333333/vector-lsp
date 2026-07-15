@@ -1,5 +1,65 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::PathBuf;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum JsonRuleAction {
+    Ignore,
+    #[default]
+    Warn,
+}
+
+impl<'de> Deserialize<'de> for JsonRuleAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "ignore" => Ok(Self::Ignore),
+            "warn" => Ok(Self::Warn),
+            // Older clients could request Error, but it ran the same JSON
+            // rule set as Warning. Keep the rule enabled while migrating to
+            // the two-state ignore/warn contract.
+            "error" => Ok(Self::Warn),
+            _ => Err(serde::de::Error::custom(format!(
+                "expected ignore or warn, got '{value}'"
+            ))),
+        }
+    }
+}
+
+impl JsonRuleAction {
+    pub fn is_enabled(self) -> bool {
+        self != Self::Ignore
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JsonDiagnosticRules {
+    pub duplicate_ids: JsonRuleAction,
+    pub string_format: JsonRuleAction,
+    pub key_usage: JsonRuleAction,
+    pub key_usage_id_start: f64,
+}
+
+impl Default for JsonDiagnosticRules {
+    fn default() -> Self {
+        Self {
+            duplicate_ids: JsonRuleAction::Warn,
+            string_format: JsonRuleAction::Warn,
+            key_usage: JsonRuleAction::Ignore,
+            key_usage_id_start: 40_000.0,
+        }
+    }
+}
+
+impl JsonDiagnosticRules {
+    pub fn any_enabled(self) -> bool {
+        self.duplicate_ids.is_enabled()
+            || self.string_format.is_enabled()
+            || self.key_usage.is_enabled()
+    }
+}
 
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(rename_all = "lowercase")]
@@ -156,6 +216,28 @@ pub struct VectorLspSettings {
     /// When true, validate the workspace and exit instead of starting the LSP server.
     #[serde(default)]
     pub single_shot: bool,
+    /// Run the d2rlint-compatible localization string JSON diagnostics for JSON
+    /// files that physically exist beside the primary mod's Excel directory.
+    /// This is intentionally opt-in: reference and bundled data must never turn
+    /// these diagnostics on for a mod that does not contain string JSON files.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub json_diagnostics: bool,
+    /// Action for d2rlint's Json/DuplicateIds rule.
+    #[serde(default)]
+    pub json_duplicate_ids_action: JsonRuleAction,
+    /// Action for d2rlint's Json/StringFormat rule.
+    #[serde(default)]
+    pub json_string_format_action: JsonRuleAction,
+    /// Action for d2rlint's Json/KeyUsage rule.
+    #[serde(default = "default_json_key_usage_action")]
+    pub json_key_usage_action: JsonRuleAction,
+    /// Json/KeyUsage reports only entries whose JavaScript-coerced id is
+    /// strictly greater than this value, matching d2rlint's `idStart`.
+    #[serde(
+        default = "default_json_key_usage_id_start",
+        deserialize_with = "deserialize_number_or_string"
+    )]
+    pub json_key_usage_id_start: f64,
 }
 
 impl VectorLspSettings {
@@ -179,7 +261,20 @@ impl VectorLspSettings {
             !self.schema_loader.trim().is_empty(),
             "schema_loader must not be empty"
         );
+        anyhow::ensure!(
+            self.json_key_usage_id_start.is_finite(),
+            "json_key_usage_id_start must be a finite number"
+        );
         Ok(())
+    }
+
+    pub fn json_diagnostic_rules(&self) -> JsonDiagnosticRules {
+        JsonDiagnosticRules {
+            duplicate_ids: self.json_duplicate_ids_action,
+            string_format: self.json_string_format_action,
+            key_usage: self.json_key_usage_action,
+            key_usage_id_start: self.json_key_usage_id_start,
+        }
     }
 
     pub fn apply_editor_mode(&mut self) {
@@ -196,7 +291,7 @@ impl VectorLspSettings {
             .map(|path| format!("path:{}", path.display()))
             .unwrap_or_else(|| format!("variant:{}", self.schema_variant));
         format!(
-            "editorMode={} transport={} singleShot={} encoding={:?} schema={} referenceVariant={} pluginPath={}",
+            "editorMode={} transport={} singleShot={} jsonDiagnostics={} encoding={:?} schema={} referenceVariant={} pluginPath={}",
             self.editor_mode,
             if matches!(self.io_type, IoType::Stdio) {
                 "stdio"
@@ -204,6 +299,7 @@ impl VectorLspSettings {
                 "tcp"
             },
             self.single_shot,
+            self.json_diagnostics,
             self.encoding,
             schema,
             if self.reference_variant.trim().is_empty() {
@@ -234,6 +330,11 @@ impl Default for VectorLspSettings {
             schema_loader: default_schema_loader(),
             schema_variant: String::new(),
             reference_variant: String::new(),
+            json_diagnostics: false,
+            json_duplicate_ids_action: JsonRuleAction::Warn,
+            json_string_format_action: JsonRuleAction::Warn,
+            json_key_usage_action: JsonRuleAction::Ignore,
+            json_key_usage_id_start: default_json_key_usage_id_start(),
         }
     }
 }
@@ -248,6 +349,52 @@ fn default_delimiter() -> String {
 
 fn default_extension() -> String {
     "txt".to_string()
+}
+
+fn default_json_key_usage_id_start() -> f64 {
+    40_000.0
+}
+
+fn default_json_key_usage_action() -> JsonRuleAction {
+    JsonRuleAction::Ignore
+}
+
+fn deserialize_bool_or_string<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrString {
+        Bool(bool),
+        String(String),
+    }
+
+    match BoolOrString::deserialize(deserializer)? {
+        BoolOrString::Bool(value) => Ok(value),
+        BoolOrString::String(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        BoolOrString::String(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        BoolOrString::String(value) => Err(serde::de::Error::custom(format!(
+            "expected true or false, got '{value}'"
+        ))),
+    }
+}
+
+fn deserialize_number_or_string<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumberOrString {
+        Number(f64),
+        String(String),
+    }
+
+    match NumberOrString::deserialize(deserializer)? {
+        NumberOrString::Number(value) => Ok(value),
+        NumberOrString::String(value) => value.parse().map_err(serde::de::Error::custom),
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +449,86 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("extension")
+        );
+    }
+
+    #[test]
+    fn json_diagnostics_is_opt_in_and_accepts_environment_strings() {
+        assert!(!VectorLspSettings::default().json_diagnostics);
+        let settings: VectorLspSettings = serde_json::from_value(serde_json::json!({
+            "json_diagnostics": "true",
+            "json_duplicate_ids_action": "ignore",
+            "json_string_format_action": "error",
+            "json_key_usage_action": "warn",
+            "json_key_usage_id_start": "56032"
+        }))
+        .unwrap();
+        assert!(settings.json_diagnostics);
+        assert_eq!(settings.json_duplicate_ids_action, JsonRuleAction::Ignore);
+        assert_eq!(settings.json_string_format_action, JsonRuleAction::Warn);
+        assert_eq!(settings.json_key_usage_action, JsonRuleAction::Warn);
+        assert_eq!(settings.json_key_usage_id_start, 56_032.0);
+        assert_eq!(
+            settings.json_diagnostic_rules(),
+            JsonDiagnosticRules {
+                duplicate_ids: JsonRuleAction::Ignore,
+                string_format: JsonRuleAction::Warn,
+                key_usage: JsonRuleAction::Warn,
+                key_usage_id_start: 56_032.0,
+            }
+        );
+    }
+
+    #[test]
+    fn vlsp_environment_names_map_to_the_flat_json_rule_fields() {
+        let source = config::Environment::with_prefix("VLSP").source(Some({
+            let mut environment = std::collections::HashMap::new();
+            environment.insert("VLSP_JSON_DIAGNOSTICS".into(), "true".into());
+            environment.insert("VLSP_JSON_DUPLICATE_IDS_ACTION".into(), "error".into());
+            environment.insert("VLSP_JSON_STRING_FORMAT_ACTION".into(), "ignore".into());
+            environment.insert("VLSP_JSON_KEY_USAGE_ACTION".into(), "warn".into());
+            environment.insert("VLSP_JSON_KEY_USAGE_ID_START".into(), "12345.5".into());
+            environment
+        }));
+        let settings = config::Config::builder()
+            .add_source(source)
+            .build()
+            .unwrap()
+            .try_deserialize::<VectorLspSettings>()
+            .unwrap();
+        assert!(settings.json_diagnostics);
+        assert_eq!(settings.json_duplicate_ids_action, JsonRuleAction::Warn);
+        assert_eq!(settings.json_string_format_action, JsonRuleAction::Ignore);
+        assert_eq!(settings.json_key_usage_action, JsonRuleAction::Warn);
+        assert_eq!(settings.json_key_usage_id_start, 12_345.5);
+    }
+
+    #[test]
+    fn json_rule_defaults_preserve_the_original_master_checkbox_behavior() {
+        let settings: VectorLspSettings = serde_json::from_value(serde_json::json!({
+            "json_diagnostics": true
+        }))
+        .unwrap();
+        assert!(settings.json_diagnostics);
+        assert_eq!(
+            settings.json_diagnostic_rules(),
+            JsonDiagnosticRules::default()
+        );
+        assert_eq!(settings.json_key_usage_action, JsonRuleAction::Ignore);
+    }
+
+    #[test]
+    fn json_key_usage_id_start_must_be_finite() {
+        let settings = VectorLspSettings {
+            json_key_usage_id_start: f64::INFINITY,
+            ..VectorLspSettings::default()
+        };
+        assert!(
+            settings
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("finite")
         );
     }
 }

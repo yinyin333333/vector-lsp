@@ -3,6 +3,7 @@ mod cli;
 mod contrib;
 mod diagnostics;
 mod document;
+mod json_diagnostics;
 #[cfg(test)]
 mod performance_measurement_tests;
 mod plugin;

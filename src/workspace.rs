@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tower_lsp::lsp_types::{Location, Position, Range, Url};
+use tower_lsp::lsp_types::{Diagnostic, Location, Position, Range, Url};
 
 use crate::document::{DocumentData, utf16_len};
+use crate::json_diagnostics::{
+    PrimaryTxtDocument, data_root_from_excel_txt, local_path_identity as json_path_identity,
+};
 use crate::plugin;
 use crate::runtime::{self, WorkspaceFileSnapshot, WorkspaceIndex};
 use crate::schema::{ReferenceResolver, Schema};
@@ -13,7 +16,7 @@ use crate::source_selection::{
 };
 
 #[cfg(windows)]
-fn local_path_identity(path: &std::path::Path) -> String {
+pub(crate) fn local_path_identity(path: &std::path::Path) -> String {
     let value = path.to_string_lossy().replace('/', "\\");
     let without_extended_prefix = if let Some(rest) = value.strip_prefix("\\\\?\\UNC\\") {
         format!("\\\\{rest}")
@@ -22,15 +25,25 @@ fn local_path_identity(path: &std::path::Path) -> String {
     } else {
         value
     };
-    without_extended_prefix.to_lowercase()
+    let normalized = without_extended_prefix.to_lowercase();
+    if normalized.len() > 3 {
+        normalized.trim_end_matches(['\\', '/']).to_string()
+    } else {
+        normalized
+    }
 }
 
 #[cfg(not(windows))]
-fn local_path_identity(path: &std::path::Path) -> String {
-    path.to_string_lossy().into_owned()
+pub(crate) fn local_path_identity(path: &std::path::Path) -> String {
+    let normalized = path.to_string_lossy();
+    if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized.into_owned()
+    }
 }
 
-fn same_local_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+pub(crate) fn same_local_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     local_path_identity(left) == local_path_identity(right)
 }
 
@@ -57,7 +70,7 @@ fn uri_parents_match(left: &Url, right: &Url) -> bool {
 }
 
 #[cfg(windows)]
-fn local_path_is_within(path: &std::path::Path, root: &std::path::Path) -> bool {
+pub(crate) fn local_path_is_within(path: &std::path::Path, root: &std::path::Path) -> bool {
     let path = local_path_identity(path);
     let root = local_path_identity(root);
     let root = root.trim_end_matches(['\\', '/']);
@@ -68,7 +81,7 @@ fn local_path_is_within(path: &std::path::Path, root: &std::path::Path) -> bool 
 }
 
 #[cfg(not(windows))]
-fn local_path_is_within(path: &std::path::Path, root: &std::path::Path) -> bool {
+pub(crate) fn local_path_is_within(path: &std::path::Path, root: &std::path::Path) -> bool {
     path.starts_with(root)
 }
 
@@ -331,6 +344,32 @@ pub struct ValidationTicket {
     pub client_version: i32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingWatchedChanges {
+    pub txt: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingJsonAnalysis {
+    pub all_rules: bool,
+    pub key_usage: bool,
+}
+
+impl PendingJsonAnalysis {
+    pub fn requested(self) -> bool {
+        self.all_rules || self.key_usage
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WatchedRegistrationState {
+    Pending {
+        session_generation: u64,
+        sequence: u64,
+    },
+    Active(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentChangeError {
     NotOpen,
@@ -383,6 +422,27 @@ pub struct Workspace {
     document_revisions: HashMap<Url, u64>,
     published_revisions: HashMap<Url, u64>,
     published_disk_diagnostics: HashSet<Url>,
+    /// JSON publications are tracked separately from stem-selected TXT
+    /// diagnostics. A `monsters.json` result must not collide with the
+    /// `monsters.txt` winner or inherit its visibility rules.
+    published_json_diagnostics: HashMap<Url, Vec<Diagnostic>>,
+    /// Invalidates JSON analyses when an external editor changes a physical
+    /// localization JSON or layout input without an LSP document version.
+    json_input_generation: u64,
+    watched_files_dynamic_registration: bool,
+    watched_files_relative_pattern_support: bool,
+    watched_registration_sequence: u64,
+    watched_json_data_roots: HashMap<String, WatchedRegistrationState>,
+    pending_watched_json_unregistrations: HashSet<String>,
+    watched_json_unregistration_worker_running: bool,
+    watched_change_generation: u64,
+    pending_watched_changes: PendingWatchedChanges,
+    watched_change_worker_running: bool,
+    pending_txt_watch_registration_catch_up: bool,
+    json_analysis_generation: u64,
+    pending_json_analysis: PendingJsonAnalysis,
+    json_analysis_worker_running: bool,
+    json_startup_analysis_queued: bool,
     next_document_epoch: u64,
     next_document_revision: u64,
     plugin_workspace_view: Mutex<Option<PluginWorkspaceView>>,
@@ -420,6 +480,22 @@ impl Workspace {
             document_revisions: HashMap::new(),
             published_revisions: HashMap::new(),
             published_disk_diagnostics: HashSet::new(),
+            published_json_diagnostics: HashMap::new(),
+            json_input_generation: 0,
+            watched_files_dynamic_registration: false,
+            watched_files_relative_pattern_support: false,
+            watched_registration_sequence: 0,
+            watched_json_data_roots: HashMap::new(),
+            pending_watched_json_unregistrations: HashSet::new(),
+            watched_json_unregistration_worker_running: false,
+            watched_change_generation: 0,
+            pending_watched_changes: PendingWatchedChanges::default(),
+            watched_change_worker_running: false,
+            pending_txt_watch_registration_catch_up: false,
+            json_analysis_generation: 0,
+            pending_json_analysis: PendingJsonAnalysis::default(),
+            json_analysis_worker_running: false,
+            json_startup_analysis_queued: false,
             next_document_epoch: 0,
             next_document_revision: 0,
             plugin_workspace_view: Mutex::new(None),
@@ -481,7 +557,331 @@ impl Workspace {
 
     pub fn begin_initialization(&mut self, session_generation: u64) {
         self.session_generation = session_generation;
+        self.json_input_generation = self.json_input_generation.wrapping_add(1);
+        self.watched_registration_sequence = 0;
+        self.pending_watched_json_unregistrations.extend(
+            self.watched_json_data_roots
+                .values()
+                .filter_map(|state| match state {
+                    WatchedRegistrationState::Active(id) => Some(id.clone()),
+                    WatchedRegistrationState::Pending { .. } => None,
+                }),
+        );
+        self.watched_json_data_roots.clear();
+        self.watched_change_generation = self.watched_change_generation.wrapping_add(1);
+        self.pending_watched_changes = PendingWatchedChanges::default();
+        self.watched_change_worker_running = false;
+        self.pending_txt_watch_registration_catch_up = false;
+        self.json_analysis_generation = self.json_analysis_generation.wrapping_add(1);
+        self.pending_json_analysis = PendingJsonAnalysis::default();
+        self.json_analysis_worker_running = false;
+        self.json_startup_analysis_queued = false;
         self.phase = WorkspacePhase::LoadingSchema;
+    }
+
+    pub fn set_watched_files_client_capabilities(
+        &mut self,
+        dynamic_registration: bool,
+        relative_pattern_support: bool,
+    ) {
+        self.watched_files_dynamic_registration = dynamic_registration;
+        self.watched_files_relative_pattern_support = relative_pattern_support;
+    }
+
+    pub fn supports_dynamic_watched_files(&self) -> bool {
+        self.watched_files_dynamic_registration && self.watched_files_relative_pattern_support
+    }
+
+    pub fn reserve_watched_json_registration(&mut self, identity: &str) -> Option<u64> {
+        if !self.supports_dynamic_watched_files() {
+            return None;
+        }
+        if self.watched_json_data_roots.contains_key(identity) {
+            return None;
+        }
+        self.watched_registration_sequence = self.watched_registration_sequence.wrapping_add(1);
+        let sequence = self.watched_registration_sequence;
+        self.watched_json_data_roots.insert(
+            identity.to_string(),
+            WatchedRegistrationState::Pending {
+                session_generation: self.session_generation,
+                sequence,
+            },
+        );
+        Some(sequence)
+    }
+
+    pub fn finish_watched_json_registration(
+        &mut self,
+        identity: &str,
+        session_generation: u64,
+        sequence: u64,
+        registration_id: &str,
+        succeeded: bool,
+    ) -> bool {
+        if self.session_generation != session_generation
+            || self.watched_json_data_roots.get(identity)
+                != Some(&WatchedRegistrationState::Pending {
+                    session_generation,
+                    sequence,
+                })
+        {
+            return false;
+        }
+        if succeeded {
+            self.watched_json_data_roots.insert(
+                identity.to_string(),
+                WatchedRegistrationState::Active(registration_id.to_string()),
+            );
+        } else {
+            self.watched_json_data_roots.remove(identity);
+        }
+        true
+    }
+
+    pub fn take_obsolete_watched_json_registrations(
+        &mut self,
+        desired_identities: &HashSet<String>,
+    ) -> Vec<String> {
+        let inactive = self
+            .watched_json_data_roots
+            .iter()
+            .filter_map(|(identity, state)| {
+                (!desired_identities.contains(identity))
+                    .then(|| match state {
+                        WatchedRegistrationState::Active(id) => {
+                            Some((identity.clone(), id.clone()))
+                        }
+                        WatchedRegistrationState::Pending { .. } => None,
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        for (identity, _) in &inactive {
+            self.watched_json_data_roots.remove(identity);
+        }
+        inactive.into_iter().map(|(_, id)| id).collect()
+    }
+
+    pub fn queue_watched_json_unregistrations<I>(&mut self, ids: I) -> bool
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.pending_watched_json_unregistrations.extend(ids);
+        if self.pending_watched_json_unregistrations.is_empty() {
+            return false;
+        }
+        let start_worker = !self.watched_json_unregistration_worker_running;
+        self.watched_json_unregistration_worker_running = true;
+        start_worker
+    }
+
+    pub fn take_watched_json_unregistrations(&mut self) -> Vec<String> {
+        if !self.watched_json_unregistration_worker_running {
+            return Vec::new();
+        }
+        let mut ids = self
+            .pending_watched_json_unregistrations
+            .drain()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    pub fn finish_watched_json_unregistration_worker_if_idle(&mut self) -> bool {
+        if !self.pending_watched_json_unregistrations.is_empty() {
+            return false;
+        }
+        self.watched_json_unregistration_worker_running = false;
+        true
+    }
+
+    pub fn defer_watched_json_unregistrations(&mut self, ids: Vec<String>) -> bool {
+        let newer_request_waiting = !self.pending_watched_json_unregistrations.is_empty();
+        self.pending_watched_json_unregistrations.extend(ids);
+        self.watched_json_unregistration_worker_running = newer_request_waiting;
+        newer_request_waiting
+    }
+
+    #[cfg(test)]
+    pub fn pending_watched_json_unregistrations(&self) -> Vec<String> {
+        let mut ids = self
+            .pending_watched_json_unregistrations
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    pub fn queue_watched_changes(&mut self, txt: bool) -> (u64, bool) {
+        self.watched_change_generation = self.watched_change_generation.wrapping_add(1);
+        self.pending_watched_changes.txt |= txt;
+        if txt {
+            // Invalidate every validation ticket immediately. The quiet-window
+            // rescan will allocate the generation that it actually commits.
+            self.begin_scan();
+        }
+        let start_worker = !self.watched_change_worker_running;
+        self.watched_change_worker_running = true;
+        (self.watched_change_generation, start_worker)
+    }
+
+    pub fn defer_txt_watch_registration_catch_up(&mut self) {
+        self.pending_txt_watch_registration_catch_up = true;
+    }
+
+    pub fn take_txt_watch_registration_catch_up(&mut self) -> bool {
+        std::mem::take(&mut self.pending_txt_watch_registration_catch_up)
+    }
+
+    #[cfg(test)]
+    pub fn has_pending_txt_watch_registration_catch_up(&self) -> bool {
+        self.pending_txt_watch_registration_catch_up
+    }
+
+    pub fn watched_change_generation_for_worker(&self, session_generation: u64) -> Option<u64> {
+        (self.session_generation == session_generation && self.watched_change_worker_running)
+            .then_some(self.watched_change_generation)
+    }
+
+    pub fn take_watched_changes(
+        &mut self,
+        session_generation: u64,
+        generation: u64,
+    ) -> Option<PendingWatchedChanges> {
+        if self.session_generation != session_generation
+            || !self.watched_change_worker_running
+            || self.watched_change_generation != generation
+        {
+            return None;
+        }
+        let pending = std::mem::take(&mut self.pending_watched_changes);
+        pending.txt.then_some(pending)
+    }
+
+    pub fn finish_watched_change_worker_if_idle(&mut self, session_generation: u64) -> bool {
+        if self.session_generation != session_generation {
+            return true;
+        }
+        if self.pending_watched_changes.txt {
+            return false;
+        }
+        self.watched_change_worker_running = false;
+        true
+    }
+
+    #[cfg(test)]
+    pub fn watched_change_worker_running(&self) -> bool {
+        self.watched_change_worker_running
+    }
+
+    pub fn queue_json_analysis(&mut self, all_rules: bool) -> (u64, bool) {
+        self.json_analysis_generation = self.json_analysis_generation.wrapping_add(1);
+        if all_rules {
+            self.pending_json_analysis.all_rules = true;
+        } else {
+            self.pending_json_analysis.key_usage = true;
+        }
+        let start_worker = !self.json_analysis_worker_running;
+        self.json_analysis_worker_running = true;
+        (self.json_analysis_generation, start_worker)
+    }
+
+    pub fn requeue_json_analysis(
+        &mut self,
+        session_generation: u64,
+        pending: PendingJsonAnalysis,
+    ) -> bool {
+        if self.session_generation != session_generation || !pending.requested() {
+            return false;
+        }
+        self.json_analysis_generation = self.json_analysis_generation.wrapping_add(1);
+        self.pending_json_analysis.all_rules |= pending.all_rules;
+        self.pending_json_analysis.key_usage |= pending.key_usage;
+        self.json_analysis_worker_running = true;
+        true
+    }
+
+    pub fn json_analysis_generation_for_worker(&self, session_generation: u64) -> Option<u64> {
+        (self.session_generation == session_generation && self.json_analysis_worker_running)
+            .then_some(self.json_analysis_generation)
+    }
+
+    pub fn take_json_analysis(
+        &mut self,
+        session_generation: u64,
+        generation: u64,
+    ) -> Option<PendingJsonAnalysis> {
+        if self.session_generation != session_generation
+            || !self.json_analysis_worker_running
+            || self.json_analysis_generation != generation
+        {
+            return None;
+        }
+        let pending = std::mem::take(&mut self.pending_json_analysis);
+        pending.requested().then_some(pending)
+    }
+
+    pub fn finish_json_analysis_worker_if_idle(&mut self, session_generation: u64) -> bool {
+        if self.session_generation != session_generation {
+            return true;
+        }
+        if self.pending_json_analysis.requested() {
+            return false;
+        }
+        self.json_analysis_worker_running = false;
+        true
+    }
+
+    pub fn defer_json_analysis(
+        &mut self,
+        session_generation: u64,
+        worker_generation: u64,
+        pending: PendingJsonAnalysis,
+    ) -> bool {
+        if self.session_generation != session_generation {
+            return false;
+        }
+        self.pending_json_analysis.all_rules |= pending.all_rules;
+        self.pending_json_analysis.key_usage |= pending.key_usage;
+        if self.json_analysis_generation != worker_generation || self.phase == WorkspacePhase::Ready
+        {
+            // A newer request or Ready transition raced the worker's phase
+            // observation. Keep this worker alive so the merged request cannot
+            // be stranded without a wakeup.
+            self.json_analysis_worker_running = true;
+            return true;
+        }
+        self.json_analysis_worker_running = false;
+        false
+    }
+
+    #[cfg(test)]
+    pub fn json_analysis_worker_running(&self) -> bool {
+        self.json_analysis_worker_running
+    }
+
+    #[cfg(test)]
+    pub fn json_analysis_generation(&self) -> u64 {
+        self.json_analysis_generation
+    }
+
+    #[cfg(test)]
+    pub fn pending_json_analysis(&self) -> PendingJsonAnalysis {
+        self.pending_json_analysis
+    }
+
+    pub fn claim_json_startup_analysis(&mut self) -> bool {
+        if self.json_startup_analysis_queued {
+            return false;
+        }
+        self.json_startup_analysis_queued = true;
+        true
+    }
+
+    pub fn json_startup_analysis_queued(&self) -> bool {
+        self.json_startup_analysis_queued
     }
 
     pub fn set_reference_context_mode(&mut self, mode: ReferenceContextMode) {
@@ -548,6 +948,10 @@ impl Workspace {
             self.reference_root_cache
                 .insert(path.clone(), Arc::clone(document));
         }
+        // A disk or explicit-reference rescan can change symbols used by any
+        // open document even when that document's own version is unchanged.
+        // Requeue every open publication against the newly committed snapshot.
+        self.published_revisions.clear();
         self.rebuild_effective_symbols();
         self.begin_reconciliation(scan_generation)
     }
@@ -615,6 +1019,20 @@ impl Workspace {
         self.reference_root_present_paths = paths.into_iter().collect();
         self.rebuild_reference_root_present_stems();
         self.clear_contextual_views();
+    }
+
+    pub fn commit_scan_present_paths(
+        &mut self,
+        scan_generation: u64,
+        workspace_paths: HashSet<PathBuf>,
+        reference_root_paths: HashSet<PathBuf>,
+    ) -> bool {
+        if self.scan_generation != scan_generation {
+            return false;
+        }
+        self.set_workspace_present_paths(workspace_paths);
+        self.set_reference_root_present_paths(reference_root_paths);
+        true
     }
 
     fn rebuild_reference_root_present_stems(&mut self) {
@@ -869,6 +1287,13 @@ impl Workspace {
                 }
                 self.rebuild_reference_root_present_stems();
             } else {
+                // An explicit reference root may be an ancestor of the primary
+                // workspace. A primary file must never remain duplicated in the
+                // lower-priority reference tier after close/delete restoration.
+                self.reference_root_cache
+                    .retain(|existing, _| !same_local_path(existing, &path));
+                self.reference_root_present_paths
+                    .retain(|existing| !same_local_path(existing, &path));
                 self.file_cache
                     .retain(|existing, _| !same_local_path(existing, &path));
                 self.workspace_present_paths
@@ -880,6 +1305,7 @@ impl Workspace {
                     self.workspace_present_paths.insert(path.clone());
                 }
                 self.rebuild_workspace_present_stems();
+                self.rebuild_reference_root_present_stems();
             }
         }
         self.rebuild_effective_symbols();
@@ -887,6 +1313,53 @@ impl Workspace {
     }
 
     fn is_reference_root_document(&self, uri: &Url, path: Option<&std::path::Path>) -> bool {
+        let resolved_path = path
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| uri.to_file_path().ok());
+        resolved_path.is_some_and(|path| self.reference_tier_owns_path(&path))
+    }
+
+    fn cache_contains_local_path(
+        cache: &HashMap<PathBuf, Arc<DocumentData>>,
+        path: &std::path::Path,
+    ) -> bool {
+        cache.keys().any(|existing| same_local_path(existing, path))
+    }
+
+    fn set_contains_local_path(paths: &HashSet<PathBuf>, path: &std::path::Path) -> bool {
+        paths.iter().any(|existing| same_local_path(existing, path))
+    }
+
+    fn primary_scope_contains_path(&self, path: &std::path::Path) -> bool {
+        let Some(primary_root) = self
+            .root_uri
+            .as_ref()
+            .and_then(|root| root.to_file_path().ok())
+        else {
+            return false;
+        };
+        if self.reference_context_mode == ReferenceContextMode::Sibling || !self.include_subfolders
+        {
+            path_parent_is(path, &primary_root)
+        } else {
+            local_path_is_within(path, &primary_root)
+        }
+    }
+
+    fn reference_tier_owns_path(&self, path: &std::path::Path) -> bool {
+        let exact_primary = Self::cache_contains_local_path(&self.file_cache, path)
+            || Self::set_contains_local_path(&self.workspace_present_paths, path);
+        if exact_primary {
+            return false;
+        }
+        if self.primary_scope_contains_path(path) {
+            return false;
+        }
+        let exact_reference = Self::cache_contains_local_path(&self.reference_root_cache, path)
+            || Self::set_contains_local_path(&self.reference_root_present_paths, path);
+        if exact_reference {
+            return true;
+        }
         let Some(reference_root) = self
             .reference_root_uri
             .as_ref()
@@ -894,22 +1367,15 @@ impl Workspace {
         else {
             return false;
         };
-        if let Some(path) = path {
-            return local_path_is_within(path, &reference_root);
-        }
-        uri.to_file_path()
-            .ok()
-            .is_some_and(|path| local_path_is_within(&path, &reference_root))
+        local_path_is_within(path, &reference_root)
     }
 
     pub fn cached_disk_document(&self, path: &std::path::Path) -> Option<Arc<DocumentData>> {
-        let cache = self
-            .reference_root_uri
-            .as_ref()
-            .and_then(|root| root.to_file_path().ok())
-            .filter(|root| local_path_is_within(path, root))
-            .map(|_| &self.reference_root_cache)
-            .unwrap_or(&self.file_cache);
+        let cache = if self.reference_tier_owns_path(path) {
+            &self.reference_root_cache
+        } else {
+            &self.file_cache
+        };
         cache.get(path).cloned().or_else(|| {
             cache
                 .iter()
@@ -936,7 +1402,7 @@ impl Workspace {
         }
         if self.uses_directory_scopes() {
             let mut paths = self.file_cache.keys().cloned().collect::<Vec<_>>();
-            paths.sort_by(|left, right| local_path_identity(left).cmp(&local_path_identity(right)));
+            paths.sort_by_key(|path| local_path_identity(path));
             let mut seen = HashSet::new();
             return paths
                 .into_iter()
@@ -972,6 +1438,103 @@ impl Workspace {
             .collect()
     }
 
+    /// Primary, physical TXT inputs for the adjacent JSON lint scope. Open
+    /// buffers replace the same disk path, while explicit reference-root and
+    /// bundled documents are intentionally absent.
+    pub fn primary_txt_documents_for_json(&self) -> Vec<PrimaryTxtDocument> {
+        let active_data_roots = self.primary_json_data_roots();
+        if active_data_roots.is_empty() {
+            return Vec::new();
+        }
+        let mut documents = HashMap::<String, PrimaryTxtDocument>::new();
+        for (path, document) in &self.file_cache {
+            if data_root_from_excel_txt(path).is_some_and(|root| {
+                active_data_roots
+                    .iter()
+                    .any(|active| same_local_path(&root, active))
+            }) {
+                documents.insert(
+                    json_path_identity(path),
+                    PrimaryTxtDocument {
+                        path: path.clone(),
+                        document: Arc::clone(document),
+                    },
+                );
+            }
+        }
+
+        let primary_root = self
+            .root_uri
+            .as_ref()
+            .and_then(|uri| uri.to_file_path().ok());
+        for (uri, document) in &self.open_documents {
+            let Ok(path) = uri.to_file_path() else {
+                continue;
+            };
+            if data_root_from_excel_txt(&path).is_none_or(|root| {
+                !active_data_roots
+                    .iter()
+                    .any(|active| same_local_path(&root, active))
+            }) || primary_root
+                .as_ref()
+                .is_some_and(|root| !local_path_is_within(&path, root))
+            {
+                continue;
+            }
+            documents.insert(
+                json_path_identity(&path),
+                PrimaryTxtDocument {
+                    path,
+                    document: Arc::clone(document),
+                },
+            );
+        }
+
+        let mut documents = documents.into_values().collect::<Vec<_>>();
+        documents.sort_by(|left, right| {
+            json_path_identity(&left.path).cmp(&json_path_identity(&right.path))
+        });
+        documents
+    }
+
+    /// Physical mod scopes selected by primary workspace TXT documents.
+    /// Disk documents discovered by Open Folder establish the scope even when
+    /// no tab is open; open buffers then shadow those same disk paths in
+    /// `primary_txt_documents_for_json`. Explicit reference-root and bundled
+    /// documents are intentionally absent.
+    pub fn primary_json_data_roots(&self) -> Vec<PathBuf> {
+        let Some(primary_root) = self
+            .root_uri
+            .as_ref()
+            .and_then(|uri| uri.to_file_path().ok())
+        else {
+            return Vec::new();
+        };
+        let mut roots = self
+            .file_cache
+            .keys()
+            .filter(|path| local_path_is_within(path, &primary_root))
+            .filter_map(|path| data_root_from_excel_txt(path))
+            .collect::<Vec<_>>();
+        roots.extend(
+            self.open_documents
+                .keys()
+                .filter_map(|uri| self.primary_json_data_root_for_uri(uri)),
+        );
+        roots.sort_by_key(|root| json_path_identity(root));
+        roots.dedup_by(|left, right| same_local_path(left, right));
+        roots
+    }
+
+    pub fn primary_json_data_root_for_uri(&self, uri: &Url) -> Option<PathBuf> {
+        let path = uri.to_file_path().ok()?;
+        let primary_root = self.root_uri.as_ref()?.to_file_path().ok()?;
+        if !local_path_is_within(&path, &primary_root) {
+            return None;
+        }
+        data_root_from_excel_txt(&path)
+    }
+
     pub fn record_disk_diagnostics(&mut self, uri: Url, has_diagnostics: bool) {
         if has_diagnostics {
             self.published_disk_diagnostics.insert(uri);
@@ -982,6 +1545,44 @@ impl Workspace {
 
     pub fn forget_disk_diagnostics(&mut self, uri: &Url) {
         self.published_disk_diagnostics.remove(uri);
+    }
+
+    pub fn published_json_diagnostic_uris(&self) -> Vec<Url> {
+        let mut uris = self
+            .published_json_diagnostics
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        uris
+    }
+
+    pub fn published_json_diagnostics(&self) -> HashMap<Url, Vec<Diagnostic>> {
+        self.published_json_diagnostics.clone()
+    }
+
+    pub fn json_diagnostics_for_uri(&self, uri: &Url) -> Vec<Diagnostic> {
+        self.published_json_diagnostics
+            .get(uri)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn record_json_diagnostics(&mut self, uri: Url, diagnostics: Vec<Diagnostic>) {
+        if diagnostics.is_empty() {
+            self.published_json_diagnostics.remove(&uri);
+        } else {
+            self.published_json_diagnostics.insert(uri, diagnostics);
+        }
+    }
+
+    pub fn json_input_generation(&self) -> u64 {
+        self.json_input_generation
+    }
+
+    pub fn bump_json_input_generation(&mut self) -> u64 {
+        self.json_input_generation = self.json_input_generation.wrapping_add(1);
+        self.json_input_generation
     }
 
     pub fn obsolete_disk_diagnostic_uris(&self) -> Vec<Url> {
@@ -1083,6 +1684,393 @@ mod tests {
             assert!(workspace.mark_published(&ticket));
         }
         assert!(workspace.pending_open_tickets().is_empty());
+    }
+
+    #[test]
+    fn json_primary_inputs_use_open_buffers_and_exclude_reference_sources() {
+        let base = std::env::temp_dir().join("vlsp-json-primary-inputs");
+        let primary_excel = base.join("mod/data/global/excel");
+        let primary_path = primary_excel.join("skills.txt");
+        let reference_excel = base.join("reference/data/global/excel");
+        let reference_path = reference_excel.join("skills.txt");
+        let primary_uri = Url::from_file_path(&primary_path).unwrap();
+        let reference_uri = Url::from_file_path(&reference_path).unwrap();
+
+        let mut workspace = Workspace::new();
+        workspace.root_uri = Url::from_directory_path(&primary_excel).ok();
+        workspace.reference_root_uri = Url::from_directory_path(&reference_excel).ok();
+        workspace.file_cache.insert(
+            primary_path,
+            Arc::new(DocumentData::parse("name\nDISK", '\t')),
+        );
+        workspace.open_documents.insert(
+            primary_uri,
+            Arc::new(DocumentData::parse("name\nOPEN", '\t')),
+        );
+        workspace.open_documents.insert(
+            reference_uri,
+            Arc::new(DocumentData::parse("name\nREFERENCE", '\t')),
+        );
+
+        let inputs = workspace.primary_txt_documents_for_json();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].document.rows[0].cells[0].value, "OPEN");
+    }
+
+    #[test]
+    fn json_scope_is_the_union_of_primary_disk_roots_before_any_tab_is_open() {
+        let base = std::env::temp_dir().join("vlsp-json-open-root-union");
+        let root_a = base.join("a/data/global/excel");
+        let root_b = base.join("b/data/global/excel");
+        let a_skills = root_a.join("skills.txt");
+        let a_items = root_a.join("itemtypes.txt");
+        let b_skills = root_b.join("skills.txt");
+        let mut workspace = Workspace::new();
+        workspace.root_uri = Url::from_directory_path(&base).ok();
+        for path in [&a_skills, &a_items, &b_skills] {
+            workspace.file_cache.insert(path.clone(), doc("DISK"));
+        }
+        workspace
+            .open_documents
+            .insert(Url::from_file_path(&a_skills).unwrap(), doc("OPEN-A"));
+
+        let roots = workspace.primary_json_data_roots();
+        assert_eq!(roots.len(), 2);
+        assert!(
+            roots
+                .iter()
+                .any(|root| same_local_path(root, &base.join("a/data")))
+        );
+        assert!(
+            roots
+                .iter()
+                .any(|root| same_local_path(root, &base.join("b/data")))
+        );
+        let inputs = workspace.primary_txt_documents_for_json();
+        assert_eq!(inputs.len(), 3);
+        assert!(inputs.iter().any(|input| {
+            same_local_path(&input.path, &a_skills)
+                && input.document.rows[0].cells[0].value == "OPEN-A"
+        }));
+
+        workspace
+            .open_documents
+            .insert(Url::from_file_path(&b_skills).unwrap(), doc("OPEN-B"));
+        assert_eq!(workspace.primary_json_data_roots().len(), 2);
+        assert_eq!(workspace.primary_txt_documents_for_json().len(), 3);
+    }
+
+    #[test]
+    fn nested_primary_root_wins_over_a_reference_ancestor_for_json_scope() {
+        let base = std::env::temp_dir().join("vlsp-json-nested-primary");
+        let primary = base.join("reference/mod/data/global/excel");
+        let path = primary.join("skills.txt");
+        let uri = Url::from_file_path(&path).unwrap();
+        let mut workspace = Workspace::new();
+        workspace.root_uri = Url::from_directory_path(&primary).ok();
+        workspace.reference_root_uri = Url::from_directory_path(base.join("reference")).ok();
+        workspace.open_documents.insert(uri.clone(), doc("OPEN"));
+        workspace.file_cache.insert(path.clone(), doc("DISK"));
+        workspace
+            .reference_root_cache
+            .insert(path.clone(), doc("STALE-REFERENCE-DUPLICATE"));
+        workspace.set_workspace_present_paths([path.clone()]);
+        workspace.set_reference_root_present_paths([path.clone()]);
+
+        assert_eq!(workspace.primary_json_data_roots().len(), 1);
+        assert_eq!(workspace.primary_txt_documents_for_json().len(), 1);
+        assert_eq!(
+            workspace.cached_disk_document(&path).unwrap().rows[0].cells[0].value,
+            "DISK"
+        );
+        assert!(workspace.restore_closed_document_with_presence(
+            &uri,
+            Some(path.clone()),
+            Some(doc("LATEST-PRIMARY-DISK")),
+            true,
+        ));
+        assert_eq!(
+            workspace.cached_disk_document(&path).unwrap().rows[0].cells[0].value,
+            "LATEST-PRIMARY-DISK"
+        );
+        assert!(workspace.reference_root_cache.is_empty());
+        assert!(workspace.reference_root_present_paths.is_empty());
+    }
+
+    #[test]
+    fn stale_all_json_analysis_is_requeued_without_losing_rule_strength() {
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(7);
+        workspace.phase = WorkspacePhase::Ready;
+        let (generation, start_worker) = workspace.queue_json_analysis(true);
+        assert!(start_worker);
+        let pending = workspace
+            .take_json_analysis(7, generation)
+            .expect("initial All analysis");
+        assert!(pending.all_rules);
+        assert!(workspace.requeue_json_analysis(7, pending));
+
+        let retry_generation = workspace.json_analysis_generation();
+        let retry = workspace
+            .take_json_analysis(7, retry_generation)
+            .expect("stale All analysis must be retried");
+        assert!(retry.all_rules);
+        assert!(!retry.key_usage);
+    }
+
+    #[test]
+    fn ready_and_new_request_racing_a_defer_keep_the_json_worker_awake() {
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(9);
+        workspace.phase = WorkspacePhase::Reconciling;
+        let (worker_generation, start_worker) = workspace.queue_json_analysis(true);
+        assert!(start_worker);
+        let pending = workspace
+            .take_json_analysis(9, worker_generation)
+            .expect("request observed while reconciling");
+
+        // This transition and queue happen after the worker observed the old
+        // phase but before it reacquires the write lock to defer its request.
+        workspace.phase = WorkspacePhase::Ready;
+        let (_, second_worker) = workspace.queue_json_analysis(false);
+        assert!(!second_worker);
+        assert!(workspace.defer_json_analysis(9, worker_generation, pending));
+        assert!(workspace.json_analysis_worker_running());
+        assert_eq!(
+            workspace.pending_json_analysis(),
+            PendingJsonAnalysis {
+                all_rules: true,
+                key_usage: true,
+            }
+        );
+    }
+
+    #[test]
+    fn scanning_json_watch_catch_up_stays_all_until_readiness_arrives() {
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(11);
+        workspace.phase = WorkspacePhase::Scanning;
+        let (generation, _) = workspace.queue_json_analysis(true);
+        let pending = workspace.take_json_analysis(11, generation).unwrap();
+        assert!(!workspace.defer_json_analysis(11, generation, pending));
+        assert!(!workspace.json_analysis_worker_running());
+
+        workspace.phase = WorkspacePhase::Ready;
+        let (_, start_worker) = workspace.queue_json_analysis(false);
+        assert!(start_worker);
+        assert_eq!(
+            workspace.pending_json_analysis(),
+            PendingJsonAnalysis {
+                all_rules: true,
+                key_usage: true,
+            }
+        );
+    }
+
+    #[test]
+    fn late_txt_registration_defers_without_invalidating_the_initial_scan() {
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(13);
+        let initial_scan = workspace.begin_scan();
+        assert_eq!(initial_scan, 1);
+
+        // A registration response arriving after the bounded startup grace is
+        // recorded, but the active scan remains authoritative until Ready.
+        workspace.defer_txt_watch_registration_catch_up();
+        assert_eq!(workspace.scan_generation, initial_scan);
+        assert_eq!(workspace.phase, WorkspacePhase::Scanning);
+        assert!(workspace.has_pending_txt_watch_registration_catch_up());
+        assert!(!workspace.watched_change_worker_running());
+
+        workspace.phase = WorkspacePhase::Ready;
+        assert!(workspace.take_txt_watch_registration_catch_up());
+        let (_, start_worker) = workspace.queue_watched_changes(true);
+        assert!(start_worker);
+        assert_eq!(workspace.scan_generation, initial_scan + 1);
+    }
+
+    #[test]
+    fn nested_reference_descendant_below_a_primary_folder_keeps_its_tier() {
+        let base = std::env::temp_dir().join("vlsp-nested-reference-descendant");
+        let reference_root = base.join("reference");
+        let primary_root = reference_root.join("primary");
+        let path = primary_root.join("nested/items.txt");
+        let uri = Url::from_file_path(&path).unwrap();
+        let mut workspace = Workspace::new();
+        workspace.root_uri = Url::from_directory_path(&primary_root).ok();
+        workspace.reference_root_uri = Url::from_directory_path(&reference_root).ok();
+        workspace.set_reference_context_mode(ReferenceContextMode::Sibling);
+        workspace.set_reference_root_present_paths([path.clone()]);
+        workspace
+            .reference_root_cache
+            .insert(path.clone(), doc("REFERENCE-DISK"));
+        workspace.open_documents.insert(uri.clone(), doc("OPEN"));
+
+        assert_eq!(
+            workspace.cached_disk_document(&path).unwrap().rows[0].cells[0].value,
+            "REFERENCE-DISK"
+        );
+        assert!(workspace.restore_closed_document_with_presence(
+            &uri,
+            Some(path.clone()),
+            Some(doc("LATEST-REFERENCE-DISK")),
+            true,
+        ));
+        assert!(workspace.file_cache.is_empty());
+        assert!(workspace.workspace_present_paths.is_empty());
+        assert_eq!(
+            workspace.reference_root_cache[&path].rows[0].cells[0].value,
+            "LATEST-REFERENCE-DISK"
+        );
+        assert!(workspace.reference_root_present_paths.contains(&path));
+    }
+
+    #[test]
+    fn failed_json_watch_registration_rolls_back_and_active_registration_can_retire() {
+        let mut workspace = Workspace::new();
+        workspace.set_watched_files_client_capabilities(true, true);
+        let session_generation = workspace.session_generation;
+        let identity = "c:/mod/data|strings|files|c:/mod/data/strings|*.json";
+        let first = workspace
+            .reserve_watched_json_registration(identity)
+            .unwrap();
+        assert!(workspace.finish_watched_json_registration(
+            identity,
+            session_generation,
+            first,
+            "registration-1",
+            false,
+        ));
+        let second = workspace
+            .reserve_watched_json_registration(identity)
+            .unwrap();
+        assert!(workspace.finish_watched_json_registration(
+            identity,
+            session_generation,
+            second,
+            "registration-2",
+            true,
+        ));
+        assert!(
+            workspace
+                .reserve_watched_json_registration(identity)
+                .is_none()
+        );
+        assert_eq!(
+            workspace.take_obsolete_watched_json_registrations(&HashSet::new()),
+            vec!["registration-2"]
+        );
+    }
+
+    #[test]
+    fn late_json_watch_registration_response_cannot_activate_a_new_session_slot() {
+        let mut workspace = Workspace::new();
+        workspace.set_watched_files_client_capabilities(true, true);
+        let identity = "c:/mod/data|strings|files|c:/mod/data/strings|*.json";
+        workspace.begin_initialization(17);
+        let old_sequence = workspace
+            .reserve_watched_json_registration(identity)
+            .unwrap();
+
+        workspace.begin_initialization(18);
+        let new_sequence = workspace
+            .reserve_watched_json_registration(identity)
+            .unwrap();
+        assert_eq!(old_sequence, new_sequence, "sequence resets per session");
+        assert!(!workspace.finish_watched_json_registration(
+            identity,
+            17,
+            old_sequence,
+            "old-session-registration",
+            true,
+        ));
+        assert!(workspace.finish_watched_json_registration(
+            identity,
+            18,
+            new_sequence,
+            "current-registration",
+            true,
+        ));
+    }
+
+    #[test]
+    fn json_watch_retirement_survives_session_reset_and_failed_unregistration() {
+        let mut workspace = Workspace::new();
+        workspace.set_watched_files_client_capabilities(true, true);
+        workspace.begin_initialization(23);
+        let identity = "c:/mod/data|strings|files|c:/mod/data/strings|*.json";
+        let sequence = workspace
+            .reserve_watched_json_registration(identity)
+            .unwrap();
+        assert!(workspace.finish_watched_json_registration(
+            identity,
+            23,
+            sequence,
+            "active-registration",
+            true,
+        ));
+
+        workspace.begin_initialization(24);
+        assert_eq!(
+            workspace.pending_watched_json_unregistrations(),
+            vec!["active-registration"]
+        );
+        assert!(workspace.queue_watched_json_unregistrations(Vec::new()));
+        let first_attempt = workspace.take_watched_json_unregistrations();
+        assert_eq!(first_attempt, vec!["active-registration"]);
+        assert!(!workspace.defer_watched_json_unregistrations(first_attempt));
+        assert_eq!(
+            workspace.pending_watched_json_unregistrations(),
+            vec!["active-registration"]
+        );
+
+        // A later event-driven scope sync wakes the retained retry; no polling
+        // worker remains active after the failed request.
+        assert!(workspace.queue_watched_json_unregistrations(Vec::new()));
+        let retry = workspace.take_watched_json_unregistrations();
+        assert_eq!(retry, vec!["active-registration"]);
+        assert!(workspace.finish_watched_json_unregistration_worker_if_idle());
+        assert!(workspace.pending_watched_json_unregistrations().is_empty());
+    }
+
+    #[test]
+    fn new_retirement_request_racing_a_failure_keeps_the_worker_awake() {
+        let mut workspace = Workspace::new();
+        assert!(workspace.queue_watched_json_unregistrations(vec!["old".to_string()]));
+        let failed = workspace.take_watched_json_unregistrations();
+        assert!(!workspace.queue_watched_json_unregistrations(vec!["new".to_string()]));
+        assert!(workspace.defer_watched_json_unregistrations(failed));
+        assert_eq!(
+            workspace.pending_watched_json_unregistrations(),
+            vec!["new", "old"]
+        );
+    }
+
+    #[test]
+    fn json_publications_are_tracked_by_uri_not_txt_stem() {
+        let mut workspace = Workspace::new();
+        let json_uri = Url::parse("file:///workspace/monsters.json").unwrap();
+        let txt_uri = Url::parse("file:///workspace/monsters.txt").unwrap();
+        workspace.record_json_diagnostics(json_uri.clone(), vec![Diagnostic::default()]);
+        workspace.record_disk_diagnostics(txt_uri, true);
+        assert_eq!(workspace.published_json_diagnostic_uris(), vec![json_uri]);
+    }
+
+    #[test]
+    fn stale_json_publication_clear_removes_the_unchanged_result_snapshot() {
+        let mut workspace = Workspace::new();
+        let uri = Url::parse("file:///workspace/skills.json").unwrap();
+        let diagnostics = vec![Diagnostic {
+            message: "same retry result".to_string(),
+            ..Diagnostic::default()
+        }];
+        workspace.record_json_diagnostics(uri.clone(), diagnostics.clone());
+
+        // This mirrors publish_json_batch_if_current's stale-after-await path:
+        // clearing both client and cache makes an identical retry publishable.
+        workspace.record_json_diagnostics(uri.clone(), Vec::new());
+        assert!(workspace.json_diagnostics_for_uri(&uri).is_empty());
+        assert_ne!(workspace.json_diagnostics_for_uri(&uri), diagnostics);
     }
 
     #[test]
@@ -1287,6 +2275,8 @@ mod tests {
         )];
 
         let live = workspace.accept_open(uri, 2, doc("NEW"));
+        assert!(workspace.mark_published(&live));
+        assert!(workspace.pending_open_tickets().is_empty());
         assert!(workspace.commit_scan_documents(scan_generation, &parsed));
 
         assert!(workspace.symbols.lookup("items", "id", "OLD").is_none());
@@ -1296,6 +2286,47 @@ mod tests {
             "NEW"
         );
         assert_eq!(workspace.file_cache.len(), 1);
+        assert_eq!(workspace.pending_open_tickets().len(), 1);
+        assert_eq!(workspace.pending_open_tickets()[0].uri, live.uri);
+    }
+
+    #[test]
+    fn stale_scan_cannot_overwrite_newer_presence_sets() {
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(5);
+        let stale_generation = workspace.begin_scan();
+        let current_generation = workspace.begin_scan();
+        let stale_path = PathBuf::from("/workspace/stale/items.txt");
+        let current_path = PathBuf::from("/workspace/current/items.txt");
+
+        assert!(workspace.commit_scan_present_paths(
+            current_generation,
+            HashSet::from([current_path.clone()]),
+            HashSet::new(),
+        ));
+        assert!(!workspace.commit_scan_present_paths(
+            stale_generation,
+            HashSet::from([stale_path]),
+            HashSet::new(),
+        ));
+        assert_eq!(
+            workspace.workspace_present_paths,
+            HashSet::from([current_path])
+        );
+    }
+
+    #[test]
+    fn local_path_identity_ignores_a_directory_uris_trailing_separator() {
+        #[cfg(windows)]
+        assert!(same_local_path(
+            std::path::Path::new(r"C:\Mods\Example\data\global\excel\"),
+            std::path::Path::new(r"c:\mods\example\data\global\excel"),
+        ));
+        #[cfg(not(windows))]
+        assert!(same_local_path(
+            std::path::Path::new("/mods/example/data/global/excel/"),
+            std::path::Path::new("/mods/example/data/global/excel"),
+        ));
     }
 
     #[test]
