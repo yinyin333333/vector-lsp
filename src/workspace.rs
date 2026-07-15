@@ -722,8 +722,15 @@ impl Workspace {
     }
 
     pub fn cached_disk_document(&self, path: &std::path::Path) -> Option<Arc<DocumentData>> {
-        self.file_cache.get(path).cloned().or_else(|| {
-            self.file_cache
+        let cache = self
+            .reference_root_uri
+            .as_ref()
+            .and_then(|root| root.to_file_path().ok())
+            .filter(|root| local_path_is_within(path, root))
+            .map(|_| &self.reference_root_cache)
+            .unwrap_or(&self.file_cache);
+        cache.get(path).cloned().or_else(|| {
+            cache
                 .iter()
                 .find(|(existing, _)| same_local_path(existing, path))
                 .map(|(_, document)| Arc::clone(document))
@@ -1554,6 +1561,44 @@ mod tests {
             .resolve("items", "id", "BUNDLED", ReferenceResolver::AsciiCi)
             .expect("deleting the explicit-root table should reveal bundled fallback");
         assert_eq!(bundled.source_kind, SourceKind::Bundled);
+    }
+
+    #[test]
+    fn cached_disk_document_uses_the_explicit_reference_root_tier() {
+        let reference_root = std::env::temp_dir().join("vlsp-reference-root-cached-restore");
+        let reference_path = reference_root.join("items.txt");
+        let workspace_path = std::env::temp_dir()
+            .join("vlsp-workspace-cached-restore")
+            .join("items.txt");
+        let mut workspace = Workspace::new();
+        workspace.set_reference_root_uri(Some(
+            Url::from_directory_path(&reference_root).expect("absolute reference root"),
+        ));
+        workspace
+            .reference_root_cache
+            .insert(reference_path.clone(), doc("REFERENCE"));
+        workspace
+            .file_cache
+            .insert(workspace_path.clone(), doc("WORKSPACE"));
+
+        assert_eq!(
+            workspace
+                .cached_disk_document(&reference_path)
+                .expect("reference-root cache entry")
+                .rows[0]
+                .cells[0]
+                .value,
+            "REFERENCE"
+        );
+        assert_eq!(
+            workspace
+                .cached_disk_document(&workspace_path)
+                .expect("workspace cache entry")
+                .rows[0]
+                .cells[0]
+                .value,
+            "WORKSPACE"
+        );
     }
 
     #[test]
