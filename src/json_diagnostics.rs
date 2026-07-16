@@ -857,10 +857,27 @@ fn js_array_string(values: &[Value]) -> String {
         .join(",")
 }
 
+fn is_ecmascript_trim_character(ch: char) -> bool {
+    // TrimString uses ECMAScript WhiteSpace plus LineTerminator. Rust's
+    // Unicode White_Space property additionally includes U+0085 NEXT LINE.
+    matches!(
+        ch,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
 fn js_string_number(value: &str) -> Option<f64> {
-    // ECMAScript TrimString includes the BOM/zero-width no-break space in
-    // addition to the Unicode whitespace covered by Rust's `trim`.
-    let value = value.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
+    let value = value.trim_matches(is_ecmascript_trim_character);
     if value.is_empty() {
         return Some(0.0);
     }
@@ -1525,6 +1542,11 @@ mod tests {
             js_number(&serde_json::json!("\u{feff} 12 \u{feff}")),
             Some(12.0)
         );
+        assert_eq!(
+            js_number(&serde_json::json!("\u{00a0}50001")),
+            Some(50001.0)
+        );
+        assert!(js_number(&serde_json::json!("\u{0085}50001")).is_none());
         assert_eq!(js_number(&serde_json::json!([])), Some(0.0));
         assert_eq!(js_number(&serde_json::json!([null])), Some(0.0));
         assert_eq!(js_number(&serde_json::json!([[" 7 "]])), Some(7.0));
