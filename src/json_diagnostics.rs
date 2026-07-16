@@ -268,9 +268,10 @@ pub fn analyze(primary_documents: Vec<PrimaryTxtDocument>) -> JsonDiagnosticRepo
 
 /// Analyze only the configured rules invalidated by `trigger`.
 ///
-/// `KeyUsageOnly` reports contain only Json/KeyUsage diagnostics. A caller
-/// publishing aggregate diagnostics must merge them with its cached results
-/// for the other rules before replacing diagnostics for a JSON URI.
+/// `KeyUsageOnly` reports contain Json/KeyUsage diagnostics, or a single
+/// Json/Syntax diagnostic when the source cannot be parsed. A caller publishing
+/// aggregate diagnostics must merge them with its cached semantic results
+/// before replacing diagnostics for a JSON URI.
 pub fn analyze_with_rules(
     primary_documents: Vec<PrimaryTxtDocument>,
     rules: JsonDiagnosticRules,
@@ -439,7 +440,10 @@ fn parse_string_file(path: PathBuf, uri: Url) -> Result<StringFile, String> {
 
 fn parse_string_source(path: PathBuf, uri: Url, source: String) -> Result<StringFile, String> {
     let parse_source = source.strip_prefix('\u{feff}').unwrap_or(&source);
-    let value: Value = serde_json::from_str(parse_source).map_err(|error| error.to_string())?;
+    let value: Value = match serde_json::from_str(parse_source) {
+        Ok(value) => value,
+        Err(error) => return Ok(syntax_error_file(path, uri, source, error)),
+    };
     let Value::Array(values) = value else {
         return Ok(StringFile {
             display_stem: display_stem(&path),
@@ -493,12 +497,11 @@ fn parse_string_source_key_usage(
 ) -> Result<StringFile, String> {
     let parse_source = source.strip_prefix('\u{feff}').unwrap_or(&source);
     if serde_json::from_str::<IgnoredAny>(parse_source).is_err() {
-        // Preserve the existing user-facing serde_json<Value> error wording on
-        // invalid files. This fallback is reached only after validation has
-        // already failed, so valid 10 MB inputs never materialize a Value tree.
+        // Preserve serde_json's detailed message, but publish it as a document
+        // diagnostic instead of reducing an invalid file to an empty batch.
         let error = serde_json::from_str::<Value>(parse_source)
             .expect_err("IgnoredAny and Value must agree on JSON validity");
-        return Err(error.to_string());
+        return Ok(syntax_error_file(path, uri, source, error));
     }
 
     let entries = top_level_array_value_spans(&source)
@@ -518,6 +521,65 @@ fn parse_string_source_key_usage(
         entries,
         diagnostics: Vec::new(),
     })
+}
+
+fn syntax_error_file(
+    path: PathBuf,
+    uri: Url,
+    source: String,
+    error: serde_json::Error,
+) -> StringFile {
+    let span = syntax_error_span(&source, &error);
+    let diagnostics = vec![rule_diagnostic(
+        &source,
+        span,
+        "Json/Syntax",
+        "invalid-json",
+        DiagnosticSeverity::ERROR,
+        format!("Invalid localization JSON: {error}"),
+    )];
+    StringFile {
+        display_stem: display_stem(&path),
+        path,
+        uri,
+        source,
+        entries: Vec::new(),
+        diagnostics,
+    }
+}
+
+fn syntax_error_span(source: &str, error: &serde_json::Error) -> Span {
+    let parse_source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let source_prefix_bytes = source.len().saturating_sub(parse_source.len());
+    let target_line = error.line().saturating_sub(1);
+    let mut line_start = 0usize;
+    for _ in 0..target_line {
+        let Some(newline) = parse_source[line_start..].find('\n') else {
+            line_start = parse_source.len();
+            break;
+        };
+        line_start += newline + 1;
+    }
+    let line_end = parse_source[line_start..]
+        .find('\n')
+        .map_or(parse_source.len(), |newline| line_start + newline);
+    let line_source = &parse_source[line_start..line_end];
+    // serde_json's string reader reports a one-based UTF-8 byte column.
+    // Clamp to the line and recover to a character boundary defensively before
+    // selecting the offending code point (or an empty EOF range).
+    let mut relative = error.column().saturating_sub(1).min(line_source.len());
+    while relative > 0 && !line_source.is_char_boundary(relative) {
+        relative -= 1;
+    }
+    let start = line_start + relative;
+    let end = parse_source[start..line_end]
+        .chars()
+        .next()
+        .map_or(start, |character| start + character.len_utf8());
+    Span {
+        start: source_prefix_bytes + start,
+        end: source_prefix_bytes + end,
+    }
 }
 
 fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity) {
@@ -1376,6 +1438,59 @@ mod tests {
     }
 
     #[test]
+    fn invalid_json_has_one_error_at_the_exact_utf16_range() {
+        let source = "\u{feff}[\r\n  {\"Key\":\"🙂\",}\r\n]".to_string();
+        let path = PathBuf::from("emoji.json");
+        let uri = Url::parse("file:///emoji.json").unwrap();
+        let expected_start = source.find('}').unwrap();
+
+        for file in [
+            parse_string_source(path.clone(), uri.clone(), source.clone()).unwrap(),
+            parse_string_source_key_usage(path.clone(), uri.clone(), source.clone()).unwrap(),
+        ] {
+            assert_eq!(file.diagnostics.len(), 1);
+            let diagnostic = &file.diagnostics[0];
+            assert_eq!(
+                diagnostic.code,
+                Some(NumberOrString::String("Json/Syntax".to_string()))
+            );
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(diagnostic.range.start, Position::new(1, 14));
+            assert_eq!(diagnostic.range.end, Position::new(1, 15));
+
+            let error =
+                serde_json::from_str::<Value>(source.strip_prefix('\u{feff}').unwrap_or(&source))
+                    .unwrap_err();
+            assert_eq!(
+                syntax_error_span(&source, &error),
+                Span {
+                    start: expected_start,
+                    end: expected_start + 1,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn syntax_diagnostic_disappears_after_the_json_is_valid_again() {
+        let path = PathBuf::from("recover.json");
+        let uri = Url::parse("file:///recover.json").unwrap();
+        let invalid =
+            parse_string_source(path.clone(), uri.clone(), "[{\"id\":1".to_string()).unwrap();
+        assert_eq!(invalid.diagnostics.len(), 1);
+        assert_eq!(
+            invalid.diagnostics[0].code,
+            Some(NumberOrString::String("Json/Syntax".to_string()))
+        );
+
+        let valid =
+            parse_string_source(path, uri, "[{\"id\":1,\"Key\":\"Recovered\"}]".to_string())
+                .unwrap();
+        assert!(valid.diagnostics.is_empty());
+        assert_eq!(valid.entries.len(), 1);
+    }
+
+    #[test]
     fn d2rlint_known_file_contract_excludes_hiredesc_and_moncalc() {
         assert_eq!(D2RLINT_EXCEL_FILES.len(), 90);
         assert_eq!(D2RLINT_LEGACY_EXCLUDED_EXCEL_FILES.len(), 8);
@@ -1753,11 +1868,20 @@ mod tests {
             JsonAnalysisTrigger::KeyUsageOnly,
         );
         assert_eq!(full.warnings, optimized.warnings);
-        assert_eq!(full.warnings.len(), 1);
+        assert!(full.warnings.is_empty());
         assert_eq!(full.batches.len(), 1);
         assert_eq!(optimized.batches.len(), 1);
-        assert!(full.batches[0].diagnostics.is_empty());
-        assert!(optimized.batches[0].diagnostics.is_empty());
+        for batch in [&full.batches[0], &optimized.batches[0]] {
+            assert_eq!(batch.diagnostics.len(), 1);
+            assert_eq!(
+                batch.diagnostics[0].code,
+                Some(NumberOrString::String("Json/Syntax".to_string()))
+            );
+            assert_eq!(
+                batch.diagnostics[0].severity,
+                Some(DiagnosticSeverity::ERROR)
+            );
+        }
     }
 
     #[test]

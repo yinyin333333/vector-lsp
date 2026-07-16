@@ -235,26 +235,53 @@ impl Backend {
         primary_identities.contains(&json_path_identity(path))
     }
 
-    fn merge_key_usage_batches(
+    fn diagnostic_has_code(diagnostic: &Diagnostic, expected: &str) -> bool {
+        matches!(
+            diagnostic.code.as_ref(),
+            Some(NumberOrString::String(code)) if code == expected
+        )
+    }
+
+    fn merge_json_batches(
         previous: &HashMap<Url, Vec<Diagnostic>>,
         batches: Vec<JsonDiagnosticBatch>,
+        trigger: JsonAnalysisTrigger,
     ) -> Vec<JsonDiagnosticBatch> {
         batches
             .into_iter()
             .map(|batch| {
+                let has_syntax_error = batch
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| Self::diagnostic_has_code(diagnostic, "Json/Syntax"));
+                if has_syntax_error {
+                    let mut diagnostics = previous.get(&batch.uri).cloned().unwrap_or_default();
+                    diagnostics
+                        .retain(|diagnostic| !Self::diagnostic_has_code(diagnostic, "Json/Syntax"));
+                    diagnostics.extend(
+                        batch.diagnostics.into_iter().filter(|diagnostic| {
+                            Self::diagnostic_has_code(diagnostic, "Json/Syntax")
+                        }),
+                    );
+                    return JsonDiagnosticBatch {
+                        uri: batch.uri,
+                        diagnostics,
+                    };
+                }
+                if trigger != JsonAnalysisTrigger::KeyUsageOnly {
+                    return batch;
+                }
+
                 let mut diagnostics = previous.get(&batch.uri).cloned().unwrap_or_default();
                 diagnostics.retain(|diagnostic| {
-                    !matches!(
-                        diagnostic.code.as_ref(),
-                        Some(NumberOrString::String(code)) if code == "Json/KeyUsage"
-                    )
+                    !Self::diagnostic_has_code(diagnostic, "Json/KeyUsage")
+                        && !Self::diagnostic_has_code(diagnostic, "Json/Syntax")
                 });
-                diagnostics.extend(batch.diagnostics.into_iter().filter(|diagnostic| {
-                    matches!(
-                        diagnostic.code.as_ref(),
-                        Some(NumberOrString::String(code)) if code == "Json/KeyUsage"
-                    )
-                }));
+                diagnostics.extend(
+                    batch.diagnostics.into_iter().filter(|diagnostic| {
+                        Self::diagnostic_has_code(diagnostic, "Json/KeyUsage")
+                    }),
+                );
                 JsonDiagnosticBatch {
                     uri: batch.uri,
                     diagnostics,
@@ -458,17 +485,14 @@ impl Backend {
                 }
             };
 
-        // A KeyUsage-only pass must not overwrite diagnostics produced by the
-        // two JSON-only rules. Merge it into the last successfully published
-        // snapshot before comparing and publishing. Preserve those diagnostics
-        // only for JSON files observed by this pass; carrying the entire prior
-        // snapshot forward would keep deleted/out-of-scope files alive forever.
-        let batches = if trigger == JsonAnalysisTrigger::KeyUsageOnly {
-            let previous = self.workspace.read().await.published_json_diagnostics();
-            Self::merge_key_usage_batches(&previous, batches)
-        } else {
-            batches
-        };
+        // Preserve the last valid semantic diagnostics while the current JSON
+        // is syntactically invalid, and replace only the prior syntax error
+        // with the current one. A successful All pass still replaces the whole
+        // snapshot. KeyUsage-only passes retain the two JSON-only rule results.
+        // Merge only files observed by this pass so deleted/out-of-scope files
+        // are still retired by clear_obsolete_json_if_current.
+        let previous = self.workspace.read().await.published_json_diagnostics();
+        let batches = Self::merge_json_batches(&previous, batches, trigger);
 
         let ticket_is_current = {
             let workspace = self.workspace.read().await;
@@ -3058,7 +3082,7 @@ mod tests {
     }
 
     #[test]
-    fn key_usage_merge_preserves_other_rules_only_for_currently_observed_json() {
+    fn json_merge_preserves_semantics_during_syntax_errors_and_recovers() {
         let kept = Url::parse("file:///mod/data/local/lng/strings/skills.json").unwrap();
         let deleted = Url::parse("file:///mod/data/local/lng/strings/ui.json").unwrap();
         let diagnostic = |code: &str, message: &str| Diagnostic {
@@ -3071,7 +3095,9 @@ mod tests {
                 kept.clone(),
                 vec![
                     diagnostic("Json/DuplicateIds", "duplicate"),
+                    diagnostic("Json/StringFormat", "string format"),
                     diagnostic("Json/KeyUsage", "old key result"),
+                    diagnostic("Json/Syntax", "old syntax result"),
                 ],
             ),
             (
@@ -3079,24 +3105,64 @@ mod tests {
                 vec![diagnostic("Json/StringFormat", "deleted file")],
             ),
         ]);
-        let merged = Backend::merge_key_usage_batches(
+        let key_usage_merged = Backend::merge_json_batches(
             &previous,
             vec![JsonDiagnosticBatch {
                 uri: kept.clone(),
                 diagnostics: vec![diagnostic("Json/KeyUsage", "new key result")],
             }],
+            JsonAnalysisTrigger::KeyUsageOnly,
         );
 
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].uri, kept);
-        assert!(merged.iter().all(|batch| batch.uri != deleted));
+        assert_eq!(key_usage_merged.len(), 1);
+        assert_eq!(key_usage_merged[0].uri, kept);
+        assert!(key_usage_merged.iter().all(|batch| batch.uri != deleted));
         assert_eq!(
-            merged[0]
+            key_usage_merged[0]
                 .diagnostics
                 .iter()
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
-            vec!["duplicate", "new key result"]
+            vec!["duplicate", "string format", "new key result"]
+        );
+
+        let syntax_merged = Backend::merge_json_batches(
+            &previous,
+            vec![JsonDiagnosticBatch {
+                uri: kept.clone(),
+                diagnostics: vec![diagnostic("Json/Syntax", "current syntax result")],
+            }],
+            JsonAnalysisTrigger::All,
+        );
+        assert_eq!(
+            syntax_merged[0]
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "duplicate",
+                "string format",
+                "old key result",
+                "current syntax result"
+            ]
+        );
+
+        let recovered = Backend::merge_json_batches(
+            &previous,
+            vec![JsonDiagnosticBatch {
+                uri: kept,
+                diagnostics: vec![diagnostic("Json/DuplicateIds", "recalculated duplicate")],
+            }],
+            JsonAnalysisTrigger::All,
+        );
+        assert_eq!(
+            recovered[0]
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recalculated duplicate"]
         );
     }
 
@@ -3858,6 +3924,46 @@ mod tests {
         assert_eq!(
             workspace.read().await.published_json_diagnostic_uris(),
             vec![json_uri.clone()]
+        );
+        let initial_diagnostics = workspace.read().await.json_diagnostics_for_uri(&json_uri);
+        assert!(!initial_diagnostics.is_empty());
+
+        std::fs::write(&json_path, r#"[{"id":1,"Key":"A"},{"id":1,"Key":"A"}"#).unwrap();
+        service
+            .inner()
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent::new(json_uri.clone(), FileChangeType::CHANGED)],
+            })
+            .await;
+        wait_for_json_analysis_worker(&workspace).await;
+        let invalid_diagnostics = workspace.read().await.json_diagnostics_for_uri(&json_uri);
+        let preserved_semantics = invalid_diagnostics
+            .iter()
+            .filter(|diagnostic| !Backend::diagnostic_has_code(diagnostic, "Json/Syntax"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let syntax_diagnostics = invalid_diagnostics
+            .iter()
+            .filter(|diagnostic| Backend::diagnostic_has_code(diagnostic, "Json/Syntax"))
+            .collect::<Vec<_>>();
+        assert_eq!(preserved_semantics, initial_diagnostics);
+        assert_eq!(syntax_diagnostics.len(), 1);
+        assert_eq!(
+            syntax_diagnostics[0].severity,
+            Some(DiagnosticSeverity::ERROR)
+        );
+
+        std::fs::write(&json_path, r#"[{"id":1,"Key":"A"},{"id":1,"Key":"A"}]"#).unwrap();
+        service
+            .inner()
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent::new(json_uri.clone(), FileChangeType::CHANGED)],
+            })
+            .await;
+        wait_for_json_analysis_worker(&workspace).await;
+        assert_eq!(
+            workspace.read().await.json_diagnostics_for_uri(&json_uri),
+            initial_diagnostics
         );
 
         std::fs::write(&json_path, "[]").unwrap();
