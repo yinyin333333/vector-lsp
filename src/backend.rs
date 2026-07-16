@@ -2308,7 +2308,10 @@ impl LanguageServer for Backend {
         if is_json {
             let update_result = {
                 let mut workspace = self.workspace.write().await;
-                if !json_enabled || !Self::localization_json_uri_in_scope(&workspace, &uri) {
+                // An accepted didOpen owns its buffer until didClose. A watched
+                // TXT rescan may temporarily remove the diagnostic scope, but
+                // rejecting changes here would desynchronize the live document.
+                if !json_enabled || workspace.open_json_version(&uri).is_none() {
                     Err(DocumentChangeError::NotOpen)
                 } else {
                     let existing = workspace.open_json_text(&uri).unwrap_or_default();
@@ -3305,7 +3308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn localization_json_open_buffer_is_versioned_and_close_restores_disk_input() {
+    async fn localization_json_open_buffer_survives_temporary_scope_loss_and_close_restores_disk() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3331,7 +3334,7 @@ mod tests {
             ws.workspace_revision = 8;
             ws.phase = WorkspacePhase::Ready;
             ws.file_cache.insert(
-                excel_path,
+                excel_path.clone(),
                 Arc::new(DocumentData::parse("skill\nnone\n", '\t')),
             );
         }
@@ -3364,6 +3367,12 @@ mod tests {
         wait_for_json_analysis_worker(&workspace).await;
         assert_eq!(workspace.read().await.open_json_version(&json_uri), Some(1));
 
+        workspace.write().await.file_cache.clear();
+        assert!(
+            workspace.read().await.primary_json_data_roots().is_empty(),
+            "the accepted LSP document must outlive a temporary loss of TXT scope"
+        );
+
         service
             .inner()
             .did_change(DidChangeTextDocumentParams {
@@ -3380,6 +3389,12 @@ mod tests {
         assert_eq!(ws.open_json_version(&json_uri), Some(2));
         assert_eq!(ws.open_json_text(&json_uri), Some("[{\"id\":41002}]"));
         drop(ws);
+
+        workspace.write().await.file_cache.insert(
+            excel_path,
+            Arc::new(DocumentData::parse("skill\nnone\n", '\t')),
+        );
+        assert_eq!(workspace.read().await.primary_json_data_roots().len(), 1);
 
         service
             .inner()
