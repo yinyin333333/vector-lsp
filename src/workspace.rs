@@ -101,6 +101,12 @@ struct DirectorySymbolView {
     index: Arc<SymbolIndex>,
 }
 
+#[derive(Clone, Debug)]
+struct PublishedJsonDiagnosticSnapshot {
+    diagnostics: Vec<Diagnostic>,
+    version: Option<i32>,
+}
+
 /// Cross-file symbol index.
 ///
 /// Key: `(file_stem, column_name, cell_value)` — all three components lowercased.
@@ -433,12 +439,10 @@ pub struct Workspace {
     published_revisions: HashMap<Url, u64>,
     published_disk_diagnostics: HashSet<Url>,
     /// JSON publications are tracked separately from stem-selected TXT
-    /// diagnostics. A `monsters.json` result must not collide with the
-    /// `monsters.txt` winner or inherit its visibility rules.
-    published_json_diagnostics: HashMap<Url, Vec<Diagnostic>>,
-    /// The LSP document version paired with each non-empty JSON diagnostic
-    /// snapshot. `None` is a physical-disk publication.
-    published_json_versions: HashMap<Url, Option<i32>>,
+    /// diagnostics. Diagnostics and their LSP document version form one
+    /// atomic snapshot so unchanged-result suppression cannot observe a
+    /// partially updated pair. `None` is a physical-disk publication.
+    published_json_diagnostics: HashMap<Url, PublishedJsonDiagnosticSnapshot>,
     /// Invalidates JSON analyses when an external editor changes a physical
     /// localization JSON or layout input without an LSP document version.
     json_input_generation: u64,
@@ -495,7 +499,6 @@ impl Workspace {
             published_revisions: HashMap::new(),
             published_disk_diagnostics: HashSet::new(),
             published_json_diagnostics: HashMap::new(),
-            published_json_versions: HashMap::new(),
             json_input_generation: 0,
             watched_files_dynamic_registration: false,
             watched_files_relative_pattern_support: false,
@@ -1640,18 +1643,23 @@ impl Workspace {
     }
 
     pub fn published_json_diagnostics(&self) -> HashMap<Url, Vec<Diagnostic>> {
-        self.published_json_diagnostics.clone()
+        self.published_json_diagnostics
+            .iter()
+            .map(|(uri, snapshot)| (uri.clone(), snapshot.diagnostics.clone()))
+            .collect()
     }
 
     pub fn json_diagnostics_for_uri(&self, uri: &Url) -> Vec<Diagnostic> {
         self.published_json_diagnostics
             .get(uri)
-            .cloned()
+            .map(|snapshot| snapshot.diagnostics.clone())
             .unwrap_or_default()
     }
 
     pub fn json_diagnostics_version_for_uri(&self, uri: &Url) -> Option<Option<i32>> {
-        self.published_json_versions.get(uri).copied()
+        self.published_json_diagnostics
+            .get(uri)
+            .map(|snapshot| snapshot.version)
     }
 
     pub fn record_json_diagnostics(&mut self, uri: Url, diagnostics: Vec<Diagnostic>) {
@@ -1666,11 +1674,14 @@ impl Workspace {
     ) {
         if diagnostics.is_empty() {
             self.published_json_diagnostics.remove(&uri);
-            self.published_json_versions.remove(&uri);
         } else {
-            self.published_json_diagnostics
-                .insert(uri.clone(), diagnostics);
-            self.published_json_versions.insert(uri, version);
+            self.published_json_diagnostics.insert(
+                uri,
+                PublishedJsonDiagnosticSnapshot {
+                    diagnostics,
+                    version,
+                },
+            );
         }
     }
 
