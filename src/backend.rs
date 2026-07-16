@@ -10,8 +10,8 @@ use crate::diagnostics;
 use crate::document::{DocumentData, utf16_len, utf16_offset_to_byte_index};
 use crate::json_diagnostics::{
     JsonAnalysisTrigger, JsonDiagnosticBatch, JsonDiagnosticReport, JsonEvidenceProfile,
-    PrimaryTxtDocument, analyze_with_rules_and_profile, data_root_from_excel_txt,
-    local_path_identity as json_path_identity,
+    PrimaryTxtDocument, analyze_with_rules_profile_and_open_json, data_root_from_excel_txt,
+    data_root_from_localization_json, local_path_identity as json_path_identity,
 };
 use crate::plugin;
 use crate::scan::{ScanFailure, ScanPolicy};
@@ -196,6 +196,30 @@ impl Backend {
         identities
     }
 
+    fn is_json_uri(uri: &Url) -> bool {
+        uri.to_file_path().ok().is_some_and(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+        })
+    }
+
+    fn localization_json_uri_in_scope(workspace: &Workspace, uri: &Url) -> bool {
+        let Ok(path) = uri.to_file_path() else {
+            return false;
+        };
+        if !path.is_file() && workspace.open_json_version(uri).is_none() {
+            return false;
+        }
+        let Some(data_root) = data_root_from_localization_json(&path) else {
+            return false;
+        };
+        workspace
+            .primary_json_data_roots()
+            .iter()
+            .any(|root| same_local_path(root, &data_root))
+    }
+
     fn successful_current_json_registration_needs_catch_up(
         finished: bool,
         succeeded: bool,
@@ -287,11 +311,12 @@ impl Backend {
     ) -> bool {
         let gate = self.json_publish_gate(&batch.uri).await;
         let _guard = gate.lock().await;
-        let (current, previous) = {
+        let (current, previous, version) = {
             let workspace = self.workspace.read().await;
             (
                 Self::json_ticket_is_current(&self.settings, &workspace, ticket),
                 workspace.json_diagnostics_for_uri(&batch.uri),
+                workspace.open_json_version(&batch.uri),
             )
         };
         if !current {
@@ -304,7 +329,7 @@ impl Backend {
         let has_diagnostics = !batch.diagnostics.is_empty();
         if has_diagnostics || had_diagnostics {
             self.client
-                .publish_diagnostics(batch.uri.clone(), batch.diagnostics.clone(), None)
+                .publish_diagnostics(batch.uri.clone(), batch.diagnostics.clone(), version)
                 .await;
         }
         let mut workspace = self.workspace.write().await;
@@ -314,10 +339,11 @@ impl Backend {
             // client so a retry whose result equals the old snapshot cannot be
             // incorrectly suppressed by the unchanged-result fast path.
             workspace.record_json_diagnostics(batch.uri.clone(), Vec::new());
+            let clear_version = workspace.open_json_version(&batch.uri);
             drop(workspace);
             if has_diagnostics || had_diagnostics {
                 self.client
-                    .publish_diagnostics(batch.uri, vec![], None)
+                    .publish_diagnostics(batch.uri, vec![], clear_version)
                     .await;
             }
             return false;
@@ -365,7 +391,7 @@ impl Backend {
         {
             return true;
         }
-        let (ticket, documents) = {
+        let (ticket, documents, open_json_sources) = {
             let workspace = self.workspace.read().await;
             if workspace.scan_generation != scan_generation
                 || workspace.workspace_revision != workspace_revision
@@ -387,13 +413,20 @@ impl Backend {
                     evidence_profile: Self::json_evidence_profile(&self.settings, &workspace),
                 },
                 documents,
+                workspace.open_json_sources(),
             )
         };
 
         let evidence_profile = ticket.evidence_profile;
         let JsonDiagnosticReport { batches, warnings } =
             match tokio::task::spawn_blocking(move || {
-                analyze_with_rules_and_profile(documents, rules, trigger, evidence_profile)
+                analyze_with_rules_profile_and_open_json(
+                    documents,
+                    rules,
+                    trigger,
+                    evidence_profile,
+                    open_json_sources,
+                )
             })
             .await
             {
@@ -2159,9 +2192,31 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
-        let mutation_gate = self.publish_gate(&uri).await;
+        let is_json = Self::is_json_uri(&uri);
+        let mutation_gate = if is_json {
+            self.json_publish_gate(&uri).await
+        } else {
+            self.publish_gate(&uri).await
+        };
         let mutation_guard = mutation_gate.lock().await;
         let json_enabled = self.json_diagnostics_enabled();
+        if is_json {
+            let accepted = {
+                let mut workspace = self.workspace.write().await;
+                if json_enabled && Self::localization_json_uri_in_scope(&workspace, &uri) {
+                    workspace.accept_open_json(uri, version, params.text_document.text);
+                    true
+                } else {
+                    false
+                }
+            };
+            drop(mutation_guard);
+            if accepted {
+                self.queue_json_analysis(JsonAnalysisTrigger::All, false)
+                    .await;
+            }
+            return;
+        }
         let doc = Arc::new(DocumentData::parse(
             &params.text_document.text,
             self.settings.delimiter_char(),
@@ -2225,10 +2280,60 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        let mutation_gate = self.publish_gate(&uri).await;
+        let is_json = Self::is_json_uri(&uri);
+        let mutation_gate = if is_json {
+            self.json_publish_gate(&uri).await
+        } else {
+            self.publish_gate(&uri).await
+        };
         let mutation_guard = mutation_gate.lock().await;
         let json_enabled = self.json_diagnostics_enabled();
         let delimiter = self.settings.delimiter_char();
+
+        if is_json {
+            let update_result = {
+                let mut workspace = self.workspace.write().await;
+                if !json_enabled || !Self::localization_json_uri_in_scope(&workspace, &uri) {
+                    Err(DocumentChangeError::NotOpen)
+                } else {
+                    let existing = workspace.open_json_text(&uri).unwrap_or_default();
+                    let mut lines = existing.lines().map(str::to_owned).collect::<Vec<_>>();
+                    let mut full_text = None;
+                    for change in &params.content_changes {
+                        match change.range {
+                            Some(range) if full_text.is_none() => {
+                                apply_change(&mut lines, range, &change.text)
+                            }
+                            Some(range) => {
+                                let mut current = full_text
+                                    .take()
+                                    .unwrap_or_else(|| lines.join("\n"))
+                                    .lines()
+                                    .map(str::to_owned)
+                                    .collect::<Vec<_>>();
+                                apply_change(&mut current, range, &change.text);
+                                full_text = Some(current.join("\n"));
+                            }
+                            None => full_text = Some(change.text.clone()),
+                        }
+                    }
+                    workspace.accept_change_json(
+                        &uri,
+                        params.text_document.version,
+                        full_text.unwrap_or_else(|| lines.join("\n")),
+                    )
+                }
+            };
+            drop(mutation_guard);
+            match update_result {
+                Ok(()) => {
+                    self.queue_json_analysis(JsonAnalysisTrigger::All, false)
+                        .await
+                }
+                Err(error) => self.report_rejected_change(&uri, error).await,
+            }
+            return;
+        }
 
         // Reconstruct current text from the stored document, apply each incremental
         // change in order, then re-parse. Avoids receiving the full document over IPC.
@@ -2279,9 +2384,23 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        let mutation_gate = self.publish_gate(&uri).await;
+        let is_json = Self::is_json_uri(&uri);
+        let mutation_gate = if is_json {
+            self.json_publish_gate(&uri).await
+        } else {
+            self.publish_gate(&uri).await
+        };
         let mutation_guard = mutation_gate.lock().await;
         let json_enabled = self.json_diagnostics_enabled();
+        if is_json {
+            let closed = self.workspace.write().await.close_open_json(&uri);
+            drop(mutation_guard);
+            if closed && json_enabled {
+                self.queue_json_analysis(JsonAnalysisTrigger::All, false)
+                    .await;
+            }
+            return;
+        }
         if !self
             .workspace
             .read()
@@ -3133,6 +3252,96 @@ mod tests {
         assert!(ws.pending_json_analysis().key_usage);
         drop(ws);
         wait_for_json_analysis_worker(&workspace).await;
+        std::fs::remove_dir_all(base).unwrap();
+        socket_task.abort();
+    }
+
+    #[tokio::test]
+    async fn localization_json_open_buffer_is_versioned_and_close_restores_disk_input() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "vector-lsp-json-open-buffer-{}-{nonce}",
+            std::process::id()
+        ));
+        let excel_path = base.join("data/global/excel/skills.txt");
+        let json_path = base.join("data/local/lng/strings/skills.json");
+        std::fs::create_dir_all(excel_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(json_path.parent().unwrap()).unwrap();
+        std::fs::write(&excel_path, "skill\nnone\n").unwrap();
+        std::fs::write(&json_path, "[]").unwrap();
+        let json_uri = Url::from_file_path(&json_path).unwrap();
+
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        {
+            let mut ws = workspace.write().await;
+            ws.root_uri = Url::from_directory_path(&base).ok();
+            ws.session_generation = 102;
+            ws.scan_generation = 4;
+            ws.workspace_revision = 8;
+            ws.phase = WorkspacePhase::Ready;
+            ws.file_cache.insert(
+                excel_path,
+                Arc::new(DocumentData::parse("skill\nnone\n", '\t')),
+            );
+        }
+        let settings = Arc::new(VectorLspSettings {
+            json_diagnostics: true,
+            ..VectorLspSettings::default()
+        });
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, mut socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+        let socket_task = tokio::spawn(async move { while socket.next().await.is_some() {} });
+
+        service
+            .inner()
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem::new(
+                    json_uri.clone(),
+                    "json".to_string(),
+                    1,
+                    "[{\"id\":41001}]".to_string(),
+                ),
+            })
+            .await;
+        wait_for_json_analysis_worker(&workspace).await;
+        assert_eq!(workspace.read().await.open_json_version(&json_uri), Some(1));
+
+        service
+            .inner()
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(json_uri.clone(), 2),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "[{\"id\":41002}]".to_string(),
+                }],
+            })
+            .await;
+        wait_for_json_analysis_worker(&workspace).await;
+        let ws = workspace.read().await;
+        assert_eq!(ws.open_json_version(&json_uri), Some(2));
+        assert_eq!(ws.open_json_text(&json_uri), Some("[{\"id\":41002}]"));
+        drop(ws);
+
+        service
+            .inner()
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier::new(json_uri.clone()),
+            })
+            .await;
+        wait_for_json_analysis_worker(&workspace).await;
+        assert_eq!(workspace.read().await.open_json_version(&json_uri), None);
+
         std::fs::remove_dir_all(base).unwrap();
         socket_task.abort();
     }

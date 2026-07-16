@@ -151,6 +151,11 @@ pub struct JsonDiagnosticReport {
     pub warnings: Vec<String>,
 }
 
+/// Unsaved localization JSON buffers supplied by the editor, keyed by the
+/// normalized physical path they shadow. Physical files still establish the
+/// scope; this map only replaces their bytes while a matching tab is open.
+pub type OpenJsonSources = HashMap<String, String>;
+
 /// Selects the rule dependency set invalidated by an input event.
 ///
 /// A localization string JSON change can affect every rule. TXT and layout
@@ -254,6 +259,22 @@ pub fn analyze_with_rules_and_profile(
     trigger: JsonAnalysisTrigger,
     evidence_profile: JsonEvidenceProfile,
 ) -> JsonDiagnosticReport {
+    analyze_with_rules_profile_and_open_json(
+        primary_documents,
+        rules,
+        trigger,
+        evidence_profile,
+        OpenJsonSources::new(),
+    )
+}
+
+pub fn analyze_with_rules_profile_and_open_json(
+    primary_documents: Vec<PrimaryTxtDocument>,
+    rules: JsonDiagnosticRules,
+    trigger: JsonAnalysisTrigger,
+    evidence_profile: JsonEvidenceProfile,
+    open_json_sources: OpenJsonSources,
+) -> JsonDiagnosticReport {
     let mut grouped: HashMap<String, (PathBuf, Vec<PrimaryTxtDocument>)> = HashMap::new();
     for input in primary_documents {
         let Some(data_root) = data_root_from_excel_txt(&input.path) else {
@@ -275,9 +296,14 @@ pub fn analyze_with_rules_and_profile(
         txt_documents.sort_by(|left, right| {
             local_path_identity(&left.path).cmp(&local_path_identity(&right.path))
         });
-        let Some(mut scope_report) =
-            analyze_scope(&data_root, &txt_documents, rules, trigger, evidence_profile)
-        else {
+        let Some(mut scope_report) = analyze_scope(
+            &data_root,
+            &txt_documents,
+            rules,
+            trigger,
+            evidence_profile,
+            &open_json_sources,
+        ) else {
             continue;
         };
         report.batches.append(&mut scope_report.batches);
@@ -295,6 +321,7 @@ fn analyze_scope(
     rules: JsonDiagnosticRules,
     trigger: JsonAnalysisTrigger,
     evidence_profile: JsonEvidenceProfile,
+    open_json_sources: &OpenJsonSources,
 ) -> Option<JsonDiagnosticReport> {
     let strings_dir = data_root.join("local").join("lng").join("strings");
     let mut json_paths = direct_files_with_extension(&strings_dir, "json");
@@ -319,9 +346,18 @@ fn analyze_scope(
             continue;
         };
         observed.push(uri.clone());
-        let parsed = match trigger {
-            JsonAnalysisTrigger::All => parse_string_file(path.clone(), uri),
-            JsonAnalysisTrigger::KeyUsageOnly => parse_string_file_key_usage(path.clone(), uri),
+        let open_source = open_json_sources.get(&local_path_identity(&path)).cloned();
+        let parsed = match (trigger, open_source) {
+            (JsonAnalysisTrigger::All, Some(source)) => {
+                parse_string_source(path.clone(), uri, source)
+            }
+            (JsonAnalysisTrigger::KeyUsageOnly, Some(source)) => {
+                parse_string_source_key_usage(path.clone(), uri, source)
+            }
+            (JsonAnalysisTrigger::All, None) => parse_string_file(path.clone(), uri),
+            (JsonAnalysisTrigger::KeyUsageOnly, None) => {
+                parse_string_file_key_usage(path.clone(), uri)
+            }
         };
         match parsed {
             Ok(file) => files.push(file),
@@ -367,6 +403,10 @@ fn analyze_scope(
 fn parse_string_file(path: PathBuf, uri: Url) -> Result<StringFile, String> {
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
     let source = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    parse_string_source(path, uri, source)
+}
+
+fn parse_string_source(path: PathBuf, uri: Url, source: String) -> Result<StringFile, String> {
     let parse_source = source.strip_prefix('\u{feff}').unwrap_or(&source);
     let value: Value = serde_json::from_str(parse_source).map_err(|error| error.to_string())?;
     let Value::Array(values) = value else {
@@ -412,6 +452,14 @@ fn parse_string_file(path: PathBuf, uri: Url) -> Result<StringFile, String> {
 fn parse_string_file_key_usage(path: PathBuf, uri: Url) -> Result<StringFile, String> {
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
     let source = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    parse_string_source_key_usage(path, uri, source)
+}
+
+fn parse_string_source_key_usage(
+    path: PathBuf,
+    uri: Url,
+    source: String,
+) -> Result<StringFile, String> {
     let parse_source = source.strip_prefix('\u{feff}').unwrap_or(&source);
     if serde_json::from_str::<IgnoredAny>(parse_source).is_err() {
         // Preserve the existing user-facing serde_json<Value> error wording on
@@ -1132,6 +1180,25 @@ pub fn data_root_from_excel_txt(path: &Path) -> Option<PathBuf> {
     None
 }
 
+pub fn data_root_from_localization_json(path: &Path) -> Option<PathBuf> {
+    if !path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+    {
+        return None;
+    }
+    let strings = path.parent()?;
+    let lng = strings.parent()?;
+    let local = lng.parent()?;
+    let data = local.parent()?;
+    (path_name_is(strings, "strings")
+        && path_name_is(lng, "lng")
+        && path_name_is(local, "local")
+        && path_name_is(data, "data"))
+    .then(|| data.to_path_buf())
+}
+
 fn path_name_is(path: &Path, expected: &str) -> bool {
     path.file_name()
         .and_then(|value| value.to_str())
@@ -1265,6 +1332,50 @@ mod tests {
         let tree = TempTree::new("absent");
         let report = analyze(vec![tree.excel("skills.txt", "skill\tstr name\nA\tUsed")]);
         assert!(report.batches.is_empty());
+    }
+
+    #[test]
+    fn open_json_source_shadows_the_same_physical_file_without_creating_scope() {
+        let tree = TempTree::new("open-shadow");
+        let duplicate = complete_entry("41001", "\"Duplicate\"");
+        tree.json("skills.json", &format!("[{duplicate},{duplicate}]"));
+        let primary = vec![tree.excel("skills.txt", "skill\nnone")];
+        assert!(
+            diagnostic_messages(&analyze(primary.clone()))
+                .iter()
+                .any(|message| message.contains("duplicate id 41001"))
+        );
+
+        let json_path = tree.data_root().join("local/lng/strings/skills.json");
+        let fixed = format!(
+            "[{},{}]",
+            complete_entry("41001", "\"First\""),
+            complete_entry("41002", "\"Second\"")
+        );
+        let open_sources =
+            OpenJsonSources::from([(local_path_identity(&json_path), fixed.clone())]);
+        let report = analyze_with_rules_profile_and_open_json(
+            primary,
+            JsonDiagnosticRules::default(),
+            JsonAnalysisTrigger::All,
+            JsonEvidenceProfile::ResurrectedOrUnknown,
+            open_sources,
+        );
+        assert!(
+            !diagnostic_messages(&report)
+                .iter()
+                .any(|message| message.contains("duplicate id 41001"))
+        );
+
+        fs::remove_file(&json_path).unwrap();
+        let report_without_physical_scope = analyze_with_rules_profile_and_open_json(
+            vec![tree.excel("skills.txt", "skill\nnone")],
+            JsonDiagnosticRules::default(),
+            JsonAnalysisTrigger::All,
+            JsonEvidenceProfile::ResurrectedOrUnknown,
+            OpenJsonSources::from([(local_path_identity(&json_path), fixed)]),
+        );
+        assert!(report_without_physical_scope.batches.is_empty());
     }
 
     #[test]

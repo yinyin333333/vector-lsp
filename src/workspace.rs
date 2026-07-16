@@ -5,7 +5,8 @@ use tower_lsp::lsp_types::{Diagnostic, Location, Position, Range, Url};
 
 use crate::document::{DocumentData, utf16_len};
 use crate::json_diagnostics::{
-    PrimaryTxtDocument, data_root_from_excel_txt, local_path_identity as json_path_identity,
+    OpenJsonSources, PrimaryTxtDocument, data_root_from_excel_txt,
+    local_path_identity as json_path_identity,
 };
 use crate::plugin;
 use crate::runtime::{self, WorkspaceFileSnapshot, WorkspaceIndex};
@@ -376,6 +377,12 @@ pub enum DocumentChangeError {
     StaleVersion { current: i32, incoming: i32 },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenJsonDocument {
+    pub version: i32,
+    pub text: Arc<str>,
+}
+
 pub struct Workspace {
     pub root_uri: Option<Url>,
     pub reference_root_uri: Option<Url>,
@@ -388,6 +395,9 @@ pub struct Workspace {
     pub workspace_directory_scopes: bool,
     /// Documents currently open in the editor (managed via didOpen/didChange).
     pub open_documents: HashMap<Url, Arc<DocumentData>>,
+    /// Physical localization JSON files currently shadowed by unsaved editor
+    /// buffers. They never participate in TXT symbols or reference lookup.
+    open_json_documents: HashMap<Url, OpenJsonDocument>,
     /// All other workspace files parsed from disk on startup.
     pub file_cache: HashMap<PathBuf, Arc<DocumentData>>,
     /// Lower-priority explicit mod/workspace reference root used only while a
@@ -459,6 +469,7 @@ impl Workspace {
             include_subfolders: true,
             workspace_directory_scopes: false,
             open_documents: HashMap::new(),
+            open_json_documents: HashMap::new(),
             file_cache: HashMap::new(),
             reference_root_cache: HashMap::new(),
             fallback_cache: HashMap::new(),
@@ -1250,6 +1261,73 @@ impl Workspace {
         self.document_revisions.remove(uri);
         self.published_revisions.clear();
         removed
+    }
+
+    pub fn accept_open_json(&mut self, uri: Url, version: i32, text: String) {
+        self.open_json_documents.insert(
+            uri,
+            OpenJsonDocument {
+                version,
+                text: Arc::from(text),
+            },
+        );
+        self.bump_json_input_generation();
+    }
+
+    pub fn accept_change_json(
+        &mut self,
+        uri: &Url,
+        version: i32,
+        text: String,
+    ) -> Result<(), DocumentChangeError> {
+        let Some(current) = self.open_json_documents.get(uri) else {
+            return Err(DocumentChangeError::NotOpen);
+        };
+        if version <= current.version {
+            return Err(DocumentChangeError::StaleVersion {
+                current: current.version,
+                incoming: version,
+            });
+        }
+        self.open_json_documents.insert(
+            uri.clone(),
+            OpenJsonDocument {
+                version,
+                text: Arc::from(text),
+            },
+        );
+        self.bump_json_input_generation();
+        Ok(())
+    }
+
+    pub fn close_open_json(&mut self, uri: &Url) -> bool {
+        let removed = self.open_json_documents.remove(uri).is_some();
+        if removed {
+            self.bump_json_input_generation();
+        }
+        removed
+    }
+
+    pub fn open_json_text(&self, uri: &Url) -> Option<&str> {
+        self.open_json_documents
+            .get(uri)
+            .map(|document| document.text.as_ref())
+    }
+
+    pub fn open_json_version(&self, uri: &Url) -> Option<i32> {
+        self.open_json_documents
+            .get(uri)
+            .map(|document| document.version)
+    }
+
+    pub fn open_json_sources(&self) -> OpenJsonSources {
+        self.open_json_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                let path = uri.to_file_path().ok()?;
+                Some((json_path_identity(&path), document.text.to_string()))
+            })
+            .collect()
     }
 
     pub fn restore_closed_document(
