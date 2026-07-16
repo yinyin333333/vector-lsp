@@ -304,6 +304,15 @@ impl Backend {
         Self::json_root_identities(&workspace.primary_json_data_roots()) == ticket.scope_identities
     }
 
+    fn json_publication_matches(
+        previous: &[Diagnostic],
+        previous_version: Option<Option<i32>>,
+        next: &[Diagnostic],
+        next_version: Option<i32>,
+    ) -> bool {
+        previous == next && previous_version == Some(next_version)
+    }
+
     async fn publish_json_batch_if_current(
         &self,
         ticket: &JsonValidationTicket,
@@ -311,18 +320,20 @@ impl Backend {
     ) -> bool {
         let gate = self.json_publish_gate(&batch.uri).await;
         let _guard = gate.lock().await;
-        let (current, previous, version) = {
+        let (current, previous, previous_version, version) = {
             let workspace = self.workspace.read().await;
             (
                 Self::json_ticket_is_current(&self.settings, &workspace, ticket),
                 workspace.json_diagnostics_for_uri(&batch.uri),
+                workspace.json_diagnostics_version_for_uri(&batch.uri),
                 workspace.open_json_version(&batch.uri),
             )
         };
         if !current {
             return false;
         }
-        if previous == batch.diagnostics {
+        if Self::json_publication_matches(&previous, previous_version, &batch.diagnostics, version)
+        {
             return true;
         }
         let had_diagnostics = !previous.is_empty();
@@ -338,8 +349,12 @@ impl Backend {
             // Keep the server-side snapshot aligned with the clear sent to the
             // client so a retry whose result equals the old snapshot cannot be
             // incorrectly suppressed by the unchanged-result fast path.
-            workspace.record_json_diagnostics(batch.uri.clone(), Vec::new());
             let clear_version = workspace.open_json_version(&batch.uri);
+            workspace.record_json_diagnostics_for_version(
+                batch.uri.clone(),
+                Vec::new(),
+                clear_version,
+            );
             drop(workspace);
             if has_diagnostics || had_diagnostics {
                 self.client
@@ -348,7 +363,7 @@ impl Backend {
             }
             return false;
         }
-        workspace.record_json_diagnostics(batch.uri, batch.diagnostics);
+        workspace.record_json_diagnostics_for_version(batch.uri, batch.diagnostics, version);
         true
     }
 
@@ -3080,6 +3095,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["duplicate", "new key result"]
         );
+    }
+
+    #[test]
+    fn identical_json_diagnostics_are_republished_when_the_version_changes() {
+        let diagnostics = vec![Diagnostic {
+            message: "same diagnostics".to_string(),
+            ..Diagnostic::default()
+        }];
+
+        assert!(Backend::json_publication_matches(
+            &diagnostics,
+            Some(Some(2)),
+            &diagnostics,
+            Some(2),
+        ));
+        assert!(!Backend::json_publication_matches(
+            &diagnostics,
+            Some(None),
+            &diagnostics,
+            Some(1),
+        ));
+        assert!(!Backend::json_publication_matches(
+            &diagnostics,
+            Some(Some(1)),
+            &diagnostics,
+            Some(2),
+        ));
+        assert!(!Backend::json_publication_matches(
+            &diagnostics,
+            Some(Some(2)),
+            &diagnostics,
+            None,
+        ));
     }
 
     #[test]

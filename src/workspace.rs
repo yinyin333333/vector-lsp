@@ -436,6 +436,9 @@ pub struct Workspace {
     /// diagnostics. A `monsters.json` result must not collide with the
     /// `monsters.txt` winner or inherit its visibility rules.
     published_json_diagnostics: HashMap<Url, Vec<Diagnostic>>,
+    /// The LSP document version paired with each non-empty JSON diagnostic
+    /// snapshot. `None` is a physical-disk publication.
+    published_json_versions: HashMap<Url, Option<i32>>,
     /// Invalidates JSON analyses when an external editor changes a physical
     /// localization JSON or layout input without an LSP document version.
     json_input_generation: u64,
@@ -492,6 +495,7 @@ impl Workspace {
             published_revisions: HashMap::new(),
             published_disk_diagnostics: HashSet::new(),
             published_json_diagnostics: HashMap::new(),
+            published_json_versions: HashMap::new(),
             json_input_generation: 0,
             watched_files_dynamic_registration: false,
             watched_files_relative_pattern_support: false,
@@ -1646,11 +1650,27 @@ impl Workspace {
             .unwrap_or_default()
     }
 
+    pub fn json_diagnostics_version_for_uri(&self, uri: &Url) -> Option<Option<i32>> {
+        self.published_json_versions.get(uri).copied()
+    }
+
     pub fn record_json_diagnostics(&mut self, uri: Url, diagnostics: Vec<Diagnostic>) {
+        self.record_json_diagnostics_for_version(uri, diagnostics, None);
+    }
+
+    pub fn record_json_diagnostics_for_version(
+        &mut self,
+        uri: Url,
+        diagnostics: Vec<Diagnostic>,
+        version: Option<i32>,
+    ) {
         if diagnostics.is_empty() {
             self.published_json_diagnostics.remove(&uri);
+            self.published_json_versions.remove(&uri);
         } else {
-            self.published_json_diagnostics.insert(uri, diagnostics);
+            self.published_json_diagnostics
+                .insert(uri.clone(), diagnostics);
+            self.published_json_versions.insert(uri, version);
         }
     }
 
@@ -2132,6 +2152,28 @@ mod tests {
         workspace.record_json_diagnostics(json_uri.clone(), vec![Diagnostic::default()]);
         workspace.record_disk_diagnostics(txt_uri, true);
         assert_eq!(workspace.published_json_diagnostic_uris(), vec![json_uri]);
+    }
+
+    #[test]
+    fn json_publication_versions_follow_the_authoritative_snapshot() {
+        let mut workspace = Workspace::new();
+        let uri = Url::parse("file:///workspace/skills.json").unwrap();
+        let diagnostics = vec![Diagnostic {
+            message: "same diagnostics".to_string(),
+            ..Diagnostic::default()
+        }];
+
+        workspace.record_json_diagnostics_for_version(uri.clone(), diagnostics.clone(), None);
+        assert_eq!(workspace.json_diagnostics_version_for_uri(&uri), Some(None));
+
+        workspace.record_json_diagnostics_for_version(uri.clone(), diagnostics, Some(7));
+        assert_eq!(
+            workspace.json_diagnostics_version_for_uri(&uri),
+            Some(Some(7))
+        );
+
+        workspace.record_json_diagnostics_for_version(uri.clone(), Vec::new(), Some(7));
+        assert_eq!(workspace.json_diagnostics_version_for_uri(&uri), None);
     }
 
     #[test]

@@ -22,6 +22,31 @@ const REQUIRED_STRING_FIELDS: &[&str] = &[
     "ptBR", "ruRU", "zhCN",
 ];
 
+/// Verified ordinary string-table load order in the D2R runtime. Unknown
+/// top-level JSON files remain observable for mod diagnostics, but sort after
+/// the runtime-owned tables because the game does not enumerate them here.
+const STRING_JSON_LOAD_ORDER: &[&str] = &[
+    "bnet.json",
+    "item-gems.json",
+    "item-modifiers.json",
+    "item-nameaffixes.json",
+    "item-names.json",
+    "item-runes.json",
+    "keybinds.json",
+    "levels.json",
+    "mercenaries.json",
+    "monsters.json",
+    "npcs.json",
+    "objects.json",
+    "quests.json",
+    "shrines.json",
+    "skills.json",
+    "ui.json",
+    "ui-controller.json",
+    "vo.json",
+    "commands.json",
+];
+
 /// Runtime `LoadWorkspace` record types in d2rlint. `hiredesc.txt` is not in
 /// this list because its class and loader are commented out upstream;
 /// `moncalc.txt` has no record type there either.
@@ -212,6 +237,12 @@ struct StringFile {
     diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Debug)]
+struct LoadedStringRecord {
+    file: String,
+    entry: usize,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum JsMapKey {
     Null,
@@ -329,8 +360,8 @@ fn analyze_scope(
         return None;
     }
     json_paths.sort_by(|left, right| {
-        file_sort_key(left)
-            .cmp(&file_sort_key(right))
+        string_json_load_order_key(left)
+            .cmp(&string_json_load_order_key(right))
             .then_with(|| local_path_identity(left).cmp(&local_path_identity(right)))
     });
 
@@ -490,51 +521,34 @@ fn parse_string_source_key_usage(
 }
 
 fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity) {
-    let mut global_ids: HashMap<JsMapKey, String> = HashMap::new();
-    let mut global_keys: HashMap<JsMapKey, String> = HashMap::new();
+    let mut global_ids: HashMap<JsMapKey, LoadedStringRecord> = HashMap::new();
+    let mut global_keys: HashMap<JsMapKey, LoadedStringRecord> = HashMap::new();
     let mut composite_identity = 0usize;
 
     for file in files {
-        let mut seen_ids: HashMap<JsMapKey, usize> = HashMap::new();
-        let mut seen_keys: HashMap<JsMapKey, usize> = HashMap::new();
         for index in 0..file.entries.len() {
             let entry = &file.entries[index];
-            if let Some((id, span)) = entry.field("id") {
-                let key = js_map_key(id, &mut composite_identity);
-                if let Some(previous) = seen_ids.get(&key) {
+            let id_field = entry.field("id");
+            let key_field = entry
+                .field("Key")
+                .filter(|(value, _)| !matches!(value, Value::String(value) if value.is_empty()));
+            let id_key = id_field.map(|(id, _)| js_map_key(id, &mut composite_identity));
+            let key_key = key_field.map(|(key, _)| js_map_key(key, &mut composite_identity));
+
+            if let Some((id, span)) = id_field {
+                if json_number_outside_runtime_id_range(id) {
                     file.diagnostics.push(rule_diagnostic(
                         &file.source,
                         *span,
                         "Json/DuplicateIds",
-                        "duplicate-id",
+                        "invalid-id-range",
                         severity,
                         format!(
-                            "{}.json: duplicate id {} found on entries {} and {}",
+                            "{}.json: id {} is outside the runtime string ID range 0..65535; the game stores this namespace as uint16",
                             file.display_stem,
-                            js_string(id),
-                            previous + 1,
-                            index + 1
+                            js_string(id)
                         ),
                     ));
-                } else {
-                    seen_ids.insert(key.clone(), index);
-                    if let Some(previous_file) = global_ids.get(&key) {
-                        file.diagnostics.push(rule_diagnostic(
-                            &file.source,
-                            *span,
-                            "Json/DuplicateIds",
-                            "duplicate-id",
-                            severity,
-                            format!(
-                                "{}.json duplicate id {} found in {}.json",
-                                file.display_stem,
-                                js_string(id),
-                                previous_file
-                            ),
-                        ));
-                    } else {
-                        global_ids.insert(key, file.display_stem.clone());
-                    }
                 }
             } else {
                 file.diagnostics.push(rule_diagnostic(
@@ -551,45 +565,79 @@ fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity) {
                 ));
             }
 
-            if let Some((key_value, span)) = entry.field("Key")
-                && !matches!(key_value, Value::String(value) if value.is_empty())
+            if let (Some((id, span)), Some(id_key)) = (id_field, id_key.as_ref())
+                && let Some(previous_record) = global_ids.get(id_key)
             {
-                let key = js_map_key(key_value, &mut composite_identity);
-                if let Some(previous) = seen_keys.get(&key) {
-                    file.diagnostics.push(rule_diagnostic(
-                        &file.source,
-                        *span,
-                        "Json/DuplicateIds",
-                        "duplicate-key",
-                        severity,
+                let same_file = previous_record.file == file.display_stem;
+                file.diagnostics.push(rule_diagnostic(
+                    &file.source,
+                    *span,
+                    "Json/DuplicateIds",
+                    "duplicate-id",
+                    severity,
+                    if same_file {
                         format!(
-                            "{}.json: duplicate Key '{}' found on entries {} and {}",
+                            "{}.json: duplicate id {} found on entries {} and {}; entry {} is ignored, so neither its ID nor Key is registered",
+                            file.display_stem,
+                            js_string(id),
+                            previous_record.entry + 1,
+                            index + 1,
+                            index + 1
+                        )
+                    } else {
+                        format!(
+                            "{}.json: duplicate id {} found in {}.json; entry {} is ignored, so neither its ID nor Key is registered",
+                            file.display_stem,
+                            js_string(id),
+                            previous_record.file,
+                            index + 1
+                        )
+                    },
+                ));
+                continue;
+            }
+
+            if let (Some((key_value, span)), Some(key_key)) = (key_field, key_key.as_ref())
+                && let Some(previous_record) = global_keys.get(key_key)
+            {
+                let same_file = previous_record.file == file.display_stem;
+                file.diagnostics.push(rule_diagnostic(
+                    &file.source,
+                    *span,
+                    "Json/DuplicateIds",
+                    "duplicate-key",
+                    severity,
+                    if same_file {
+                        format!(
+                            "{}.json: duplicate Key '{}' found on entries {} and {}; entry {} is ignored, so neither its ID nor Key is registered",
                             file.display_stem,
                             js_string(key_value),
-                            previous + 1,
+                            previous_record.entry + 1,
+                            index + 1,
                             index + 1
-                        ),
-                    ));
-                } else {
-                    seen_keys.insert(key.clone(), index);
-                    if let Some(previous_file) = global_keys.get(&key) {
-                        file.diagnostics.push(rule_diagnostic(
-                            &file.source,
-                            *span,
-                            "Json/DuplicateIds",
-                            "duplicate-key",
-                            severity,
-                            format!(
-                                "{}.json duplicate key '{}' found in {}.json",
-                                file.display_stem,
-                                js_string(key_value),
-                                previous_file
-                            ),
-                        ));
+                        )
                     } else {
-                        global_keys.insert(key, file.display_stem.clone());
-                    }
-                }
+                        format!(
+                            "{}.json: duplicate Key '{}' found in {}.json; entry {} is ignored, so neither its ID nor Key is registered",
+                            file.display_stem,
+                            js_string(key_value),
+                            previous_record.file,
+                            index + 1
+                        )
+                    },
+                ));
+                continue;
+            }
+
+            let loaded = LoadedStringRecord {
+                file: file.display_stem.clone(),
+                entry: index,
+            };
+            if let Some(id_key) = id_key {
+                global_ids.insert(id_key, loaded.clone());
+            }
+            if let Some(key_key) = key_key {
+                global_keys.insert(key_key, loaded);
             }
         }
     }
@@ -851,6 +899,11 @@ fn js_map_key(value: &Value, composite_identity: &mut usize) -> JsMapKey {
             JsMapKey::Composite(identity)
         }
     }
+}
+
+fn json_number_outside_runtime_id_range(value: &Value) -> bool {
+    matches!(value, Value::Number(number)
+        if number.as_f64().is_some_and(|number| !(0.0..=65535.0).contains(&number)))
 }
 
 fn js_string(value: &Value) -> String {
@@ -1219,6 +1272,15 @@ fn file_sort_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn string_json_load_order_key(path: &Path) -> (usize, String) {
+    let file = file_sort_key(path);
+    let rank = STRING_JSON_LOAD_ORDER
+        .iter()
+        .position(|candidate| *candidate == file)
+        .unwrap_or(STRING_JSON_LOAD_ORDER.len());
+    (rank, file)
+}
+
 #[cfg(windows)]
 pub fn local_path_identity(path: &Path) -> String {
     let value = path.to_string_lossy().replace('/', "\\");
@@ -1382,14 +1444,15 @@ mod tests {
     fn duplicate_and_format_rules_preserve_js_presence_and_map_semantics() {
         let tree = TempTree::new("duplicate-format");
         let first = complete_entry("null", "null");
-        let second = complete_entry("null", "null");
+        let second = complete_entry("null", "\"RejectedWithId\"");
+        let third = complete_entry("3", "null");
         let numeric = complete_entry("1", "1");
         let string = complete_entry("\"1\"", "\"1\"");
         let empty_values = complete_entry("2", "\"\"");
         let missing = r#"{"Key":"missing"}"#;
         tree.json(
             "a.json",
-            &format!("[{first},{second},{numeric},{string},{empty_values},{missing}]"),
+            &format!("[{first},{second},{third},{numeric},{string},{empty_values},{missing}]"),
         );
         let report = analyze(vec![tree.excel("skills.txt", "skill\nnone")]);
         let messages = diagnostic_messages(&report);
@@ -1411,14 +1474,93 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("missing id on entry 6"))
+                .any(|message| message.contains("missing id on entry 7"))
         );
         assert!(
             messages.iter().any(|message| {
-                message.contains("entry 6 (missing) is missing fields: id, enUS")
+                message.contains("entry 7 (missing) is missing fields: id, enUS")
             })
         );
-        assert!(!messages.iter().any(|message| message.contains("entry 5")));
+        assert!(!messages.iter().any(|message| message.contains("entry 6")));
+    }
+
+    #[test]
+    fn duplicate_rules_follow_runtime_file_order_and_explain_first_wins() {
+        let tree = TempTree::new("runtime-string-order");
+        tree.json(
+            "commands.json",
+            &format!(
+                "[{},{},{},{},{}]",
+                complete_entry("50000", "\"RejectedIdKey\""),
+                complete_entry("60000", "\"SharedKey\""),
+                complete_entry("60000", "\"AcceptedAfterKeyRejection\""),
+                complete_entry("60001", "\"RejectedIdKey\""),
+                complete_entry("60002", "\"Unique\"")
+            ),
+        );
+        tree.json(
+            "bnet.json",
+            &format!(
+                "[{},{}]",
+                complete_entry("50000", "\"WinnerIdKey\""),
+                complete_entry("50001", "\"SharedKey\"")
+            ),
+        );
+
+        let report = analyze(vec![tree.excel("skills.txt", "skill\nnone")]);
+        let commands = report
+            .batches
+            .iter()
+            .find(|batch| batch.uri.path().ends_with("/commands.json"))
+            .unwrap();
+        assert_eq!(commands.diagnostics.len(), 2);
+        assert!(commands.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("duplicate id 50000 found in bnet.json")
+                && diagnostic
+                    .message
+                    .contains("entry 1 is ignored, so neither its ID nor Key is registered")
+        }));
+        assert!(commands.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("duplicate Key 'SharedKey' found in bnet.json")
+                && diagnostic
+                    .message
+                    .contains("entry 2 is ignored, so neither its ID nor Key is registered")
+        }));
+        let bnet = report
+            .batches
+            .iter()
+            .find(|batch| batch.uri.path().ends_with("/bnet.json"))
+            .unwrap();
+        assert!(bnet.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn duplicate_rule_reports_numeric_ids_outside_the_runtime_uint16_range() {
+        let tree = TempTree::new("runtime-id-range");
+        tree.json(
+            "skills.json",
+            &format!(
+                "[{},{},{}]",
+                complete_entry("-1", "\"Negative\""),
+                complete_entry("65535", "\"Boundary\""),
+                complete_entry("65536", "\"Overflow\"")
+            ),
+        );
+
+        let messages = diagnostic_messages(&analyze(vec![tree.excel("skills.txt", "skill\nnone")]));
+        assert!(messages.iter().any(|message| {
+            message.contains("id -1 is outside the runtime string ID range 0..65535")
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.contains("id 65535 is outside the runtime string ID range")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.contains("id 65536 is outside the runtime string ID range 0..65535")
+        }));
     }
 
     #[test]
@@ -1692,7 +1834,7 @@ mod tests {
         let tree = TempTree::new("ranges");
         tree.json(
             "emoji.json",
-            "\u{feff}[\r\n  {\"id\":1,\"Key\":\"🙂\"},\r\n  {\"id\":1,\"Key\":\"🙂\"}\r\n]",
+            "\u{feff}[\r\n  {\"id\":1,\"Key\":\"🙂\"},\r\n  {\"id\":1,\"Key\":\"Other\"},\r\n  {\"id\":2,\"Key\":\"🙂\"}\r\n]",
         );
         let metadata = tree.data_root().join("local/lng/strings/metadata");
         fs::create_dir_all(&metadata).unwrap();
@@ -1711,7 +1853,7 @@ mod tests {
             .iter()
             .find(|diagnostic| diagnostic.message.contains("duplicate Key"))
             .unwrap();
-        assert_eq!(duplicate_key.range.start.line, 2);
+        assert_eq!(duplicate_key.range.start.line, 3);
         assert_eq!(duplicate_key.range.start.character, 16);
         assert_eq!(duplicate_key.range.end.character, 20); // quotes + surrogate pair
     }
@@ -1720,9 +1862,10 @@ mod tests {
     fn compact_bom_json_ranges_start_at_editor_visible_columns() {
         let tree = TempTree::new("compact-bom-range");
         let visible_json = format!(
-            "[{},{}]",
+            "[{},{},{}]",
             complete_entry("1", "\"A\""),
-            complete_entry("1", "\"A\"")
+            complete_entry("1", "\"B\""),
+            complete_entry("2", "\"A\"")
         );
         tree.json("compact.json", &format!("\u{feff}{visible_json}"));
         let report = analyze(vec![tree.excel("skills.txt", "name\nnone")]);
