@@ -9,7 +9,10 @@ use tower_lsp::lsp_types::Url;
 
 use crate::document::DocumentData;
 use crate::schema::{Schema, format_description};
-use crate::source_selection::effective_workspace_sources;
+use crate::source_selection::{
+    EffectiveSource, effective_workspace_sources, effective_workspace_sources_with_fallback,
+};
+use crate::workspace::fixed4_key;
 
 // ---------------------------------------------------------------------------
 // WorkspaceFileSnapshot — per-file DocumentData references for plugin ops
@@ -21,12 +24,21 @@ use crate::source_selection::effective_workspace_sources;
 pub struct WorkspaceFileSnapshot {
     /// Lowercase stem → parsed document.
     pub files: HashMap<String, Arc<DocumentData>>,
+    pub sources: HashMap<String, WorkspaceSourceInfo>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSourceInfo {
+    pub kind: String,
+    pub version: Option<String>,
 }
 
 impl WorkspaceFileSnapshot {
     pub fn new() -> Self {
         Self {
             files: HashMap::new(),
+            sources: HashMap::new(),
         }
     }
 }
@@ -40,6 +52,7 @@ impl WorkspaceFileSnapshot {
 pub struct WorkspaceIndex {
     /// Value existence index: `(file_stem_lowercase, col_name)` → set of values.
     data: HashMap<(String, String), HashSet<String>>,
+    fixed4_data: HashMap<(String, String), HashSet<String>>,
     /// Ordered header list per file (open-doc entries shadow cache entries).
     columns: HashMap<String, Vec<String>>,
 }
@@ -48,32 +61,47 @@ impl WorkspaceIndex {
     pub fn new() -> Self {
         Self {
             data: HashMap::new(),
+            fixed4_data: HashMap::new(),
             columns: HashMap::new(),
         }
     }
 
     fn insert(&mut self, file: &str, col: &str, value: String) {
+        let key = (file.to_ascii_lowercase(), col.to_ascii_lowercase());
         self.data
-            .entry((file.to_lowercase(), col.to_lowercase()))
+            .entry(key.clone())
             .or_default()
-            .insert(value.to_lowercase());
+            .insert(value.to_ascii_lowercase());
+        if col.eq_ignore_ascii_case("code") {
+            self.fixed4_data
+                .entry(key)
+                .or_default()
+                .insert(fixed4_key(&value));
+        }
     }
 
     pub fn lookup(&self, file: &str, col: &str, value: &str) -> bool {
         self.data
-            .get(&(file.to_lowercase(), col.to_lowercase()))
-            .map(|s| s.contains(&value.to_lowercase()))
+            .get(&(file.to_ascii_lowercase(), col.to_ascii_lowercase()))
+            .map(|s| s.contains(&value.to_ascii_lowercase()))
+            .unwrap_or(false)
+    }
+
+    pub fn lookup_fixed4(&self, file: &str, col: &str, value: &str) -> bool {
+        self.fixed4_data
+            .get(&(file.to_ascii_lowercase(), col.to_ascii_lowercase()))
+            .map(|values| values.contains(&fixed4_key(value)))
             .unwrap_or(false)
     }
 
     /// Return the 0-based header position of `col` in `file`, or `None`.
     /// The comparison is case-insensitive.
     pub fn column_index(&self, file: &str, col: &str) -> Option<usize> {
-        let col_lower = col.to_lowercase();
+        let col_lower = col.to_ascii_lowercase();
         self.columns
-            .get(&file.to_lowercase())?
+            .get(&file.to_ascii_lowercase())?
             .iter()
-            .position(|h| h.to_lowercase() == col_lower)
+            .position(|h| h.to_ascii_lowercase() == col_lower)
     }
 
     pub fn has_lookup_target(&self, file: &str, col: &str) -> bool {
@@ -96,9 +124,38 @@ pub fn build_workspace_index(
     Arc::new(idx)
 }
 
+pub fn build_workspace_index_with_fallback(
+    open_docs: &HashMap<Url, Arc<DocumentData>>,
+    file_cache: &HashMap<PathBuf, Arc<DocumentData>>,
+    fallback_cache: &HashMap<String, Arc<DocumentData>>,
+    workspace_present_stems: &HashSet<String>,
+    fallback_version: Option<&str>,
+) -> Arc<WorkspaceIndex> {
+    let mut idx = WorkspaceIndex::new();
+    for source in effective_workspace_sources_with_fallback(
+        open_docs,
+        file_cache,
+        fallback_cache,
+        workspace_present_stems,
+        fallback_version,
+    ) {
+        index_doc(&mut idx, &source.stem, &source.document);
+    }
+    Arc::new(idx)
+}
+
+pub fn build_workspace_index_from_sources(sources: &[EffectiveSource]) -> Arc<WorkspaceIndex> {
+    let mut index = WorkspaceIndex::new();
+    for source in sources {
+        index_doc(&mut index, &source.stem, &source.document);
+    }
+    Arc::new(index)
+}
+
 fn index_doc(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
     // Record ordered header list (last write wins, so open docs beat cache).
-    idx.columns.insert(stem.to_lowercase(), doc.headers.clone());
+    idx.columns
+        .insert(stem.to_ascii_lowercase(), doc.headers.clone());
 
     for row in &doc.rows {
         if row
@@ -141,6 +198,19 @@ pub fn op_lookup_key(
         .unwrap_or(false)
 }
 
+#[op2(nofast)]
+pub fn op_lookup_key_fixed4(
+    state: &OpState,
+    #[string] file: &str,
+    #[string] col: &str,
+    #[string] value: &str,
+) -> bool {
+    state
+        .try_borrow::<Arc<WorkspaceIndex>>()
+        .map(|idx| idx.lookup_fixed4(file, col, value))
+        .unwrap_or(false)
+}
+
 #[derive(serde::Serialize)]
 struct ColumnInfo {
     /// 0-based position of this column in the file's header row.
@@ -166,8 +236,19 @@ pub fn op_get_column(
 pub fn op_has_file(state: &OpState, #[string] stem: &str) -> bool {
     state
         .try_borrow::<Arc<WorkspaceFileSnapshot>>()
-        .map(|snap| snap.files.contains_key(&stem.to_lowercase()))
+        .map(|snap| snap.files.contains_key(&stem.to_ascii_lowercase()))
         .unwrap_or(false)
+}
+
+#[op2]
+#[serde]
+pub fn op_get_workspace_source(
+    state: &OpState,
+    #[string] stem: &str,
+) -> Option<WorkspaceSourceInfo> {
+    state
+        .try_borrow::<Arc<WorkspaceFileSnapshot>>()
+        .and_then(|snapshot| snapshot.sources.get(&stem.to_ascii_lowercase()).cloned())
 }
 
 /// Return true when the workspace contains `file` with column `col`.
@@ -209,14 +290,14 @@ pub fn op_get_column_values(
     let Some(snap) = state.try_borrow::<Arc<WorkspaceFileSnapshot>>() else {
         return vec![];
     };
-    let Some(doc) = snap.files.get(&stem.to_lowercase()) else {
+    let Some(doc) = snap.files.get(&stem.to_ascii_lowercase()) else {
         return vec![];
     };
-    let col_lower = col.to_lowercase();
+    let col_lower = col.to_ascii_lowercase();
     let Some(col_idx) = doc
         .headers
         .iter()
-        .position(|h| h.to_lowercase() == col_lower)
+        .position(|h| h.to_ascii_lowercase() == col_lower)
     else {
         return vec![];
     };
@@ -234,6 +315,44 @@ pub fn op_get_column_values(
         .collect()
 }
 
+/// Return the first physical line whose column value matches using the same
+/// ASCII case-insensitive name-map semantics as `lookupKey`.
+#[derive(serde::Serialize)]
+struct FirstColumnValueLine {
+    line: u32,
+}
+
+#[op2]
+#[serde]
+pub fn op_get_first_column_value_line(
+    state: &OpState,
+    #[string] stem: &str,
+    #[string] col: &str,
+    #[string] value: &str,
+) -> Option<FirstColumnValueLine> {
+    let snapshot = state.try_borrow::<Arc<WorkspaceFileSnapshot>>()?;
+    let doc = snapshot.files.get(&stem.to_ascii_lowercase())?;
+    let col_idx = doc
+        .headers
+        .iter()
+        .position(|header| header.eq_ignore_ascii_case(col))?;
+    doc.rows
+        .iter()
+        .filter(|row| {
+            !row.cells
+                .first()
+                .map(|cell| cell.value.trim_start().starts_with('*'))
+                .unwrap_or(false)
+        })
+        .find(|row| {
+            row.cells
+                .get(col_idx)
+                .map(|cell| cell.value.eq_ignore_ascii_case(value))
+                .unwrap_or(false)
+        })
+        .map(|row| FirstColumnValueLine { line: row.line })
+}
+
 /// Return non-empty values from `value_col` in file `stem` where `filter_col == filter_value`.
 /// Callable from JS as `Deno.core.ops.op_get_filtered_column_values(stem, valueCol, filterCol, filterValue)`.
 #[op2]
@@ -248,7 +367,7 @@ pub fn op_get_filtered_column_values(
     let Some(snap) = state.try_borrow::<Arc<WorkspaceFileSnapshot>>() else {
         return vec![];
     };
-    let Some(doc) = snap.files.get(&stem.to_lowercase()) else {
+    let Some(doc) = snap.files.get(&stem.to_ascii_lowercase()) else {
         return vec![];
     };
     let Some(vi) = doc
@@ -398,9 +517,12 @@ extension!(
     vlsp_ops,
     ops = [
         op_lookup_key,
+        op_lookup_key_fixed4,
         op_get_column,
         op_has_file,
+        op_get_workspace_source,
         op_get_column_values,
+        op_get_first_column_value_line,
         op_get_filtered_column_values,
         op_get_enum_table,
         op_get_ctx_json,

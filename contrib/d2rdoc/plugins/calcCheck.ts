@@ -87,7 +87,9 @@ const BBE_FIELDS: Record<string, Record<string, string[]>> = {
     },
 };
 
-// xcalc file providing scope-level bare identifiers; null = no identifiers in scope.
+// xcalc file providing a closed set of scope-level bare identifiers.
+// null means that the callback does not expose a closed dictionary, so bare
+// identifiers are left to the binary resolver while syntax is still checked.
 const SCOPE_CALC_FILE: Record<string, string | null> = {
     "Skill scope BBE":          "skillcalc",
     "Missile scope BBE":        "misscalc",
@@ -96,11 +98,32 @@ const SCOPE_CALC_FILE: Record<string, string | null> = {
     "Treasure Class scope BBE": null,
 };
 
-// Known condition names for cond().
-const VALID_COND_NAMES: Record<string, boolean> = {
+// Binary resolver condition names and their total arity (including the quoted
+// condition-name argument).  Both function and condition-name comparisons are
+// ASCII case-insensitive.
+const COND_ARITY: Record<string, number> = {
+    istype: 2,
+    isclass: 2,
+    monstertestelite: 2,
+    itemistype: 2,
+    itemismodtype: 2,
+    difficulty: 2,
+    desecrated: 1,
+    isdesecratedzonesenabled: 1,
+};
+
+// MonPet calc was explicitly outside the binary revalidation scope.  Preserve
+// its pre-existing semantic allowlist until that loader is audited separately.
+const LEGACY_MONSTER_COND_NAMES: Record<string, boolean> = {
     IsType: true, IsClass: true, Desecrated: true, Difficulty: true,
-    MonsterTestElite: true, ItemIsType: true, ItemIsModType: true, MonsterHasMod: true,
-    IsDesecratedZonesEnabled: true,
+    MonsterTestElite: true, ItemIsType: true, ItemIsModType: true,
+    MonsterHasMod: true, IsDesecratedZonesEnabled: true,
+};
+
+const FIXED_FUNC_ARITY: Record<string, number> = {
+    min: 2, max: 2, rand: 2,
+    skill: 2, miss: 2, stat: 2,
+    sklvl: 3, sksrc: 2,
 };
 
 // Valid parameters for stat().
@@ -133,6 +156,8 @@ interface CalcParseError {
     tokenStart?: number;
     tokenEnd?: number;
     hint?: string;
+    consumedPrefix?: string;
+    ignoredSuffix?: string;
 }
 
 interface NormalizedText {
@@ -149,6 +174,8 @@ interface CalcErrorMeta {
     tokenStart?: number;
     tokenEnd?: number;
     hint?: string;
+    consumedPrefix?: string;
+    ignoredSuffix?: string;
 }
 
 const TOKEN_LABELS: Record<string, string> = {
@@ -196,6 +223,8 @@ function calcError(
         if (meta.tokenStart !== undefined) err.tokenStart = meta.tokenStart;
         if (meta.tokenEnd !== undefined) err.tokenEnd = meta.tokenEnd;
         if (meta.hint !== undefined) err.hint = meta.hint;
+        if (meta.consumedPrefix !== undefined) err.consumedPrefix = meta.consumedPrefix;
+        if (meta.ignoredSuffix !== undefined) err.ignoredSuffix = meta.ignoredSuffix;
     }
     return err;
 }
@@ -431,14 +460,19 @@ function tokenize(src: string): Token[] | CalcParseError {
 interface ParseState {
     tokens: Token[];
     pos: number;
-    // null  = xcalc absent → skip bare-identifier validation (avoid false positives).
-    // empty Set = Item/TC scope → any bare identifier is an error.
+    // null = no closed dictionary (including Item/TC) → defer bare identifiers.
+    // non-empty Set = validate top-level bare identifiers against that scope.
     scopeIds: Set<string> | null;
+    // Missile bare identifiers use the binary's packed first-four-byte,
+    // space-padded, case-sensitive MissCalc.code lookup. Other scopes retain
+    // their existing identifier semantics.
+    missileBareIdentifiers: boolean;
     // Always-available identifier sets for use inside skill() / miss() calls.
     skillIds: Set<string>;
     missIds: Set<string>;
     // >0 means we are inside function argument list(s); skip bare-ident scope check.
     funcDepth: number;
+    enforceRevalidatedFunctions: boolean;
 }
 
 function peek(st: ParseState): Token { return st.tokens[st.pos]; }
@@ -545,7 +579,10 @@ function parsePrimary(st: ParseState): CalcParseError | null {
             return eat(st, "RPAREN");
         }
         // Bare identifier: validate against scope when at the top-level expression.
-        if (st.funcDepth === 0 && st.scopeIds !== null && !st.scopeIds.has(tok.value)) {
+        const scopeIdentifier = st.missileBareIdentifiers
+            ? missileBareIdentifierKey(tok.value)
+            : tok.value;
+        if (st.funcDepth === 0 && st.scopeIds !== null && !st.scopeIds.has(scopeIdentifier)) {
             return calcError(
                 "unknownIdentifier",
                 `Unknown identifier '${tok.value}' for this BBE scope`,
@@ -568,10 +605,111 @@ function parsePrimary(st: ParseState): CalcParseError | null {
     return tokenError("calc.unexpected-token", `Unexpected token '${tok.value}'`, tok);
 }
 
-function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null {
-    if (check(st, "RPAREN")) return null; // zero-arg (defensive)
+function validateFunctionArity(
+    funcName: string,
+    condName: string | null,
+    actual: number,
+    tok: Token,
+    enforce: boolean,
+): CalcParseError | null {
+    if (!enforce) return null;
+    const expected = funcName === "cond" && condName !== null
+        ? COND_ARITY[condName.toLowerCase()]
+        : FIXED_FUNC_ARITY[funcName];
+    if (expected === undefined || expected === actual) return null;
+    return tokenError(
+        "calc.wrong-arity",
+        `Function '${funcName}()' expects ${expected} argument${expected === 1 ? "" : "s"}, got ${actual}`,
+        tok,
+        "invalid-argument",
+        {
+            expected: String(expected),
+            actual: String(actual),
+            hint: `Use exactly ${expected} argument${expected === 1 ? "" : "s"}.`,
+        },
+    );
+}
+
+// Keep MonPet on the exact pre-revalidation argument grammar.  Its calc
+// consumer was not part of this binary audit, so even defensive quirks such as
+// accepting quoted-style zero-argument calls and stopping after one optional
+// quoted-style expression argument remain unchanged.
+function parseLegacyMonPetFuncArgs(st: ParseState, funcName: string): CalcParseError | null {
+    if (check(st, "RPAREN")) return null;
 
     if (QUOTED_ARG_FUNCS[funcName] || check(st, "QUOTED")) {
+        if (!check(st, "QUOTED")) {
+            const t = peek(st);
+            return tokenError(
+                "calc.expected-quoted-argument",
+                `Expected quoted string as first argument of '${funcName}()'`,
+                t,
+                "invalid-argument",
+                { expected: "quoted string" },
+            );
+        }
+        const quotedTok = advance(st);
+        const quotedVal = quotedTok.value.slice(1, -1);
+
+        const nameErr = validateQuotedName(funcName, quotedVal, quotedTok, false);
+        if (nameErr) return nameErr;
+
+        const dotIdents: Token[] = [];
+        while (check(st, "DOT")) {
+            advance(st);
+            if (!check(st, "IDENT") && !check(st, "NUM")) {
+                const t = peek(st);
+                return tokenError(
+                    "calc.expected-dot-identifier",
+                    "Expected identifier after '.'",
+                    t,
+                    "invalid-argument",
+                    { expected: "identifier" },
+                );
+            }
+            dotIdents.push(advance(st));
+        }
+
+        const dotErr = validateDotIdents(funcName, dotIdents, st);
+        if (dotErr) return dotErr;
+
+        if (check(st, "COMMA")) {
+            advance(st);
+            const err = parseExpr(st);
+            if (err) return err;
+        }
+
+        return null;
+    }
+
+    let err = parseExpr(st);
+    if (err) return err;
+    while (check(st, "COMMA")) {
+        advance(st);
+        err = parseExpr(st);
+        if (err) return err;
+    }
+    return null;
+}
+
+function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null {
+    if (!st.enforceRevalidatedFunctions) return parseLegacyMonPetFuncArgs(st, funcName);
+    const funcLower = st.enforceRevalidatedFunctions ? funcName.toLowerCase() : funcName;
+
+    if (check(st, "RPAREN")) {
+        if (QUOTED_ARG_FUNCS[funcLower]) {
+            return tokenError(
+                "calc.expected-quoted-argument",
+                `Expected quoted string as first argument of '${funcName}()'`,
+                peek(st),
+                "invalid-argument",
+                { expected: "quoted string" },
+            );
+        }
+        return validateFunctionArity(funcLower, null, 0, peek(st), st.enforceRevalidatedFunctions);
+    }
+
+    if (QUOTED_ARG_FUNCS[funcLower] || check(st, "QUOTED")) {
         // Quoted-string style: QUOTED ('.' (IDENT | NUM))* (',' expr)?
         if (!check(st, "QUOTED")) {
             const t = peek(st);
@@ -589,7 +727,7 @@ function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null 
         const quotedTok = advance(st);
         const quotedVal = quotedTok.value.slice(1, -1); // strip surrounding ' '
 
-        const nameErr = validateQuotedName(funcName, quotedVal, quotedTok);
+        const nameErr = validateQuotedName(funcLower, quotedVal, quotedTok, st.enforceRevalidatedFunctions);
         if (nameErr) return nameErr;
 
         // Collect dot-separated identifiers / numbers
@@ -612,33 +750,41 @@ function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null 
             dotIdents.push(advance(st));
         }
 
-        const dotErr = validateDotIdents(funcName, dotIdents, st);
+        const dotErr = validateDotIdents(funcLower, dotIdents, st);
         if (dotErr) return dotErr;
 
-        // cond() accepts an optional second argument after a comma
-        if (check(st, "COMMA")) {
+        let argCount = 1 + dotIdents.length;
+        while (check(st, "COMMA")) {
             advance(st);
             const err = parseExpr(st);
             if (err) return err;
+            argCount++;
         }
 
-        return null;
+        return validateFunctionArity(funcLower, quotedVal, argCount, peek(st), st.enforceRevalidatedFunctions);
     }
 
     // Expression-list style: min / max / rand / unknown functions
+    let argCount = 1;
     let err = parseExpr(st);
     if (err) return err;
     while (check(st, "COMMA")) {
         advance(st);
         err = parseExpr(st);
         if (err) return err;
+        argCount++;
     }
-    return null;
+    return validateFunctionArity(funcLower, null, argCount, peek(st), st.enforceRevalidatedFunctions);
 }
 
 // ─── Function argument validation ─────────────────────────────────────────────
 
-function validateQuotedName(funcName: string, name: string, tok: Token): CalcParseError | null {
+function validateQuotedName(
+    funcName: string,
+    name: string,
+    tok: Token,
+    enforceRevalidatedFunctions: boolean,
+): CalcParseError | null {
     if (funcName === "skill" || funcName === "sksrc" || funcName === "sklvl") {
         if (hasFile("skills") && !lookupKey("skills", "skill", name)) {
             return calcError("unknownSkill", `Unknown skill '${name}'`, tok.pos, tok.value.length);
@@ -652,7 +798,10 @@ function validateQuotedName(funcName: string, name: string, tok: Token): CalcPar
             return calcError("unknownStat", `Unknown stat '${name}'`, tok.pos, tok.value.length);
         }
     } else if (funcName === "cond") {
-        if (!VALID_COND_NAMES[name]) {
+        const known = enforceRevalidatedFunctions
+            ? COND_ARITY[name.toLowerCase()] !== undefined
+            : !!LEGACY_MONSTER_COND_NAMES[name];
+        if (!known) {
             return calcError("unknownCondition", `Unknown condition '${name}'`, tok.pos, tok.value.length);
         }
     }
@@ -717,6 +866,75 @@ function loadCalcIds(stem: string): Set<string> {
     return new Set(getColumnValues(stem, "code").filter((v: string) => v.trim()));
 }
 
+// The audited byte lexer returns its EOF/null path for this unsupported ASCII
+// punctuation byte. Keep this intentionally finite: other punctuation and
+// non-ASCII input remain hard syntax cases unless separately revalidated.
+const REVALIDATED_PREFIX_STOP_CHARS: Record<string, true> = {
+    "%": true,
+};
+
+function findRevalidatedPrefixStop(src: string): number {
+    let inQuote = false;
+    for (let index = 0; index < src.length; index++) {
+        const ch = src[index];
+        if (ch === "'") {
+            inQuote = !inQuote;
+            continue;
+        }
+        if (inQuote) continue;
+        const pair = src.slice(index, index + 2);
+        if (pair === "<=" || pair === ">=" || pair === "==" || pair === "!=") {
+            index++;
+            continue;
+        }
+        if (REVALIDATED_PREFIX_STOP_CHARS[ch]) return index;
+    }
+    return -1;
+}
+
+function decimalPolicyError(
+    source: string,
+    tokens: Token[],
+    confirmedSkillDescDisplay: boolean,
+): CalcParseError | null {
+    const decimal = tokens.find((token) => token.type === "NUM" && token.value.indexOf(".") !== -1);
+    if (!decimal) return null;
+    const decimalOffset = decimal.value.indexOf(".");
+    if (confirmedSkillDescDisplay) {
+        const suffixStart = decimal.pos + decimalOffset;
+        const consumedPrefix = source.slice(0, suffixStart);
+        const ignoredSuffix = source.slice(suffixStart);
+        return calcError(
+            "calc.skilldesc-decimal-prefix",
+            `Decimal values are not supported here. The game reads '${source}' as '${consumedPrefix}' and ignores '${ignoredSuffix}'. Use an integer expression that matches your intent.`,
+            decimal.pos,
+            decimal.value.length,
+            "decimal-policy",
+            {
+                actual: decimal.value,
+                tokenStart: decimal.pos,
+                tokenEnd: decimal.pos + decimal.value.length,
+                hint: "Use an integer expression that matches your intent.",
+                consumedPrefix,
+                ignoredSuffix,
+            },
+        );
+    }
+    return calcError(
+        "calc.decimal-policy",
+        `Decimal value '${decimal.value}' may not work as written here. Use an integer expression unless this field is known to support decimals.`,
+        decimal.pos,
+        decimal.value.length,
+        "decimal-policy",
+        {
+            actual: decimal.value,
+            tokenStart: decimal.pos,
+            tokenEnd: decimal.pos + decimal.value.length,
+            hint: "Use an integer expression unless this field is known to support decimals.",
+        },
+    );
+}
+
 // ─── Formula entry point ──────────────────────────────────────────────────────
 
 function parseBBE(
@@ -724,28 +942,83 @@ function parseBBE(
     scopeIds: Set<string> | null,
     skillIds: Set<string>,
     missIds: Set<string>,
+    enforceRevalidatedFunctions: boolean,
+    missileBareIdentifiers: boolean,
+    confirmedSkillDescDisplay: boolean,
 ): CalcParseError | null {
     // Strip outer double-quotes that some editors wrap around cell formulas.
     const normalized = normalizeFormula(raw);
     const src = normalized.text;
     if (!src) return null;
 
-    const result = tokenize(src);
+    // Unsupported ASCII punctuation can take the binary lexer's EOF/null path.
+    // Only report prefix compilation after the preceding text parses on its
+    // own; leading unsupported input and malformed prefixes remain failures.
+    const prefixStop = enforceRevalidatedFunctions ? findRevalidatedPrefixStop(src) : -1;
+    const parseSrc = prefixStop === -1 ? src : src.slice(0, prefixStop);
+    const prefixStopWarning = () => mapParseError(
+        calcError(
+            "calc.prefix-stop",
+            `Character '${src[prefixStop]}' is not supported here. The game uses the valid part before it and ignores the rest. Rewrite the expression if the ignored part is intended to run.`,
+            prefixStop,
+            1,
+            "ignored-suffix",
+            {
+                actual: src[prefixStop],
+                tokenStart: prefixStop,
+                tokenEnd: prefixStop + 1,
+                hint: "Rewrite the expression if the ignored part is intended to run.",
+            },
+        ),
+        normalized,
+    );
+    if (prefixStop === 0) {
+        return mapParseError(
+            calcError(
+                "calc.unexpected-character",
+                `Unexpected character '${src[prefixStop]}' before any valid calc prefix`,
+                prefixStop,
+                1,
+                "unexpected-character",
+                {
+                    actual: src[prefixStop],
+                    tokenStart: prefixStop,
+                    tokenEnd: prefixStop + 1,
+                },
+            ),
+            normalized,
+        );
+    }
+
+    const result = tokenize(parseSrc);
     if (!Array.isArray(result)) return mapParseError(result, normalized);
 
     const st: ParseState = {
         tokens: result, pos: 0,
-        scopeIds, skillIds, missIds,
+        scopeIds, skillIds, missIds, missileBareIdentifiers,
         funcDepth: 0,
+        enforceRevalidatedFunctions,
     };
     const err = parseExpr(st);
-    if (err) return mapParseError(err, normalized);
+    if (err) {
+        // A missing final ')' is itself prefix-compatible in the binary.  When
+        // an unsupported suffix follows that prefix, lexer stop is more precise.
+        if (prefixStop !== -1 && err.code === "calc.expected-rparen.eof") {
+            return prefixStopWarning();
+        }
+        return mapParseError(err, normalized);
+    }
     if (!check(st, "EOF")) {
         const t = peek(st);
         return mapParseError(
             tokenError("calc.unexpected-token", `Unexpected token '${t.value}'`, t),
             normalized,
         );
+    }
+    if (prefixStop !== -1) return prefixStopWarning();
+    if (enforceRevalidatedFunctions) {
+        const decimalWarning = decimalPolicyError(parseSrc, result, confirmedSkillDescDisplay);
+        if (decimalWarning) return mapParseError(decimalWarning, normalized);
     }
     return null;
 }
@@ -773,7 +1046,75 @@ function calcDiagnosticData(err: CalcParseError): Record<string, string | number
     addDiagnosticData(data, "tokenStart", err.tokenStart);
     addDiagnosticData(data, "tokenEnd", err.tokenEnd);
     addDiagnosticData(data, "hint", err.hint);
+    addDiagnosticData(data, "consumedPrefix", err.consumedPrefix);
+    addDiagnosticData(data, "ignoredSuffix", err.ignoredSuffix);
     return data;
+}
+
+type SkillParamAlias = {
+    identifier: string;
+    interpretedAs: string;
+    suggestion: string;
+    parameter: string;
+};
+
+function skillParamAlias(
+    identifier: string,
+    selectedVersion: string | undefined,
+    skillIds: Set<string>,
+): SkillParamAlias | null {
+    if (selectedVersion !== "3.1" && selectedVersion !== "3.2") return null;
+    const match = /^par(1[0-9]|20)$/.exec(identifier);
+    if (!match) return null;
+    const parameterNumber = Number(match[1]);
+    const interpretedAs = identifier.slice(0, 4);
+    const suggestion = `pa${parameterNumber}`;
+    if (!skillIds.has(interpretedAs) || !skillIds.has(suggestion)) return null;
+    return {
+        identifier,
+        interpretedAs,
+        suggestion,
+        parameter: `Param${parameterNumber}`,
+    };
+}
+
+function skillParamAliasMessage(alias: SkillParamAlias): string {
+    return `${alias.identifier} is interpreted as ${alias.interpretedAs} because SkillCalc identifiers use only the first four characters. Use ${alias.suggestion} to reference ${alias.parameter}.`;
+}
+
+function skillParamAliasDiagnosticData(
+    err: CalcParseError,
+    alias: SkillParamAlias,
+): Record<string, string | number> {
+    const data = calcDiagnosticData(err);
+    data.kind = "identifier-alias";
+    data.scope = "Skill scope BBE";
+    data.identifier = alias.identifier;
+    data.interpretedAs = alias.interpretedAs;
+    data.suggestion = alias.suggestion;
+    data.parameter = alias.parameter;
+    data.lookup = "first-four-byte exact case-sensitive";
+    data.hint = `Use ${alias.suggestion} to reference ${alias.parameter}.`;
+    return data;
+}
+
+function missileUnknownDiagnosticData(
+    err: CalcParseError,
+    identifier: string,
+): Record<string, string | number> {
+    const data = calcDiagnosticData(err);
+    data.scope = "Missile scope BBE";
+    data.identifier = identifier;
+    data.namespace = "MissCalc.code";
+    data.lookup = "first-four-byte exact case-sensitive";
+    data.resolverResult = -1;
+    data.binaryFallback = "integer constant 0";
+    data.compileEffect = "remaining formula continues";
+    return data;
+}
+
+function missileBareIdentifierKey(identifier: string): string {
+    return identifier.slice(0, 4).padEnd(4, " ");
 }
 
 function validate(ctx: PluginContext): PluginDiagnostic[] {
@@ -784,6 +1125,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
     const skillIds = loadCalcIds("skillcalc");
     const missIds  = loadCalcIds("misscalc");
     const monIds   = loadCalcIds("moncalc");
+    const selectedVersion = getWorkspaceSource(ctx.file)?.version;
 
     const diags: PluginDiagnostic[] = [];
 
@@ -792,19 +1134,27 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
         const calcFile: string | null | undefined = SCOPE_CALC_FILE[scope];
 
         let scopeIds: Set<string> | null;
+        const missileBareIdentifiers = scope === "Missile scope BBE";
         if (typeof calcFile === "string") {
             // Use the loaded ids. If the file is absent (empty set), skip
             // identifier validation rather than flooding with false positives.
             let ids: Set<string>;
             if (calcFile === "skillcalc")      ids = skillIds;
-            else if (calcFile === "misscalc")  ids = missIds;
+            else if (calcFile === "misscalc") {
+                ids = new Set();
+                for (const identifier of missIds) {
+                    ids.add(missileBareIdentifierKey(identifier));
+                }
+            }
             else if (calcFile === "moncalc")   ids = monIds;
             else                               ids = new Set();
             scopeIds = ids.size > 0 ? ids : null;
         } else {
-            // null = Item / TC scope: no bare identifiers allowed.
-            // Use an empty Set so any bare identifier is flagged as an error.
-            scopeIds = new Set();
+            // Item / TC resolvers have a binary fallback, not a closed xcalc
+            // dictionary.  Do not turn the absence of a dictionary into an
+            // empty allowlist; keep the parser checks and defer identifier
+            // resolution to the engine.
+            scopeIds = null;
         }
 
         // Expand '#' patterns into concrete column names.
@@ -826,18 +1176,56 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                 const val = row[col] as string | undefined;
                 if (!val || !val.trim()) continue;
 
-                const err = parseBBE(val, scopeIds, skillIds, missIds);
+                const revalidatedScope = scope !== "Monster scope BBE";
+                const confirmedSkillDescDisplay = ctx.file === "skilldesc"
+                    && selectedVersion === "3.2"
+                    && /^dsc3calc[ab][1-4]$/i.test(col);
+                const err = parseBBE(
+                    val,
+                    scopeIds,
+                    skillIds,
+                    missIds,
+                    revalidatedScope,
+                    missileBareIdentifiers,
+                    confirmedSkillDescDisplay,
+                );
                 if (err) {
                     const c = row.__colstarts[col] ?? 0;
                     const length = err.length ?? 1;
+                    const unknownIdentifier = err.code === "unknownIdentifier"
+                        ? val.slice(err.pos, err.pos + length)
+                        : "";
+                    const paramAlias = scope === "Skill scope BBE"
+                        ? skillParamAlias(unknownIdentifier, selectedVersion, skillIds)
+                        : null;
+                    const missileUnknown = scope === "Missile scope BBE"
+                        && err.code === "unknownIdentifier";
+                    const policyWarning = revalidatedScope && (
+                        err.code === "calc.expected-rparen.eof"
+                        || err.code === "calc.prefix-stop"
+                        || err.code === "calc.decimal-policy"
+                        || err.code === "calc.skilldesc-decimal-prefix"
+                    );
                     diags.push({
                         line:     row.__line,
                         col:      c + err.pos,
                         endCol:   c + err.pos + length,
-                        severity: "error",
-                        message:  `calcCheck: Invalid calc formula: ${err.message}`,
-                        code:     err.code,
-                        data:     calcDiagnosticData(err),
+                        severity: paramAlias || policyWarning ? "warning" : "error",
+                        message: paramAlias
+                            ? skillParamAliasMessage(paramAlias)
+                            : (missileUnknown
+                            ? `Unknown missile value '${unknownIdentifier}'. The game treats it as 0, so this part of the calculation has no effect.`
+                            : (err.code === "calc.skilldesc-decimal-prefix"
+                                ? err.message
+                            : (policyWarning && err.code === "calc.expected-rparen.eof"
+                                ? `${err.message}. The game may still use the valid part before this point. Add the missing ')'.`
+                                : (policyWarning ? err.message : `Invalid calculation: ${err.message}`)))),
+                        code:     paramAlias ? "calc.skill-param-alias" : err.code,
+                        data:     paramAlias
+                            ? skillParamAliasDiagnosticData(err, paramAlias)
+                            : (missileUnknown
+                            ? missileUnknownDiagnosticData(err, unknownIdentifier)
+                            : calcDiagnosticData(err)),
                     });
                 }
             }

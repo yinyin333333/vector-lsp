@@ -57,6 +57,25 @@ pub enum FieldTypeName {
     Unknown,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceResolver {
+    /// Full string, ASCII case-insensitive, with whitespace preserved.
+    #[default]
+    AsciiCi,
+    /// First four raw bytes, space padded, case-sensitive.
+    Fixed4,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ReferenceUnknownPolicy {
+    Error,
+    #[default]
+    Warning,
+    Ignore,
+}
+
 /// Type descriptor attached to each field definition.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +90,13 @@ pub struct FieldType {
     pub file: Option<String>,
     /// For `reference` fields: the column in the target file to resolve against.
     pub field: Option<String>,
+    /// Binary resolver semantics for reference fields.
+    #[serde(default)]
+    pub resolver: ReferenceResolver,
+    /// Severity policy for an unresolved value. Defaults to a hygiene warning
+    /// because a generic schema reference does not prove a fatal consumer.
+    #[serde(default)]
+    pub unknown_policy: ReferenceUnknownPolicy,
 }
 
 /// Declares that this field's valid values come from an enum defined in another schema file.
@@ -96,6 +122,9 @@ pub struct SchemaField {
     /// Enum table for `comment`-type fields in reference-only schema files.
     /// Each inner vec is [code, description].
     pub table: Option<Vec<Vec<serde_json::Value>>>,
+    /// Only explicitly declared unique fields participate in duplicate checks.
+    #[serde(default)]
+    pub unique: bool,
 }
 
 /// Top-level schema entry for a single data file (or a reference-only pseudo-file).

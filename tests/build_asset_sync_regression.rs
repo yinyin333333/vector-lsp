@@ -62,3 +62,16 @@ fn contrib_copy_prunes_stale_destination_files() {
         "a deleted source asset must not survive the next destination sync"
     );
 }
+
+#[test]
+fn reference_sync_requires_an_explicit_source_root_without_a_machine_path_default() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("contrib/d2rdoc/sync-reference-data.ps1"),
+    )
+    .expect("read bundled reference sync script");
+
+    assert!(script.contains("REFERENCE_TXT_SOURCE_ROOT"));
+    assert!(script.contains("Pass -ReferenceSourceRoot explicitly"));
+    assert!(!script.contains(&["E:", "\\"].concat()));
+    assert!(!script.contains(&["C:", "\\Users\\"].concat()));
+}

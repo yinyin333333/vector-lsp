@@ -1937,9 +1937,11 @@ dependencies = [
  "clap",
  "config",
  "deno_core",
+ "futures",
  "inventory",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower-lsp",
 ]

@@ -71,6 +71,8 @@ interface PluginDiagnostic {
         tokenStart?: number;
         tokenEnd?: number;
         hint?: string;
+        consumedPrefix?: string;
+        ignoredSuffix?: string;
     };
 }
 
@@ -87,6 +89,18 @@ interface PluginDiagnostic {
  * if (!lookupKey("properties", "code", row["prop1"])) { ... }
  */
 declare function lookupKey(file: string, col: string, value: string): boolean;
+
+/** Binary fixed-4 lookup: first four UTF-8 bytes, space padded, case-sensitive. */
+declare function lookupKeyFixed4(file: string, col: string, value: string): boolean;
+
+interface WorkspaceSourceInfo {
+    kind: "open" | "workspace" | "sibling" | "bundled";
+    /** Selected game version when the request is version-scoped. */
+    version?: string;
+}
+
+/** Report which effective source tier supplies a table for this request. */
+declare function getWorkspaceSource(stem: string): WorkspaceSourceInfo | null;
 
 /** Metadata returned by `getColumn` when a column exists. */
 interface ColumnInfo {
@@ -118,6 +132,13 @@ declare function hasLookupTarget(file: string, col: string): boolean;
  * const codes = new Set(getColumnValues("skillcalc", "code"));
  */
 declare function getColumnValues(stem: string, col: string): string[];
+
+/**
+ * Return the 0-based physical line of the first non-disabled row whose `col`
+ * value matches `value` with ASCII-only case folding, or `null` when absent.
+ * This is useful for loaders that resolve names sequentially.
+ */
+declare function getFirstColumnValueLine(stem: string, col: string, value: string): number | null;
 
 /**
  * Return non-empty values from `valueCol` in file `stem` where

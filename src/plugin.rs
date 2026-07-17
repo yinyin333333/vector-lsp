@@ -9,9 +9,12 @@ use tokio::sync::{mpsc, oneshot};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url};
 
 use crate::document::DocumentData;
-use crate::runtime::{ScriptRuntime, WorkspaceFileSnapshot, WorkspaceIndex};
+use crate::runtime::{ScriptRuntime, WorkspaceFileSnapshot, WorkspaceIndex, WorkspaceSourceInfo};
 use crate::schema::Schema;
-use crate::source_selection::effective_workspace_sources;
+use crate::source_selection::{
+    EffectiveSource, SourceKind, effective_workspace_sources,
+    effective_workspace_sources_with_fallback,
+};
 
 // ---------------------------------------------------------------------------
 // Wire types for validate()
@@ -258,11 +261,15 @@ impl PluginHost {
                  var __lookupCache={};\
                  var __colCache={};\
                  var __cvCache={};\
+                 var __firstLineCache={};\
                  var __filteredCvCache={};\
                  function lookupKey(file,col,value){\
                      var k=file+'|'+col+'|'+value;\
                      if(!(k in __lookupCache)){__lookupCache[k]=Deno.core.ops.op_lookup_key(file,col,value);}\
                      return __lookupCache[k];\
+                 }\
+                 function lookupKeyFixed4(file,col,value){\
+                     return Deno.core.ops.op_lookup_key_fixed4(file,col,value);\
                  }\
                  function getColumn(file,col){\
                      var k=file+'|'+col;\
@@ -272,6 +279,9 @@ impl PluginHost {
                  function hasFile(stem){\
                      return Deno.core.ops.op_has_file(stem);\
                  }\
+                 function getWorkspaceSource(stem){\
+                     return Deno.core.ops.op_get_workspace_source(stem);\
+                 }\
                  function hasLookupTarget(file,col){\
                      return Deno.core.ops.op_has_lookup_target(file,col);\
                  }\
@@ -279,6 +289,11 @@ impl PluginHost {
                      var k=stem+'|'+col;\
                      if(!(k in __cvCache)){__cvCache[k]=Deno.core.ops.op_get_column_values(stem,col);}\
                      return __cvCache[k];\
+                 }\
+                 function getFirstColumnValueLine(stem,col,value){\
+                     var k=stem+'|'+col+'|'+value;\
+                     if(!(k in __firstLineCache)){var result=Deno.core.ops.op_get_first_column_value_line(stem,col,value);__firstLineCache[k]=result===null?null:result.line;}\
+                     return __firstLineCache[k];\
                  }\
                  function getFilteredColumnValues(stem,valueCol,filterCol,filterValue){\
                      var k=stem+'|'+valueCol+'|'+filterCol+'|'+filterValue;\
@@ -584,7 +599,7 @@ fn install_workspace_view(
     if snapshot_ptr != *last_snapshot_ptr {
         let _ = runtime.exec(
             "__cache_reset__",
-            "var __lookupCache={}; var __colCache={}; var __cvCache={}; var __filteredCvCache={};",
+            "var __lookupCache={}; var __colCache={}; var __cvCache={}; var __firstLineCache={}; var __filteredCvCache={};",
         );
         *last_snapshot_ptr = snapshot_ptr;
     }
@@ -765,17 +780,10 @@ fn run_goto_definition_plugins(
     result
 }
 
-fn goto_definition_value(
-    value: Value,
-    health: &PluginHealth,
-) -> Option<(String, String, String)> {
+fn goto_definition_value(value: Value, health: &PluginHealth) -> Option<(String, String, String)> {
     match value {
         value @ Value::Object(_) => match serde_json::from_value::<RawGotoTarget>(value) {
-            Ok(target) => Some((
-                target.target_file,
-                target.target_col,
-                target.target_value,
-            )),
+            Ok(target) => Some((target.target_file, target.target_col, target.target_value)),
             Err(error) => {
                 health.report_once(
                     "goto-shape",
@@ -870,10 +878,7 @@ fn report_plugin_timeout(runtime: &mut ScriptRuntime, health: &PluginHealth, ope
         format!("timeout:{operation}:{plugin}"),
         format!("plugin '{plugin}' {operation} exceeded the execution budget and was interrupted"),
     );
-    let _ = runtime.exec(
-        "__plugin_timeout_cleanup__",
-        "__activePluginName=null;",
-    );
+    let _ = runtime.exec("__plugin_timeout_cleanup__", "__activePluginName=null;");
 }
 
 fn validation_results(raw: anyhow::Result<Value>, health: &PluginHealth) -> Vec<Diagnostic> {
@@ -1114,10 +1119,81 @@ pub fn build_workspace_snapshot(
 ) -> Arc<WorkspaceFileSnapshot> {
     let mut snap = WorkspaceFileSnapshot::new();
     for source in effective_workspace_sources(open_docs, file_cache) {
+        let kind = match source.kind {
+            SourceKind::Open => "open",
+            SourceKind::Workspace => "workspace",
+            SourceKind::Bundled => "bundled",
+            SourceKind::Sibling => "sibling",
+        };
+        snap.sources.insert(
+            source.stem.clone(),
+            WorkspaceSourceInfo {
+                kind: kind.to_string(),
+                version: source.bundled_version.clone(),
+            },
+        );
         snap.files.insert(source.stem, source.document);
     }
 
     Arc::new(snap)
+}
+
+pub fn build_workspace_snapshot_with_fallback(
+    open_docs: &HashMap<Url, Arc<DocumentData>>,
+    file_cache: &HashMap<PathBuf, Arc<DocumentData>>,
+    fallback_cache: &HashMap<String, Arc<DocumentData>>,
+    workspace_present_stems: &HashSet<String>,
+    fallback_version: Option<&str>,
+) -> Arc<WorkspaceFileSnapshot> {
+    let mut snapshot = WorkspaceFileSnapshot::new();
+    for source in effective_workspace_sources_with_fallback(
+        open_docs,
+        file_cache,
+        fallback_cache,
+        workspace_present_stems,
+        fallback_version,
+    ) {
+        let kind = match source.kind {
+            SourceKind::Open => "open",
+            SourceKind::Workspace => "workspace",
+            SourceKind::Bundled => "bundled",
+            SourceKind::Sibling => "sibling",
+        };
+        snapshot.sources.insert(
+            source.stem.clone(),
+            WorkspaceSourceInfo {
+                kind: kind.to_string(),
+                version: source.bundled_version.clone(),
+            },
+        );
+        snapshot.files.insert(source.stem, source.document);
+    }
+    Arc::new(snapshot)
+}
+
+pub fn build_workspace_snapshot_from_sources(
+    sources: &[EffectiveSource],
+) -> Arc<WorkspaceFileSnapshot> {
+    let mut snapshot = WorkspaceFileSnapshot::new();
+    for source in sources {
+        let kind = match source.kind {
+            SourceKind::Open => "open",
+            SourceKind::Workspace => "workspace",
+            SourceKind::Sibling => "sibling",
+            SourceKind::Bundled => "bundled",
+        };
+        snapshot.sources.insert(
+            source.stem.clone(),
+            WorkspaceSourceInfo {
+                kind: kind.to_string(),
+                version: source.bundled_version.clone(),
+            },
+        );
+        snapshot
+            .files
+            .insert(source.stem.clone(), Arc::clone(&source.document));
+    }
+    Arc::new(snapshot)
 }
 
 // ---------------------------------------------------------------------------
@@ -1621,7 +1697,7 @@ mod tests {
         strip_typescript,
     };
     use crate::document::DocumentData;
-    use crate::runtime::{WorkspaceFileSnapshot, build_workspace_index};
+    use crate::runtime::{WorkspaceFileSnapshot, WorkspaceSourceInfo, build_workspace_index};
 
     // --- Structural (pass 1) -------------------------------------------------
 
@@ -1927,17 +2003,12 @@ function validate(ctx: PluginContext): string[] {
 
         let open_docs = HashMap::new();
         let index = build_workspace_index(&open_docs, &file_cache);
-        let mut snapshot = WorkspaceFileSnapshot::new();
-        for (path, doc) in &file_cache {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                snapshot.files.insert(stem.to_lowercase(), Arc::clone(doc));
-            }
-        }
+        let snapshot = build_workspace_snapshot(&open_docs, &file_cache);
 
         PluginFixture {
             docs,
             index,
-            snapshot: Arc::new(snapshot),
+            snapshot,
         }
     }
 
@@ -2007,6 +2078,17 @@ function validate(ctx: PluginContext): string[] {
         assert!(
             !index.lookup("weapons", "code", "OLD"),
             "disk OLD must not remain visible while the same-stem live document contains NEW"
+        );
+    }
+
+    #[test]
+    fn workspace_index_uses_ascii_only_case_folding_for_lookup_values() {
+        let fx = fixture(&[("unicode", "Name\nÄName\n")]);
+
+        assert!(fx.index.lookup("UNICODE", "name", "ÄName"));
+        assert!(
+            !fx.index.lookup("unicode", "Name", "äName"),
+            "non-ASCII case variants must remain distinct"
         );
     }
 
@@ -2140,7 +2222,10 @@ function validate(ctx: PluginContext): string[] {
 
     fn base_lookup_files() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("weapons", "code\tname\nhpot\tHealing Potion\n"),
+            (
+                "weapons",
+                "code\tname\nhpot\tHealing Potion\nabc \tPadded Code\n가xA\tMultibyte Item\néab\tFour-byte UTF-8 Item\n",
+            ),
             ("armor", "code\tname\ncap\tCap\n"),
             ("misc", "code\tname\nkey\tKey\n"),
             (
@@ -2154,6 +2239,16 @@ function validate(ctx: PluginContext): string[] {
 
     fn with_base_files(primary: (&'static str, &'static str)) -> Vec<(&'static str, &'static str)> {
         let mut files = base_lookup_files();
+        files.push(primary);
+        files
+    }
+
+    fn with_cube_output_files(
+        primary: (&'static str, &'static str),
+    ) -> Vec<(&'static str, &'static str)> {
+        let mut files = base_lookup_files();
+        files.push(("properties", "code\nfire-damage\n"));
+        files.push(("propertygroups", "code\nvalidgroup\n"));
         files.push(primary);
         files
     }
@@ -2437,37 +2532,553 @@ function validate(ctx: PluginContext): string[] {
     }
 
     #[tokio::test]
-    async fn cube_input_check_reports_token_ranges() {
+    async fn calc_check_preserves_pre_revalidation_monpet_scope_allowlist_and_argument_grammar() {
+        let fx = fixture(&[
+            ("moncalc", "code\nhpct\n"),
+            (
+                "monpet",
+                "id\tcalc1\tcalc2\tcalc3\tcalc4\tcalc5\n\
+                 wolf\tskill()\tcond('IsType',1)\tcond('IsType',1,2)\tcond('istype',1)\tunknown\n",
+            ),
+        ]);
+        let diags = run_plugin("calcCheck.ts", "monpet", &fx).await;
+
+        assert_eq!(diags.len(), 3, "{diags:#?}");
+        assert_code(&diags[0], "calc.expected-rparen");
+        assert_code(&diags[1], "unknownCondition");
+        assert_code(&diags[2], "unknownIdentifier");
+        assert!(
+            diags
+                .iter()
+                .all(|diag| diag.severity == Some(DiagnosticSeverity::ERROR))
+        );
+    }
+
+    #[tokio::test]
+    async fn calc_check_defers_item_and_tc_bare_identifiers_without_losing_syntax_checks() {
+        let fx = fixture(&[(
+            "misc",
+            "code\tlen\tDropConditionCalc\nrow\tbinaryresolved\totherresolved\n",
+        )]);
+        let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "Item/TC callbacks have no closed identifier dictionary: {diags:#?}"
+        );
+
+        let tc = fixture(&[(
+            "treasureclassex",
+            "Treasure Class\tConditionCalc\nAct 1\tbinaryresolved\n",
+        )]);
+        let diags = run_plugin("calcCheck.ts", "treasureclassex", &tc).await;
+        assert!(
+            diags.is_empty(),
+            "TreasureClassEx ConditionCalc must use the TC fallback: {diags:#?}"
+        );
+
+        let syntax = fixture(&[("misc", "code\tlen\nrow\t1 + * 2\n")]);
+        let diags = run_plugin("calcCheck.ts", "misc", &syntax).await;
+        assert_eq!(first_range(&diags), (1, 8, 9));
+        assert_code(&diags[0], "calc.unexpected-token");
+    }
+
+    #[tokio::test]
+    async fn calc_check_keeps_closed_scope_identifier_rejection() {
+        let fx = fixture(&[
+            ("misscalc", "code\nknown\n"),
+            ("missiles", "Missile\tSrvCalc1\nrow\tunknown\n"),
+        ]);
+        let diags = run_plugin("calcCheck.ts", "missiles", &fx).await;
+        assert_eq!(first_range(&diags), (1, 4, 11));
+        assert!(diags[0].message.contains("Unknown missile value 'unknown'"));
+        assert!(diags[0].message.contains("game treats it as 0"));
+        assert!(diags[0].message.contains("has no effect"));
+        assert!(!diags[0].message.contains("Invalid calc formula"));
+        assert_code(&diags[0], "unknownIdentifier");
+    }
+
+    #[tokio::test]
+    async fn calc_check_reports_edmgsympercalc_ulvl_as_zero_substituted_misscalc_miss() {
+        let formula = "(skill('Firestorm'.clc5)-skill('Molten Boulder'.blvl))*skill('Molten Boulder'.par8)+ulvl*skill('Molten Boulder'.par5)";
+        let fx = fixture(&[
+            ("misscalc", "code\nknown\n"),
+            ("skillcalc", "code\nclc5\nblvl\npar8\npar5\n"),
+            ("skills", "skill\nFirestorm\nMolten Boulder\n"),
+            (
+                "missiles",
+                &format!("Missile\tEDmgSymPerCalc\nrow\t{formula}\n"),
+            ),
+        ]);
+        let diags = run_plugin("calcCheck.ts", "missiles", &fx).await;
+
+        let offset = formula.find("ulvl").expect("fixture contains ulvl") as u32 + 4;
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert_eq!(first_range(&diags), (1, offset, offset + 4));
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diags[0].message,
+            "Unknown missile value 'ulvl'. The game treats it as 0, so this part of the calculation has no effect."
+        );
+        assert!(!diags[0].message.contains("Invalid calc formula"));
+        assert_code(&diags[0], "unknownIdentifier");
+        assert_eq!(data_str(&diags[0], "scope"), "Missile scope BBE");
+        assert_eq!(data_str(&diags[0], "identifier"), "ulvl");
+        assert_eq!(data_str(&diags[0], "namespace"), "MissCalc.code");
+        assert_eq!(
+            data_str(&diags[0], "lookup"),
+            "first-four-byte exact case-sensitive"
+        );
+        assert_eq!(
+            diag_data(&diags[0])
+                .get("resolverResult")
+                .and_then(|value| value.as_i64()),
+            Some(-1)
+        );
+        assert_eq!(data_str(&diags[0], "binaryFallback"), "integer constant 0");
+        assert_eq!(
+            data_str(&diags[0], "compileEffect"),
+            "remaining formula continues"
+        );
+    }
+
+    #[tokio::test]
+    async fn calc_check_uses_missile_first_four_byte_case_sensitive_bare_lookup_only() {
+        let fx = fixture(&[
+            ("misscalc", "code\npar1\n"),
+            (
+                "missiles",
+                "Missile\tSrvCalc1\tCltCalc1\nrow\tpar1suffix\tPAR1\n",
+            ),
+        ]);
+        let diags = run_plugin("calcCheck.ts", "missiles", &fx).await;
+
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert_eq!(range(&diags[0]), (1, 15, 19));
+        assert!(diags[0].message.contains("'PAR1'"));
+        assert_eq!(
+            data_str(&diags[0], "lookup"),
+            "first-four-byte exact case-sensitive"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_accepts_binary_equivalent_forms_without_cubemod() {
+        let files = with_cube_output_files((
+            "cubemain",
+            "description\tenabled\tinput 1\tinput 2\tinput 3\toutput\toutput b\toutput c\tb mod 1\tc mod 1\n\
+             row\t1\thpot\tcap\tkey\thpot,pre,162\tuseitem,qty,3\tRED PORTAL\tFire-Damage\tFIRE-DAMAGE\n\
+             named\t1\thpot\tcap\tkey\tthe gnasher\tusetype,pre=162\tPandemonium Finale Portal\t\t\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "comma/equal parameters, b/c ordinals, portal ASCII-CI, names/properties CI should pass: {diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_rejects_compact_portals_and_code_case_variants() {
+        for (label, output) in [
+            ("compact portal", "cowportal"),
+            ("packed-code case", "HPOT"),
+            ("over-four-byte raw code", "hpota"),
+        ] {
+            let cubemain = format!("description\tenabled\toutput\nrow\t1\t{output}\n");
+            let mut files: Vec<(&str, &str)> = base_lookup_files();
+            files.push(("properties", "code\nfire-damage\n"));
+            files.push(("propertygroups", "code\nvalidgroup\n"));
+            files.push(("cubemain", cubemain.as_str()));
+            let fx = fixture(&files);
+            let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+            assert_eq!(diags.len(), 1, "{label}: {diags:#?}");
+            assert_code(&diags[0], "cube-output.invalid-base");
+        }
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_uses_lossless_utf8_fixed4_padding_for_short_raw_codes() {
+        let files = with_cube_output_files((
+            "cubemain",
+            "description\tenabled\toutput\n\
+             space padded\t1\tabc\n\
+             multibyte\t1\t가x\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "abc -> 'abc ' and 가x -> 가xA share the exact padded/first-four UTF-8 bytes: {diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_does_not_accept_object_prototype_keys() {
+        let files = with_cube_output_files((
+            "cubemain",
+            "description\tenabled\toutput\n\
+             prototype base\t1\tconstructor\n\
+             prototype flag\t1\thpot,toString\n\
+             prototype parameter\t1\thpot,__proto__=3\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+        assert_eq!(
+            diags.len(),
+            3,
+            "prototype keys must not become grammar entries: {diags:#?}"
+        );
+        assert_code(&diags[0], "cube-output.invalid-base");
+        assert_code(&diags[1], "cube-output.ignored-suffix");
+        assert_code(&diags[2], "cube-output.ignored-suffix");
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_rejects_a_nonblank_cell_with_an_empty_base() {
+        let files =
+            with_cube_output_files(("cubemain", "description\tenabled\toutput\nrow\t1\t,mag\n"));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+        assert_eq!(diags.len(), 1, "empty base must be explicit: {diags:#?}");
+        assert_code(&diags[0], "cube-output.invalid-base");
+        assert!(
+            diags[0].message.contains("empty base for output"),
+            "{diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_reports_ordinal_suffix_storage_and_property_semantics() {
+        let cases = [
+            (
+                "ordinal",
+                "description\tenabled\tinput 2\toutput b\nrow\t1\t\tuseitem\n",
+                "cube-output.missing-ordinal-input",
+                "has no matching 'input 2'",
+            ),
+            (
+                "ignored suffix",
+                "description\tenabled\toutput\nrow\t1\thpot,mag,noe,qty=2\n",
+                "cube-output.ignored-suffix",
+                "The game stops at 'noe'",
+            ),
+            (
+                "u8 storage",
+                "description\tenabled\toutput\nrow\t1\thpot,qty=256\n",
+                "cube-output.u8-range",
+                "outside 0..255",
+            ),
+            (
+                "secondary property",
+                "description\tenabled\tb mod 1\nrow\t1\tbad-property\n",
+                "cube-output.invalid-property",
+                "invalid property 'bad-property'",
+            ),
+        ];
+
+        for (label, cubemain, code, message) in cases {
+            let files = with_cube_output_files(("cubemain", cubemain));
+            let fx = fixture(&files);
+            let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+            assert_eq!(diags.len(), 1, "{label}: {diags:#?}");
+            assert_code(&diags[0], code);
+            assert!(diags[0].message.contains(message), "{label}: {diags:#?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_reports_legacy_core_messages_on_whole_cells() {
+        let cases = [
+            (
+                "invalid base",
+                "description\tenabled\toutput\nrow\t1\tbad-base,mag\n",
+                "cube-output.invalid-base",
+                (1, 6, 18),
+                "cubemain.txt, line 2: could not find 'bad-base' for output in recipe 'row'",
+            ),
+            (
+                "empty base",
+                "description\tenabled\toutput\nrow\t1\t,mag\n",
+                "cube-output.invalid-base",
+                (1, 6, 10),
+                "cubemain.txt, line 2: empty base for output in recipe 'row'",
+            ),
+            (
+                "ordinal",
+                "description\tenabled\tinput 2\toutput b\nrow\t1\t\tuseitem\n",
+                "cube-output.missing-ordinal-input",
+                (1, 7, 14),
+                "cubemain.txt, line 2: 'useitem' for 'output b' has no matching 'input 2' in recipe 'row'",
+            ),
+            (
+                "secondary property",
+                "description\tenabled\tb mod 1\nrow\t1\tbad-property\n",
+                "cube-output.invalid-property",
+                (1, 6, 18),
+                "cubemain.txt, line 2: invalid property 'bad-property' for 'b mod 1' in recipe 'row'",
+            ),
+            (
+                "inline byte storage",
+                "description\tenabled\toutput\nrow\t1\thpot,qty=256\n",
+                "cube-output.u8-range",
+                (1, 6, 18),
+                "cubemain.txt, line 2: 'qty=256' for 'output' is outside 0..255, so the game truncates it. Enter a value from 0 through 255 in recipe 'row'",
+            ),
+            (
+                "ignored suffix",
+                "description\tenabled\toutput\nrow\t1\thpot,mag,noe,qty=2\n",
+                "cube-output.ignored-suffix",
+                (1, 6, 24),
+                "cubemain.txt, line 2: The game stops at 'noe' for 'output' in recipe 'row'. The base and modifiers before it still work; 'noe' and everything after it are ignored.",
+            ),
+            (
+                "separate byte storage",
+                "description\tenabled\toutput\tplvl\nrow\t1\thpot\t-1\n",
+                "cube-output.u8-range",
+                (1, 11, 13),
+                "cubemain.txt, line 2: 'plvl' value '-1' for 'output' is outside 0..255, so the game truncates it. Enter a value from 0 through 255 in recipe 'row'",
+            ),
+        ];
+
+        for (label, cubemain, code, expected_range, expected_message) in cases {
+            let files = with_cube_output_files(("cubemain", cubemain));
+            let fx = fixture(&files);
+            let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+            assert_eq!(diags.len(), 1, "{label}: {diags:#?}");
+            assert_code(&diags[0], code);
+            assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(range(&diags[0]), expected_range, "{label}");
+            assert_eq!(diags[0].message, expected_message, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_pins_all_separate_output_byte_columns() {
+        for column in [
+            "lvl", "plvl", "ilvl", "b lvl", "b plvl", "b ilvl", "c lvl", "c plvl", "c ilvl",
+        ] {
+            let output_column = if column.starts_with("b ") {
+                "output b"
+            } else if column.starts_with("c ") {
+                "output c"
+            } else {
+                "output"
+            };
+            let cubemain =
+                format!("description\tenabled\t{output_column}\t{column}\nrow\t1\thpot\t256\n");
+            let mut files: Vec<(&str, &str)> = base_lookup_files();
+            files.push(("properties", "code\nfire-damage\n"));
+            files.push(("propertygroups", "code\nvalidgroup\n"));
+            files.push(("cubemain", cubemain.as_str()));
+            let fx = fixture(&files);
+            let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+            assert_eq!(diags.len(), 1, "{column}: {diags:#?}");
+            assert_code(&diags[0], "cube-output.u8-range");
+            assert!(diags[0].message.contains(column), "{column}: {diags:#?}");
+            assert_eq!(range(&diags[0]), (1, 11, 14), "{column}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_does_not_call_a_failed_base_preserved() {
+        let files = with_cube_output_files((
+            "cubemain",
+            "description\tenabled\toutput\tilvl\nrow\t1\tbad-base,noe,qty=999\t256\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+        assert_eq!(
+            diags.len(),
+            1,
+            "failed base should stop cell semantics: {diags:#?}"
+        );
+        assert_code(&diags[0], "cube-output.invalid-base");
+        assert!(!diags[0].message.contains("preserved"));
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_matches_legacy_storage_warnings_for_noncanonical_parameters() {
+        let files = with_cube_output_files((
+            "cubemain",
+            "description\tenabled\toutput\toutput c\tc ilvl\nrow\t1\thpot,qty=+12,mag\thpot\t+12\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+        assert_eq!(diags.len(), 2, "inline and separate plus forms: {diags:#?}");
+        assert!(
+            diags.iter().all(
+                |diag| diag.code == Some(NumberOrString::String("cube-output.u8-range".into()))
+            )
+        );
+        assert_eq!(range(&diags[0]), (1, 6, 22));
+        assert_eq!(range(&diags[1]), (1, 28, 31));
+        assert_eq!(
+            diags[0].message,
+            "cubemain.txt, line 2: 'qty=+12' for 'output' is outside 0..255, so the game truncates it. Enter a value from 0 through 255 in recipe 'row'"
+        );
+        assert_eq!(
+            diags[1].message,
+            "cubemain.txt, line 2: 'c ilvl' value '+12' for 'output c' is outside 0..255, so the game truncates it. Enter a value from 0 through 255 in recipe 'row'"
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|diag| !diag.message.contains("suffix is ignored")),
+            "present noncanonical values must not be overclaimed as ignored: {diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_output_check_keeps_incomplete_lookup_guard_and_disabled_rows() {
+        let incomplete = fixture(&[(
+            "cubemain",
+            "description\tenabled\toutput\tilvl\nrow\t1\tunknown-base,qty=999\t256\n",
+        )]);
+        let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &incomplete).await;
+        assert!(
+            diags.is_empty(),
+            "incomplete lookup must suppress inline and separate-byte claims equally: {diags:#?}"
+        );
+
+        let files = with_cube_output_files((
+            "cubemain",
+            "description\tenabled\toutput\nrow\t0\tunknown-base\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeOutputCheck.ts", "cubemain", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "disabled recipes should stay ignored: {diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_output_hover_explains_ordinal_and_preserved_prefix() {
+        let files = with_cube_output_files((
+            "cubemain",
+            "description\tenabled\tinput 2\toutput b\nrow\t1\tcap\tuseitem,pre,162,noe\n",
+        ));
+        let fx = fixture(&files);
+        let host = PluginHost::new(vec![plugin_path("cubeOutputCheck.ts")]).unwrap();
+        let doc = fx.docs.get("cubemain").expect("cubemain fixture");
+        let ctx = build_hover_context("cubemain", "output b", "useitem,pre,162,noe", 1, doc);
+
+        let hover = host
+            .hover(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("cube output hover");
+        assert!(
+            hover.contains("input 2"),
+            "ordinal mapping missing: {hover}"
+        );
+        assert!(
+            hover.contains("Prefix ID: 162"),
+            "applied prefix missing: {hover}"
+        );
+        assert!(
+            hover.contains("Ignored text begins at"),
+            "ignored suffix missing: {hover}"
+        );
+        assert!(
+            hover.contains("base and modifiers before it still work"),
+            "prefix preservation missing: {hover}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_output_hover_reports_the_effective_reference_source() {
+        let files =
+            with_cube_output_files(("cubemain", "description\tenabled\toutput\nrow\t1\thpot\n"));
+        let mut fx = fixture(&files);
+        Arc::get_mut(&mut fx.snapshot)
+            .expect("unshared fixture snapshot")
+            .sources
+            .insert(
+                "weapons".into(),
+                WorkspaceSourceInfo {
+                    kind: "sibling".into(),
+                    version: Some("3.2".into()),
+                },
+            );
+        let host = PluginHost::new(vec![plugin_path("cubeOutputCheck.ts")]).unwrap();
+        let doc = fx.docs.get("cubemain").expect("cubemain fixture");
+        let ctx = build_hover_context("cubemain", "output", "hpot", 1, doc);
+
+        let hover = host
+            .hover(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("cube output source hover");
+        assert!(
+            hover.contains("four-character item code")
+                && hover.contains("Source: TXT file in the same folder (game version 3.2)"),
+            "{hover}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_output_hover_does_not_claim_preservation_for_an_invalid_base() {
+        let files = with_cube_output_files((
+            "cubemain",
+            "description\tenabled\toutput\nrow\t1\tbad-base,mag,noe\n",
+        ));
+        let fx = fixture(&files);
+        let host = PluginHost::new(vec![plugin_path("cubeOutputCheck.ts")]).unwrap();
+        let doc = fx.docs.get("cubemain").expect("cubemain fixture");
+        let ctx = build_hover_context("cubemain", "output", "bad-base,mag,noe", 1, doc);
+
+        let hover = host
+            .hover(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("cube output hover");
+        assert!(
+            hover.contains("Unknown output value"),
+            "invalid base status missing: {hover}"
+        );
+        assert!(
+            hover.contains("the game does not create this output"),
+            "failed-base parser result missing: {hover}"
+        );
+        assert!(
+            !hover.contains("Applied modifiers")
+                && !hover.contains("Modifiers the game will use")
+                && !hover.contains("stored u8")
+                && !hover.contains("are preserved"),
+            "failed base must not be described as an applied, stored, or preserved output: {hover}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_input_check_reports_legacy_messages_on_whole_cell_ranges() {
         let cases = [
             (
                 "invalid base",
                 "desc\tinput 1\nr\tbadbase,qty=1\n",
-                (1, 2, 9),
-                "not a valid cubemain input",
+                (1, 2, 15),
+                "couldn't find 'badbase' for input 1",
             ),
             (
                 "invalid modifier key",
                 "desc\tinput 1\nr\thpot,foo=1\n",
-                (1, 7, 10),
-                "Unknown parameterized modifier",
+                (1, 2, 12),
+                "The game stops at 'foo=1'",
             ),
             (
                 "invalid modifier value",
                 "desc\tinput 1\nr\thpot,qty=abc\n",
-                (1, 11, 14),
-                "requires a non-negative integer",
+                (1, 2, 14),
+                "input quantity 'abc'",
             ),
             (
                 "missing modifier value",
                 "desc\tinput 1\nr\thpot,qty=\n",
-                (1, 10, 11),
-                "requires a non-negative integer",
+                (1, 2, 11),
+                "input quantity ''",
             ),
             (
                 "quoted input",
                 "desc\tinput 1\nr\t\"hpot,qty=abc\"\n",
-                (1, 12, 15),
-                "requires a non-negative integer",
+                (1, 2, 16),
+                "input quantity 'abc'",
             ),
         ];
 
@@ -2493,6 +3104,25 @@ function validate(ctx: PluginContext): string[] {
             "incomplete lookup evidence should not flag invalid bases: {diags:#?}"
         );
 
+        let partial_itemtypes = vec![
+            ("weapons", "code\nhpot\n"),
+            ("armor", "code\ncap\n"),
+            ("misc", "code\nkey\n"),
+            ("itemtypes", "Code\nweap\n"),
+            ("uniqueitems", "index\nThe Gnasher\n"),
+            ("setitems", "index\nHsarus' Iron Heel\n"),
+            (
+                "treasureclassex",
+                "Treasure Class\tItem1\tProb1\nAct 1\tbaditem\t1\n",
+            ),
+        ];
+        let fx = fixture(&partial_itemtypes);
+        let diags = run_plugin("tcItemCheck.ts", "treasureclassex", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "missing ItemTypes.TreasureClass evidence must defer invalid-base policy: {diags:#?}"
+        );
+
         let files = with_base_files(("cubemain", "desc\tinput 1\n*disabled\tbadbase\n"));
         let fx = fixture(&files);
         let diags = run_plugin("cubeInputCheck.ts", "cubemain", &fx).await;
@@ -2503,37 +3133,37 @@ function validate(ctx: PluginContext): string[] {
     }
 
     #[tokio::test]
-    async fn tc_item_check_reports_token_ranges() {
+    async fn tc_item_check_reports_legacy_messages_on_whole_cell_ranges() {
         let cases = [
             (
                 "invalid base",
                 "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nAct 1\t1\t0\tbaditem,mul=1280\t1\n",
-                (1, 10, 17),
-                "not a valid item code",
+                (1, 10, 26),
+                "can't find 'baditem' for 'item1'",
             ),
             (
                 "invalid modifier key",
                 "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nAct 1\t1\t0\thpot,zz=1\t1\n",
-                (1, 15, 17),
-                "Unknown modifier key",
+                (1, 10, 19),
+                "The game stops at 'zz=1'",
             ),
             (
                 "missing modifier value",
                 "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nAct 1\t1\t0\thpot,mul=\t1\n",
-                (1, 18, 19),
-                "Missing value",
+                (1, 10, 19),
+                "The game stops at 'mul='",
             ),
             (
                 "quoted modifier",
                 "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nAct 1\t1\t0\t\"hpot,zz=1\"\t1\n",
-                (1, 16, 18),
-                "Unknown modifier key",
+                (1, 10, 21),
+                "The game stops at 'zz=1'",
             ),
             (
                 "forward reference",
                 "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\nFirst\t1\t0\tLater\t1\nLater\t1\t0\thpot\t1\n",
                 (1, 10, 15),
-                "defined at or below",
+                "can't find 'Later' for 'item1'",
             ),
         ];
 
@@ -2564,6 +3194,105 @@ function validate(ctx: PluginContext): string[] {
     }
 
     #[tokio::test]
+    async fn tc_item_check_treats_a_missing_item_header_as_the_first_empty_slot() {
+        let files = with_base_files((
+            "treasureclassex",
+            "Treasure Class\tItem1\tProb1\tItem3\tProb3\nHeader gap\thpot\t1\tbad-after-gap\t7\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("tcItemCheck.ts", "treasureclassex", &fx).await;
+
+        assert_eq!(
+            diags.len(),
+            2,
+            "missing Item2 must terminate sequential slots: {diags:#?}"
+        );
+        assert_code(&diags[0], "tc-item.after-first-gap");
+        assert_code(&diags[1], "tc-prob.after-first-gap");
+        assert!(
+            diags
+                .iter()
+                .all(|diag| diag.message.contains("first empty Item slot"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tc_item_check_reports_probability_omissions_without_gap_or_orphan_duplicates() {
+        let files = with_base_files((
+            "treasureclassex",
+            "Treasure Class\tItem1\tProb1\n\
+             Blank\thpot\t\n\
+             Zero\thpot\t0\n\
+             Negative\thpot\t-1\n\
+             Noncanonical\thpot\tabc\n\
+             Quoted zero\thpot\t\"0\"\n\
+             Valid\thpot\t1\n\
+             Orphan\t\t7\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("tcItemCheck.ts", "treasureclassex", &fx).await;
+
+        assert_eq!(
+            diags.len(),
+            6,
+            "four omission forms plus one quoted zero and one orphan: {diags:#?}"
+        );
+        let expected = [
+            (
+                "tc-prob.blank-omission",
+                "treasureclassex.txt, line 2: This Treasure Class entry is skipped because 'prob1' is blank ('item1').",
+            ),
+            (
+                "tc-prob.nonpositive-omission",
+                "treasureclassex.txt, line 3: This Treasure Class entry is skipped because 'prob1' is 0 ('item1').",
+            ),
+            (
+                "tc-prob.nonpositive-omission",
+                "treasureclassex.txt, line 4: This Treasure Class entry is skipped because 'prob1' is -1 ('item1').",
+            ),
+            (
+                "tc-prob.noncanonical",
+                "treasureclassex.txt, line 5: 'prob1' is not a whole number and may cause 'item1' to be skipped.",
+            ),
+            (
+                "tc-prob.nonpositive-omission",
+                "treasureclassex.txt, line 6: This Treasure Class entry is skipped because 'prob1' is 0 ('item1').",
+            ),
+        ];
+        for (diag, (code, message)) in diags.iter().zip(expected).take(5) {
+            assert_code(diag, code);
+            assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(diag.message, message);
+        }
+        assert_eq!(
+            range(&diags[0]).1,
+            range(&diags[0]).2,
+            "blank Prob is an insertion range"
+        );
+        assert_code(&diags[5], "tc-prob.orphaned");
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|diag| diag.range.start.line == 7)
+                .count(),
+            1,
+            "an orphan probability must not also receive an omission diagnostic"
+        );
+
+        let missing_prob_files = with_base_files((
+            "treasureclassex",
+            "Treasure Class\tItem1\tItem2\tProb2\nNo Prob1\thpot\tcap\t1\n",
+        ));
+        let missing_prob = fixture(&missing_prob_files);
+        assert!(
+            run_plugin("tcItemCheck.ts", "treasureclassex", &missing_prob)
+                .await
+                .is_empty(),
+            "a missing Prob header is not a blank probability cell"
+        );
+    }
+
+    #[tokio::test]
     async fn cube_input_hover_and_definition_still_use_the_base_token() {
         let files = with_base_files(("cubemain", "desc\tinput 1\nr\thpot,qty=3\n"));
         let fx = fixture(&files);
@@ -2582,6 +3311,10 @@ function validate(ctx: PluginContext): string[] {
         assert!(
             hover.contains("Quantity: 3"),
             "hover should include modifier text: {hover}"
+        );
+        assert!(
+            hover.contains("Source: TXT file in the current workspace"),
+            "hover should expose the effective reference source: {hover}"
         );
 
         let target = host
@@ -2604,16 +3337,896 @@ function validate(ctx: PluginContext): string[] {
         let fx = fixture(&item_files);
         let diags = run_plugin("itemCodeCheck.ts", "uniqueitems", &fx).await;
         assert_eq!(first_range(&diags), (1, 11, 14));
-        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_code(&diags[0], "item-code.unresolved-policy");
 
         let prop_files = vec![
             ("cubemain", "desc\tmod 1\nr\tbadprop\n"),
             ("properties", "code\nvalidprop\n"),
             ("propertygroups", "code\nvalidgroup\n"),
         ];
-        let fx = fixture(&prop_files);
+        let mut fx = fixture(&prop_files);
+        Arc::get_mut(&mut fx.snapshot)
+            .expect("unshared fixture snapshot")
+            .sources
+            .insert(
+                "properties".into(),
+                WorkspaceSourceInfo {
+                    kind: "bundled".into(),
+                    version: Some("3.2".into()),
+                },
+            );
         let diags = run_plugin("propCodeCheck.ts", "cubemain", &fx).await;
         assert_eq!(first_range(&diags), (1, 2, 9));
-        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_code(&diags[0], "property.unknown-code");
+
+        let host = PluginHost::new(vec![plugin_path("propCodeCheck.ts")]).unwrap();
+        let doc = fx.docs.get("cubemain").expect("cubemain fixture");
+        let ctx = build_hover_context("cubemain", "mod 1", "validprop", 1, doc);
+        let hover = host
+            .hover(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("property source hover");
+        assert!(
+            hover.contains("properties.txt code")
+                && hover.contains("Source: Built-in reference data (game version 3.2)"),
+            "{hover}"
+        );
+    }
+
+    #[tokio::test]
+    async fn property_checks_follow_the_selected_versions_propertygroups_capability() {
+        let mut files = base_lookup_files();
+        files.push(("properties", "code\nknown\n"));
+        files.push((
+            "cubemain",
+            "description\tenabled\tmod 1\tb mod 1\nrow\t1\tmissing\tmissing\n",
+        ));
+
+        let mut old = fixture(&files);
+        Arc::get_mut(&mut old.snapshot)
+            .expect("unshared old-version snapshot")
+            .sources
+            .get_mut("properties")
+            .expect("properties source")
+            .version = Some("1.13c".into());
+        let prop_diags = run_plugin("propCodeCheck.ts", "cubemain", &old).await;
+        let output_diags = run_plugin("cubeOutputCheck.ts", "cubemain", &old).await;
+        assert_eq!(
+            prop_diags.len(),
+            1,
+            "1.13c properties-only lookup: {prop_diags:#?}"
+        );
+        assert_eq!(
+            output_diags.len(),
+            1,
+            "1.13c output property lookup: {output_diags:#?}"
+        );
+
+        let mut modern = fixture(&files);
+        Arc::get_mut(&mut modern.snapshot)
+            .expect("unshared modern-version snapshot")
+            .sources
+            .get_mut("properties")
+            .expect("properties source")
+            .version = Some("3.2".into());
+        assert!(
+            run_plugin("propCodeCheck.ts", "cubemain", &modern)
+                .await
+                .is_empty(),
+            "3.2 must wait for propertygroups before proving a missing property"
+        );
+        assert!(
+            run_plugin("cubeOutputCheck.ts", "cubemain", &modern)
+                .await
+                .is_empty(),
+            "3.2 cube output must wait for propertygroups before proving a missing property"
+        );
+    }
+
+    #[tokio::test]
+    async fn calc_check_models_revalidated_function_case_arity_and_prefix_policy() {
+        let valid = [
+            "MIN(1,2)",
+            "mAx(1,2)",
+            "RAND(1,2)",
+            "SKILL('x'.lvl)",
+            "Miss('x'.lvl)",
+            "STAT('x'.base)",
+            "Sklvl('x'.lvl.blvl)",
+            "SkSrC('x'.lvl)",
+            "CoNd('DESECRATED')",
+            "COND('difficulty',hell)",
+        ];
+        for formula in valid {
+            let misc = format!("code\tlen\nrow\t{formula}\n");
+            let fx = fixture(&[("misc", misc.as_str())]);
+            let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+            assert!(diags.is_empty(), "valid {formula}: {diags:#?}");
+        }
+
+        let wrong_arity = [
+            "min(1)",
+            "max(1,2,3)",
+            "rand()",
+            "skill('x')",
+            "miss('x'.lvl.extra)",
+            "stat('x')",
+            "sklvl('x'.lvl)",
+            "sksrc('x'.lvl.extra)",
+            "cond('difficulty')",
+        ];
+        for formula in wrong_arity {
+            let misc = format!("code\tlen\nrow\t{formula}\n");
+            let fx = fixture(&[("misc", misc.as_str())]);
+            let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+            assert_eq!(diags.len(), 1, "wrong arity {formula}: {diags:#?}");
+            assert_code(&diags[0], "calc.wrong-arity");
+            assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        }
+
+        let fx = fixture(&[("misc", "code\tlen\nrow\tcond('MonsterHasMod',1)\n")]);
+        let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+        assert_eq!(diags.len(), 1, "unverified condition must not be accepted");
+        assert_code(&diags[0], "unknownCondition");
+
+        for (formula, code) in [
+            ("min(1,2", "calc.expected-rparen.eof"),
+            ("1%2", "calc.prefix-stop"),
+            ("1.5+2", "calc.decimal-policy"),
+            ("1+2.5", "calc.decimal-policy"),
+        ] {
+            let misc = format!("code\tlen\nrow\t{formula}\n");
+            let fx = fixture(&[("misc", misc.as_str())]);
+            let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+            assert_eq!(diags.len(), 1, "policy case {formula}: {diags:#?}");
+            assert_code(&diags[0], code);
+            assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+        }
+
+        for (formula, code) in [
+            ("%2", "calc.unexpected-character"),
+            ("@ignored", "calc.unexpected-character"),
+            ("1+@ignored", "calc.unexpected-character"),
+            ("1.5+", "calc.unexpected-eof"),
+        ] {
+            let misc = format!("code\tlen\nrow\t{formula}\n");
+            let fx = fixture(&[("misc", misc.as_str())]);
+            let diags = run_plugin("calcCheck.ts", "misc", &fx).await;
+            assert_eq!(diags.len(), 1, "hard syntax case {formula}: {diags:#?}");
+            assert_code(&diags[0], code);
+            assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        }
+
+        let monpet = fixture(&[("monpet", "Id\tcalc1\nrow\t1.5\n")]);
+        let diags = run_plugin("calcCheck.ts", "monpet", &monpet).await;
+        assert!(
+            diags.is_empty(),
+            "decimal policy must remain excluded from MonPet: {diags:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_param_aliases_are_explained_only_for_3_1_and_3_2_skill_scopes() {
+        fn versioned_fixture(file: &str, text: &str, version: &str) -> PluginFixture {
+            let skillcalc = "code\npar1\npar2\npa10\npa11\npa12\npa13\npa14\npa15\npa16\npa17\npa18\npa19\npa20\n";
+            let mut fx = fixture(&[("skillcalc", skillcalc), (file, text)]);
+            Arc::get_mut(&mut fx.snapshot)
+                .expect("unshared fixture snapshot")
+                .sources
+                .get_mut(file)
+                .expect("versioned source")
+                .version = Some(version.into());
+            fx
+        }
+
+        for version in ["3.1", "3.2"] {
+            for parameter in 10..=20 {
+                let identifier = format!("par{parameter}");
+                let text = format!("skill\tcalc1\nrow\t{identifier}\n");
+                let fx = versioned_fixture("skills", &text, version);
+                let diags = run_plugin("calcCheck.ts", "skills", &fx).await;
+                assert_eq!(diags.len(), 1, "{version} {identifier}: {diags:#?}");
+                let diag = &diags[0];
+                let interpreted_as = if parameter == 20 { "par2" } else { "par1" };
+                assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
+                assert_code(diag, "calc.skill-param-alias");
+                assert_eq!(
+                    diag.message,
+                    format!(
+                        "{identifier} is interpreted as {interpreted_as} because SkillCalc identifiers use only the first four characters. Use pa{parameter} to reference Param{parameter}."
+                    )
+                );
+                assert_eq!(range(diag), (1, 4, 4 + identifier.len() as u32));
+                assert_eq!(data_str(diag, "kind"), "identifier-alias");
+                assert_eq!(data_str(diag, "scope"), "Skill scope BBE");
+                assert_eq!(data_str(diag, "identifier"), identifier);
+                assert_eq!(data_str(diag, "interpretedAs"), interpreted_as);
+                assert_eq!(data_str(diag, "suggestion"), format!("pa{parameter}"));
+                assert_eq!(data_str(diag, "parameter"), format!("Param{parameter}"));
+            }
+        }
+
+        let skilldesc =
+            versioned_fixture("skilldesc", "skilldesc\tdsc3calca1\nrow\tpar20\n", "3.2");
+        let skilldesc_diags = run_plugin("calcCheck.ts", "skilldesc", &skilldesc).await;
+        assert_code(&skilldesc_diags[0], "calc.skill-param-alias");
+        assert_eq!(data_str(&skilldesc_diags[0], "interpretedAs"), "par2");
+
+        let older = versioned_fixture("skills", "skill\tcalc1\nrow\tpar10\n", "2.4");
+        let older_diags = run_plugin("calcCheck.ts", "skills", &older).await;
+        assert_eq!(older_diags.len(), 1, "{older_diags:#?}");
+        assert_eq!(older_diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_code(&older_diags[0], "unknownIdentifier");
+        assert_eq!(
+            older_diags[0].message,
+            "Invalid calculation: Unknown identifier 'par10' for this BBE scope"
+        );
+
+        let uppercase = versioned_fixture("skills", "skill\tcalc1\nrow\tPAR10\n", "3.2");
+        let uppercase_diags = run_plugin("calcCheck.ts", "skills", &uppercase).await;
+        assert_code(&uppercase_diags[0], "unknownIdentifier");
+
+        let missile = fixture(&[
+            ("misscalc", "code\npar1\n"),
+            ("missiles", "Missile\tSrvCalc1\nrow\tpar10\n"),
+        ]);
+        assert!(
+            run_plugin("calcCheck.ts", "missiles", &missile)
+                .await
+                .is_empty(),
+            "Missile first-four lookup remains valid without a Skill-param warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn skilldesc_3_2_decimal_warning_reports_used_prefix_and_ignored_suffix() {
+        async fn run(formula: &str) -> Vec<Diagnostic> {
+            let text = format!("skilldesc\tdsc3calca1\tdsc3calca2\nrow\t\t{formula}\n");
+            let mut fx = fixture(&[("skilldesc", text.as_str())]);
+            Arc::get_mut(&mut fx.snapshot)
+                .expect("unshared fixture snapshot")
+                .sources
+                .get_mut("skilldesc")
+                .expect("skilldesc source")
+                .version = Some("3.2".into());
+            run_plugin("calcCheck.ts", "skilldesc", &fx).await
+        }
+
+        assert!(run("-6").await.is_empty());
+        for (formula, consumed, ignored) in [
+            ("6.25", "6", ".25"),
+            ("-6.25", "-6", ".25"),
+            ("6.", "6", "."),
+            ("6.25+1", "6", ".25+1"),
+            ("-6.25+1", "-6", ".25+1"),
+        ] {
+            let diagnostics = run(formula).await;
+            assert_eq!(diagnostics.len(), 1, "{formula}: {diagnostics:#?}");
+            let diagnostic = &diagnostics[0];
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+            assert_code(diagnostic, "calc.skilldesc-decimal-prefix");
+            assert_eq!(
+                diagnostic.message,
+                format!(
+                    "Decimal values are not supported here. The game reads '{formula}' as '{consumed}' and ignores '{ignored}'. Use an integer expression that matches your intent."
+                )
+            );
+            assert_eq!(data_str(diagnostic, "consumedPrefix"), consumed);
+            assert_eq!(data_str(diagnostic, "ignoredSuffix"), ignored);
+            assert!(!diagnostic.message.contains("compiler"));
+            assert!(!diagnostic.message.contains("bytecode"));
+        }
+
+        let invalid_start = run(".25").await;
+        assert_eq!(invalid_start.len(), 1, "{invalid_start:#?}");
+        assert_eq!(invalid_start[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_ne!(
+            invalid_start[0].code,
+            Some(NumberOrString::String(
+                "calc.skilldesc-decimal-prefix".into()
+            ))
+        );
+
+        let mut older = fixture(&[(
+            "skilldesc",
+            "skilldesc\tdsc3calca1\tdsc3calca2\nrow\t\t-6.25\n",
+        )]);
+        Arc::get_mut(&mut older.snapshot)
+            .expect("unshared fixture snapshot")
+            .sources
+            .get_mut("skilldesc")
+            .expect("skilldesc source")
+            .version = Some("3.1".into());
+        let older_diagnostics = run_plugin("calcCheck.ts", "skilldesc", &older).await;
+        assert_code(&older_diagnostics[0], "calc.decimal-policy");
+        assert!(
+            !older_diagnostics[0]
+                .message
+                .contains("game reads '-6.25' as '-6'")
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_input_check_matches_parameter_and_ignored_suffix_grammar() {
+        let files = with_base_files((
+            "cubemain",
+            "desc\tinput 1\tinput 2\tinput 3\tinput 4\tinput 5\n\
+             valid\thpot,qty,3\thpot,qty=3\thpot,sock\tqty=3,hpot,id\tqty,3,hpot,id\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeInputCheck.ts", "cubemain", &fx).await;
+        assert!(
+            diags.is_empty(),
+            "binary-equivalent input forms: {diags:#?}"
+        );
+
+        let files = with_base_files((
+            "cubemain",
+            "desc\tinput 1\tinput 2\tinput 3\tinput 4\tinput 5\tinput 6\tinput 7\n\
+             bad\thpot,brk\thpot,MAG\thpot, mag\thpot,,mag\thpot,sock=3\thpot,sock,3\thpot,qty,256\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeInputCheck.ts", "cubemain", &fx).await;
+        assert_eq!(
+            diags.len(),
+            7,
+            "each first ignored suffix/range: {diags:#?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.severity == Some(DiagnosticSeverity::WARNING))
+        );
+        assert_eq!(
+            diags
+                .iter()
+                .filter(
+                    |d| d.code == Some(NumberOrString::String("cube-input.ignored-suffix".into()))
+                )
+                .count(),
+            6
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(NumberOrString::String("cube-input.u8-range".into())))
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| { d.message.contains("The game stops at 'sock=3'") })
+        );
+        assert!(diags.iter().any(|d| d.message.contains("outside 0..255")));
+    }
+
+    #[tokio::test]
+    async fn cube_input_check_matches_legacy_numinputs_relationship() {
+        let files = with_base_files((
+            "cubemain",
+            "description\tenabled\tnuminputs\tinput 1\tinput 2\n\
+             match\t1\t3\thpot,qty,3\t\n\
+             mismatch\t1\t2\thpot\t\n\
+             zero\t1\t0\tbadbase\t\n\
+             invalid\t1\tabc\tbadbase\t\n\
+             disabled\t0\t99\tbadbase\t\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeInputCheck.ts", "cubemain", &fx).await;
+
+        assert_eq!(diags.len(), 3, "numinputs parity diagnostics: {diags:#?}");
+        assert!(
+            diags
+                .iter()
+                .all(|diag| diag.severity == Some(DiagnosticSeverity::WARNING))
+        );
+
+        let mismatch = &diags[0];
+        assert_code(mismatch, "cube-input.numinputs-mismatch");
+        assert_eq!(range(mismatch), (2, 11, 12));
+        assert_eq!(
+            mismatch.message,
+            "cubemain.txt, line 3: wrong numinputs. expected 1, found 2 in recipe 'mismatch'"
+        );
+
+        let zero = &diags[1];
+        assert_code(zero, "cube-input.no-inputs");
+        assert_eq!(range(zero), (3, 7, 8));
+        assert_eq!(
+            zero.message,
+            "cubemain.txt, line 4: no inputs for recipe 'zero'"
+        );
+
+        let invalid = &diags[2];
+        assert_code(invalid, "cube-input.invalid-numinputs");
+        assert_eq!(range(invalid), (4, 10, 13));
+        assert_eq!(
+            invalid.message,
+            "cubemain.txt, line 5: invalid value for 'numinputs' for recipe 'invalid'"
+        );
+    }
+
+    #[tokio::test]
+    async fn cube_input_and_rune_item_codes_use_fixed_four_byte_lookup() {
+        let files = vec![
+            (
+                "weapons",
+                "code\tname\nstaf\tStaff\n가xA\tMultibyte\nabcé\tBoundary A\n",
+            ),
+            ("armor", "code\tname\ncap\tCap\n"),
+            ("misc", "code\tname\nhpot\tHealing Potion\n"),
+            (
+                "itemtypes",
+                "Code\tTreasureClass\tItemType\nweap\t1\tWeapon\n",
+            ),
+            ("uniqueitems", "index\nThe Gnasher\n"),
+            ("setitems", "index\nHsarus' Iron Heel\n"),
+            (
+                "cubemain",
+                "desc\tinput 1\tinput 2\tinput 3\tinput 4\nrow\tstaff\tSTAF\t가x\tabc€\n",
+            ),
+        ];
+        let fx = fixture(&files);
+        let diags = run_plugin("cubeInputCheck.ts", "cubemain", &fx).await;
+        assert_eq!(
+            diags.len(),
+            2,
+            "staff -> staf and multibyte first-four bytes resolve, while case and truncated UTF-8 prefixes stay exact: {diags:#?}"
+        );
+        assert_eq!(range(&diags[0]), (1, 10, 14));
+        assert_code(&diags[1], "cube-input.invalid-base");
+
+        let host = PluginHost::new(vec![plugin_path("cubeInputCheck.ts")]).unwrap();
+        let doc = fx.docs.get("cubemain").expect("cube fixture");
+        let multibyte_ctx = build_hover_context("cubemain", "input 3", "가x", 1, doc);
+        let hover = host
+            .hover(
+                multibyte_ctx.clone(),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await
+            .expect("multibyte cube-input hover");
+        assert!(hover.contains("Multibyte"), "{hover}");
+        assert_eq!(
+            host.goto_definition(
+                multibyte_ctx,
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await,
+            Some(("weapons".into(), "code".into(), "가xA".into()))
+        );
+
+        let rune_files = vec![
+            (
+                "weapons",
+                "code\tname\nstaf\tStaff\n가xA\tMultibyte\nabcé\tBoundary A\n",
+            ),
+            ("armor", "code\tname\ncap\tCap\n"),
+            ("misc", "code\tname\nhpot\tHealing Potion\n"),
+            (
+                "runes",
+                "Name\tRune1\tRune2\tRune3\tRune4\tRune5\tRune6\nrow\tstaff\tHPOT\t가x\tabc€\t\t\n",
+            ),
+        ];
+        let mut fx = fixture(&rune_files);
+        Arc::get_mut(&mut fx.snapshot)
+            .expect("unshared fixture snapshot")
+            .sources
+            .insert(
+                "weapons".into(),
+                WorkspaceSourceInfo {
+                    kind: "sibling".into(),
+                    version: Some("3.2".into()),
+                },
+            );
+        let diags = run_plugin("itemCodeCheck.ts", "runes", &fx).await;
+        assert_eq!(
+            diags.len(),
+            2,
+            "actual Rune# headers and lossless first-four byte identity must be enforced: {diags:#?}"
+        );
+        assert_eq!(range(&diags[0]), (1, 10, 14));
+        assert_code(&diags[0], "item-code.unresolved");
+        assert_code(&diags[1], "item-code.unresolved");
+
+        let host = PluginHost::new(vec![plugin_path("itemCodeCheck.ts")]).unwrap();
+        let doc = fx.docs.get("runes").expect("runes fixture");
+        let ctx = build_hover_context("runes", "Rune1", "staff", 1, doc);
+        let hover = host
+            .hover(ctx.clone(), Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("Rune hover");
+        assert!(
+            hover.contains("Staff")
+                && hover.contains("Source: TXT file in the same folder (game version 3.2)"),
+            "{hover}"
+        );
+        let target = host
+            .goto_definition(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("Rune fixed4 definition");
+        assert_eq!(target, ("weapons".into(), "code".into(), "staf".into()));
+
+        let multibyte_ctx = build_hover_context("runes", "Rune3", "가x", 1, doc);
+        let hover = host
+            .hover(
+                multibyte_ctx.clone(),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await
+            .expect("Rune multibyte fixed4 hover");
+        assert!(hover.contains("Multibyte"), "{hover}");
+        assert_eq!(
+            host.goto_definition(
+                multibyte_ctx,
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await,
+            Some(("weapons".into(), "code".into(), "가xA".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn item_code_check_separates_engine_lookup_from_unproven_policy_fields() {
+        let files = vec![
+            ("weapons", "code\tname\nstaf\tStaff\n"),
+            ("armor", "code\tname\ncap\tCap\n"),
+            ("misc", "code\tname\nhpot\tHealing Potion\n"),
+            ("uniqueitems", "index\tcode\nPolicy Sample\tmissing\n"),
+        ];
+        let fx = fixture(&files);
+        let diags = run_plugin("itemCodeCheck.ts", "uniqueitems", &fx).await;
+
+        assert_eq!(diags.len(), 1, "raw type-9 policy result: {diags:#?}");
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_code(&diags[0], "item-code.unresolved-policy");
+        assert!(diags[0].message.contains("No matching item was found"));
+        assert!(
+            diags[0]
+                .message
+                .contains("may keep the text without resolving it to an item")
+        );
+    }
+
+    #[tokio::test]
+    async fn prop_code_check_covers_gapped_headers_and_reports_sentinel_policy() {
+        let targets = [
+            ("properties", "code\nvalid\n"),
+            ("propertygroups", "code\nvalidgroup\n"),
+        ];
+        for (file, content, expected_code) in [
+            (
+                "monprop",
+                "id\tprop1\tprop1 (H)\tprop1 (N)\nrow\tvalid\tvalid\tmissing-monprop\n",
+                "property.unknown-code",
+            ),
+            (
+                "setitems",
+                "index\taprop1a\nrow\tmissing-aprop\n",
+                "property.unknown-code",
+            ),
+            (
+                "sets",
+                "index\tPCode2a\nrow\tmissing-pcode\n",
+                "property.unknown-code",
+            ),
+            (
+                "uniqueitems",
+                "index\tprop1\nrow\t*enr\n",
+                "property.unknown-marker",
+            ),
+        ] {
+            let files = vec![(file, content), targets[0], targets[1]];
+            let fx = fixture(&files);
+            let diags = run_plugin("propCodeCheck.ts", file, &fx).await;
+            assert_eq!(diags.len(), 1, "coverage {file}: {diags:#?}");
+            assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+            assert_code(&diags[0], expected_code);
+        }
+    }
+
+    #[tokio::test]
+    async fn tc_item_check_reports_u16_conversion_ignored_suffix_and_fixed_width() {
+        let width_value = format!("hpot,mul={}", "0".repeat(55));
+        assert_eq!(width_value.len(), 64);
+        let treasure = format!(
+            "Treasure Class\tItem1\tProb1\n\
+             Storage\thpot,mul=-1,cu=abc\t1\n\
+             Width\t{width_value}\t1\n\
+             Suffix\thpot,mul=1,wat=2,cu=abc\t1\n"
+        );
+        let mut files: Vec<(&str, &str)> = base_lookup_files();
+        files.push(("treasureclassex", treasure.as_str()));
+        let fx = fixture(&files);
+        let diags = run_plugin("tcItemCheck.ts", "treasureclassex", &fx).await;
+
+        assert_eq!(
+            diags.len(),
+            4,
+            "independent TC storage policies: {diags:#?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|diag| diag.severity == Some(DiagnosticSeverity::WARNING))
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|diag| diag.message.contains("game converts it to 65535"))
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|diag| diag.message.contains("game converts it to 0"))
+        );
+        assert!(diags.iter().any(|diag| diag.code
+            == Some(NumberOrString::String("tc-item.field-width".into()))));
+        assert!(
+            diags
+                .iter()
+                .any(|diag| diag.message.contains("The game stops at 'wat=2'")
+                    && diag.message.contains("everything after it are ignored"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tc_item_check_matches_sequential_lookup_gap_and_modifier_policy() {
+        let files = with_base_files((
+            "treasureclassex",
+            "Treasure Class\tPicks\tNoDrop\tItem1\tProb1\tItem2\tProb2\n\
+             Self\t1\t0\tSelf\t1\t\t\n\
+             Gap\t1\t0\t\t1\tbad-after-gap\t1\n\
+             Case\t1\t0\tHPOT\t1\t\t\n\
+             GeneratedFinite\t1\t0\tweap3\t1\t\t\n\
+             GeneratedInvalid\t1\t0\tweap5\t1\t\t\n\
+             BareItemType\t1\t0\tweap\t1\t\t\n\
+             UnknownMod\t1\t0\thpot,ZZ=1\t1\t\t\n\
+             Range\t1\t0\thpot,mul=65536\t1\t\t\n\
+             Forward\t1\t0\tLater\t1\t\t\n\
+             Later\t1\t0\thpot\t1\t\t\n\
+             Multibyte\t1\t0\t가x\t1\t\t\n\
+             Utf8TooLong\t1\t0\téabc\t1\t\t\n",
+        ));
+        let fx = fixture(&files);
+        let diags = run_plugin("tcItemCheck.ts", "treasureclassex", &fx).await;
+        assert_eq!(
+            diags.len(),
+            10,
+            "finite generated name clean; broad ItemTypes/gap/exact/forward/modifiers diagnosed: {diags:#?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.severity == Some(DiagnosticSeverity::WARNING)),
+            "Legacy parity uses warnings for these TC diagnostics: {diags:#?}"
+        );
+        assert!(diags.iter().any(|d| d.code == Some(NumberOrString::String("tc-item.forward-reference".into()))));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(NumberOrString::String("tc-item.ignored-suffix".into())))
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(NumberOrString::String("tc-item.modifier-range".into())))
+        );
+        let modifier_range = diags
+            .iter()
+            .find(|d| d.code == Some(NumberOrString::String("tc-item.modifier-range".into())))
+            .expect("modifier range warning");
+        assert_eq!(
+            modifier_range.message,
+            "treasureclassex.txt, line 9: Modifier 'mul=65536' for 'item1' in TC 'Range' is outside 0..65535. The game converts it to 0. Replace it with the number you actually want."
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(NumberOrString::String("tc-item.after-first-gap".into())))
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(NumberOrString::String("tc-prob.orphaned".into())))
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("can't find 'weap5' for 'item1'")),
+            "only the finite equipment-TC name set may resolve: {diags:#?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("can't find 'weap' for 'item1'")),
+            "bare ItemTypes codes are not Item# parser lookups: {diags:#?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("can't find 'éabc' for 'item1'")),
+            "a five-byte UTF-8 base must not enter the raw four-byte item-code path: {diags:#?}"
+        );
+        let orphan = diags
+            .iter()
+            .find(|diag| diag.code == Some(NumberOrString::String("tc-prob.orphaned".into())))
+            .expect("orphaned probability warning");
+        assert_eq!(range(orphan), (2, 9, 10));
+        assert_eq!(
+            orphan.message,
+            "prob1 is orphaned and ignored because item1 is empty."
+        );
+        let ignored_item = diags
+            .iter()
+            .find(|diag| {
+                diag.code == Some(NumberOrString::String("tc-item.after-first-gap".into()))
+            })
+            .expect("post-gap item warning");
+        assert_eq!(range(ignored_item), (2, 11, 24));
+        assert_eq!(
+            ignored_item.message,
+            "item2 is ignored because the first empty Item slot already ended this treasure class."
+        );
+        let ignored_prob = diags
+            .iter()
+            .find(|diag| {
+                diag.code == Some(NumberOrString::String("tc-prob.after-first-gap".into()))
+            })
+            .expect("post-gap probability warning");
+        assert_eq!(range(ignored_prob), (2, 25, 26));
+        assert_eq!(
+            ignored_prob.message,
+            "prob2 is ignored because the first empty Item slot already ended this treasure class."
+        );
+
+        let host = PluginHost::new(vec![plugin_path("tcItemCheck.ts")]).unwrap();
+        let doc = fx.docs.get("treasureclassex").expect("TC fixture");
+        let ctx = build_hover_context("treasureclassex", "Item1", "hpot,ZZ=1", 7, doc);
+        let hover = host
+            .hover(ctx.clone(), Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("TC hover");
+        assert!(
+            hover.contains("Healing Potion")
+                && hover.contains("Source: TXT file in the current workspace"),
+            "{hover}"
+        );
+        assert!(
+            hover.contains("Ignored text begins at: `ZZ=1`")
+                && hover.contains("base and modifiers before it still work"),
+            "hover should share TC parser suffix semantics: {hover}"
+        );
+        let target = host
+            .goto_definition(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
+            .await
+            .expect("TC definition from parsed base");
+        assert_eq!(target, ("weapons".into(), "code".into(), "hpot".into()));
+
+        let generated_ctx = build_hover_context("treasureclassex", "Item1", "weap3", 4, doc);
+        let generated_hover = host
+            .hover(
+                generated_ctx.clone(),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await
+            .expect("generated TC hover");
+        assert!(
+            generated_hover.contains("Generated Treasure Class")
+                && generated_hover.contains("Source: TXT file in the current workspace"),
+            "finite generated named-TC provenance: {generated_hover}"
+        );
+        let generated_target = host
+            .goto_definition(
+                generated_ctx,
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await
+            .expect("generated TC definition");
+        assert_eq!(
+            generated_target,
+            ("itemtypes".into(), "Code".into(), "weap".into())
+        );
+
+        let invalid_generated_ctx =
+            build_hover_context("treasureclassex", "Item1", "weap5", 5, doc);
+        let invalid_generated_hover = host
+            .hover(
+                invalid_generated_ctx.clone(),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await
+            .expect("unresolved TC item still exposes probability context");
+        assert!(
+            !invalid_generated_hover.contains("Generated Treasure Class")
+                && !invalid_generated_hover.contains("Source: TXT file in the current workspace"),
+            "arbitrary suffix must not inherit ItemTypes provenance: {invalid_generated_hover}"
+        );
+        assert!(
+            host.goto_definition(
+                invalid_generated_ctx,
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot)
+            )
+            .await
+            .is_none(),
+            "arbitrary generated-TC suffix must not define into ItemTypes"
+        );
+
+        let forward_ctx = build_hover_context("treasureclassex", "Item1", "Later", 9, doc);
+        let forward_hover = host
+            .hover(
+                forward_ctx.clone(),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await
+            .expect("forward TC hover keeps probability context");
+        assert!(
+            !forward_hover.contains("Treasure Class")
+                && !forward_hover.contains("Source: TXT file in the current workspace"),
+            "a later TC row must not resolve in hover: {forward_hover}"
+        );
+        assert!(
+            host.goto_definition(forward_ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot),)
+                .await
+                .is_none(),
+            "a later TC row must not resolve in goto-definition"
+        );
+
+        let self_ctx = build_hover_context("treasureclassex", "Item1", "Self", 1, doc);
+        let self_hover = host
+            .hover(
+                self_ctx.clone(),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await
+            .expect("self TC hover");
+        assert!(
+            self_hover.contains("Treasure Class")
+                && self_hover.contains("Source: TXT file in the current workspace"),
+            "the current row is already in the sequential TC map: {self_hover}"
+        );
+        assert_eq!(
+            host.goto_definition(self_ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot),)
+                .await,
+            Some((
+                "treasureclassex".into(),
+                "treasure class".into(),
+                "Self".into(),
+            ))
+        );
+
+        let multibyte_ctx = build_hover_context("treasureclassex", "Item1", "가x", 11, doc);
+        let multibyte_hover = host
+            .hover(
+                multibyte_ctx.clone(),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await
+            .expect("multibyte fixed4 TC hover");
+        assert!(
+            multibyte_hover.contains("Multibyte Item"),
+            "{multibyte_hover}"
+        );
+        assert_eq!(
+            host.goto_definition(
+                multibyte_ctx,
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await,
+            Some(("weapons".into(), "code".into(), "가xA".into()))
+        );
     }
 }
