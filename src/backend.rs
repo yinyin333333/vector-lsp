@@ -242,11 +242,27 @@ impl Backend {
         )
     }
 
+    fn json_scope_identity(uri: &Url) -> Option<String> {
+        let path = uri.to_file_path().ok()?;
+        data_root_from_localization_json(&path).map(|root| json_path_identity(&root))
+    }
+
     fn merge_json_batches(
         previous: &HashMap<Url, Vec<Diagnostic>>,
         batches: Vec<JsonDiagnosticBatch>,
         trigger: JsonAnalysisTrigger,
     ) -> Vec<JsonDiagnosticBatch> {
+        let invalid_scopes = batches
+            .iter()
+            .filter(|batch| {
+                batch
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| Self::diagnostic_has_code(diagnostic, "Json/Syntax"))
+            })
+            .filter_map(|batch| Self::json_scope_identity(&batch.uri))
+            .collect::<std::collections::HashSet<_>>();
+
         batches
             .into_iter()
             .map(|batch| {
@@ -254,6 +270,9 @@ impl Backend {
                     .diagnostics
                     .iter()
                     .any(|diagnostic| Self::diagnostic_has_code(diagnostic, "Json/Syntax"));
+                let scope_has_syntax_error = trigger == JsonAnalysisTrigger::All
+                    && Self::json_scope_identity(&batch.uri)
+                        .is_some_and(|scope| invalid_scopes.contains(&scope));
                 if has_syntax_error {
                     let mut diagnostics = previous.get(&batch.uri).cloned().unwrap_or_default();
                     diagnostics
@@ -263,6 +282,27 @@ impl Backend {
                             Self::diagnostic_has_code(diagnostic, "Json/Syntax")
                         }),
                     );
+                    return JsonDiagnosticBatch {
+                        uri: batch.uri,
+                        diagnostics,
+                    };
+                }
+                if scope_has_syntax_error {
+                    let mut diagnostics = previous
+                        .get(&batch.uri)
+                        .map(|diagnostics| {
+                            diagnostics
+                                .iter()
+                                .filter(|diagnostic| {
+                                    Self::diagnostic_has_code(diagnostic, "Json/DuplicateIds")
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    diagnostics.extend(batch.diagnostics.into_iter().filter(|diagnostic| {
+                        !Self::diagnostic_has_code(diagnostic, "Json/DuplicateIds")
+                    }));
                     return JsonDiagnosticBatch {
                         uri: batch.uri,
                         diagnostics,
@@ -485,12 +525,14 @@ impl Backend {
                 }
             };
 
-        // Preserve the last valid semantic diagnostics while the current JSON
-        // is syntactically invalid, and replace only the prior syntax error
-        // with the current one. A successful All pass still replaces the whole
-        // snapshot. KeyUsage-only passes retain the two JSON-only rule results.
-        // Merge only files observed by this pass so deleted/out-of-scope files
-        // are still retired by clear_obsolete_json_if_current.
+        // Preserve the last valid semantic diagnostics for a syntactically invalid
+        // JSON file. Json/DuplicateIds is scope-wide, so if any localization JSON
+        // in a scope is invalid, retain that rule's previous snapshot for every
+        // observed peer while allowing local StringFormat and KeyUsage results to
+        // update. Successful All passes still replace unaffected scopes.
+        // KeyUsage-only passes retain the two JSON-only rule results. Merge only
+        // files observed by this pass so deleted/out-of-scope files are still
+        // retired by clear_obsolete_json_if_current.
         let previous = self.workspace.read().await.published_json_diagnostics();
         let batches = Self::merge_json_batches(&previous, batches, trigger);
 
@@ -3163,6 +3205,95 @@ mod tests {
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["recalculated duplicate"]
+        );
+    }
+
+    #[test]
+    fn json_merge_preserves_duplicate_snapshot_for_invalid_scope_peers() {
+        let strings = std::env::temp_dir()
+            .join("vector-lsp-json-merge-invalid-scope")
+            .join("data")
+            .join("local")
+            .join("lng")
+            .join("strings");
+        let other_strings = std::env::temp_dir()
+            .join("vector-lsp-json-merge-other-scope")
+            .join("data")
+            .join("local")
+            .join("lng")
+            .join("strings");
+        let invalid = Url::from_file_path(strings.join("bnet.json")).unwrap();
+        let peer = Url::from_file_path(strings.join("commands.json")).unwrap();
+        let unrelated = Url::from_file_path(other_strings.join("skills.json")).unwrap();
+        let diagnostic = |code: &str, message: &str| Diagnostic {
+            code: Some(NumberOrString::String(code.to_string())),
+            message: message.to_string(),
+            ..Diagnostic::default()
+        };
+        let previous = HashMap::from([
+            (
+                invalid.clone(),
+                vec![diagnostic("Json/StringFormat", "invalid file format")],
+            ),
+            (
+                peer.clone(),
+                vec![
+                    diagnostic("Json/DuplicateIds", "cross-file duplicate"),
+                    diagnostic("Json/StringFormat", "old peer format"),
+                ],
+            ),
+            (
+                unrelated.clone(),
+                vec![diagnostic("Json/DuplicateIds", "old unrelated duplicate")],
+            ),
+        ]);
+
+        let merged = Backend::merge_json_batches(
+            &previous,
+            vec![
+                JsonDiagnosticBatch {
+                    uri: invalid.clone(),
+                    diagnostics: vec![diagnostic("Json/Syntax", "current syntax")],
+                },
+                JsonDiagnosticBatch {
+                    uri: peer.clone(),
+                    diagnostics: vec![diagnostic("Json/StringFormat", "new peer format")],
+                },
+                JsonDiagnosticBatch {
+                    uri: unrelated.clone(),
+                    diagnostics: vec![diagnostic("Json/DuplicateIds", "new unrelated duplicate")],
+                },
+            ],
+            JsonAnalysisTrigger::All,
+        );
+
+        let messages = |uri: &Url| -> Vec<String> {
+            merged
+                .iter()
+                .find(|batch| &batch.uri == uri)
+                .expect("expected diagnostics batch")
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect()
+        };
+        assert_eq!(
+            messages(&invalid),
+            vec![
+                "invalid file format".to_string(),
+                "current syntax".to_string(),
+            ]
+        );
+        assert_eq!(
+            messages(&peer),
+            vec![
+                "cross-file duplicate".to_string(),
+                "new peer format".to_string(),
+            ]
+        );
+        assert_eq!(
+            messages(&unrelated),
+            vec!["new unrelated duplicate".to_string()]
         );
     }
 
