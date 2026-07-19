@@ -1274,6 +1274,36 @@ impl Backend {
         }
     }
 
+    async fn validate_open_schema_ticket(
+        &self,
+        ticket: &ValidationTicket,
+    ) -> Option<Vec<Diagnostic>> {
+        let (stem, doc, schema, symbols, reference_version) = {
+            let ws = self.workspace.read().await;
+            if !ws.is_current(ticket) {
+                return None;
+            }
+            (
+                Self::file_stem(&ticket.uri),
+                Arc::clone(ws.open_documents.get(&ticket.uri)?),
+                ws.schema.clone(),
+                ws.symbols_for_uri(&ticket.uri),
+                ws.reference_version.clone(),
+            )
+        };
+        tokio::task::spawn_blocking(move || {
+            diagnostics::validate_document_for_version(
+                &stem,
+                &doc,
+                schema.as_deref(),
+                &symbols,
+                reference_version.as_deref(),
+            )
+        })
+        .await
+        .ok()
+    }
+
     async fn validate_open_ticket(&self, ticket: &ValidationTicket) -> Option<Vec<Diagnostic>> {
         let (schema_diags, plugin_data) = {
             let ws = self.workspace.read().await;
@@ -1326,11 +1356,81 @@ impl Backend {
         self.workspace.write().await.mark_published(ticket)
     }
 
+    async fn publish_open_preview_if_current(
+        &self,
+        ticket: &ValidationTicket,
+        diagnostics: Vec<Diagnostic>,
+    ) -> bool {
+        let gate = self.publish_gate(&ticket.uri).await;
+        let _guard = gate.lock().await;
+        if !self.workspace.read().await.needs_publish(ticket) {
+            return false;
+        }
+        self.client
+            .publish_diagnostics(ticket.uri.clone(), diagnostics, Some(ticket.client_version))
+            .await;
+        true
+    }
+
     async fn validate_and_publish_open(&self, ticket: ValidationTicket) -> bool {
         let Some(diagnostics) = self.validate_open_ticket(&ticket).await else {
             return false;
         };
         self.publish_open_if_current(&ticket, diagnostics).await
+    }
+
+    async fn validate_and_publish_open_schema_preview(&self, ticket: &ValidationTicket) -> bool {
+        let Some(schema_diags) = self.validate_open_schema_ticket(&ticket).await else {
+            return false;
+        };
+        self.publish_open_preview_if_current(ticket, schema_diags)
+            .await
+    }
+
+    async fn run_workspace_revalidation_worker(self, session_generation: u64) {
+        loop {
+            self.revalidate_workspace_after_change().await;
+            if !self
+                .workspace
+                .write()
+                .await
+                .workspace_revalidation_worker_should_continue(session_generation)
+            {
+                return;
+            }
+        }
+    }
+
+    async fn run_schema_preview_worker(self, uri: Url, session_generation: u64) {
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let ticket = {
+                let workspace = self.workspace.read().await;
+                if workspace.session_generation != session_generation {
+                    return;
+                }
+                workspace
+                    .open_tickets()
+                    .into_iter()
+                    .find(|ticket| ticket.uri == uri)
+            };
+            let Some(ticket) = ticket else {
+                self.workspace
+                    .write()
+                    .await
+                    .finish_schema_preview_worker(&uri);
+                return;
+            };
+            self.validate_and_publish_open_schema_preview(&ticket).await;
+            if self
+                .workspace
+                .write()
+                .await
+                .finish_schema_preview_worker_if_current(&ticket)
+            {
+                return;
+            }
+        }
     }
 
     async fn publish_disk_if_current(
@@ -2421,7 +2521,7 @@ impl LanguageServer for Backend {
 
         // Reconstruct current text from the stored document, apply each incremental
         // change in order, then re-parse. Avoids receiving the full document over IPC.
-        let update_result: Result<(bool, bool), DocumentChangeError> = {
+        let update_result: Result<(bool, bool, ValidationTicket), DocumentChangeError> = {
             let mut ws = self.workspace.write().await;
 
             let existing_text = ws
@@ -2441,11 +2541,12 @@ impl LanguageServer for Backend {
             let full_text = lines.join("\n");
             let doc = Arc::new(DocumentData::parse(&full_text, delimiter));
             match ws.accept_change(&uri, params.text_document.version, Arc::clone(&doc)) {
-                Ok(_) => {
-                    ws.rebuild_effective_symbols();
+                Ok(ticket) => {
+                    ws.refresh_open_document_symbols(&uri);
                     Ok((
                         ws.phase == WorkspacePhase::Ready,
                         json_enabled && ws.primary_json_data_root_for_uri(&uri).is_some(),
+                        ticket,
                     ))
                 }
                 Err(error) => Err(error),
@@ -2454,10 +2555,41 @@ impl LanguageServer for Backend {
         drop(mutation_guard);
         let json_relevant = update_result
             .as_ref()
-            .is_ok_and(|(_, json_relevant)| *json_relevant);
+            .is_ok_and(|(_, json_relevant, _)| *json_relevant);
         match update_result {
-            Ok((true, _)) => self.revalidate_workspace_after_change().await,
-            Ok((false, _)) => {}
+            Ok((true, _, ticket)) => {
+                // Coalesce rapid edits per URI and validate on the blocking pool.
+                // Plugin diagnostics and dependent files follow in a separate
+                // session-wide worker, so didChange never waits for a full scan.
+                if let Some(preview_session_generation) = self
+                    .workspace
+                    .write()
+                    .await
+                    .reserve_schema_preview_worker(&ticket.uri)
+                {
+                    let backend = self.clone();
+                    let preview_uri = ticket.uri.clone();
+                    tokio::spawn(async move {
+                        backend
+                            .run_schema_preview_worker(preview_uri, preview_session_generation)
+                            .await;
+                    });
+                }
+                if let Some(session_generation) = self
+                    .workspace
+                    .write()
+                    .await
+                    .start_workspace_revalidation_worker()
+                {
+                    let backend = self.clone();
+                    tokio::spawn(async move {
+                        backend
+                            .run_workspace_revalidation_worker(session_generation)
+                            .await;
+                    });
+                }
+            }
+            Ok((false, _, _)) => {}
             Err(error) => self.report_rejected_change(&uri, error).await,
         }
         if json_relevant {

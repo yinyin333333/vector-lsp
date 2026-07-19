@@ -97,7 +97,7 @@ pub struct PluginWorkspaceView {
 #[derive(Clone)]
 struct DirectorySymbolView {
     session_generation: u64,
-    workspace_revision: u64,
+    symbol_generation: u64,
     index: Arc<SymbolIndex>,
 }
 
@@ -138,6 +138,16 @@ impl SymbolIndex {
             columns: HashSet::new(),
             files: HashSet::new(),
         }
+    }
+
+    pub fn remove_file(&mut self, file_stem: &str) {
+        let stem = file_stem.to_ascii_lowercase();
+        self.ascii_ci_entries
+            .retain(|(entry_stem, _, _), _| entry_stem != &stem);
+        self.fixed4_entries
+            .retain(|(entry_stem, _, _), _| entry_stem != &stem);
+        self.columns.retain(|(entry_stem, _)| entry_stem != &stem);
+        self.files.remove(&stem);
     }
 
     /// Index the cells of `doc` that belong to columns listed in `ref_targets`.
@@ -433,6 +443,7 @@ pub struct Workspace {
     pub session_generation: u64,
     pub scan_generation: u64,
     pub workspace_revision: u64,
+    symbol_generation: u64,
     document_versions: HashMap<Url, i32>,
     document_epochs: HashMap<Url, u64>,
     document_revisions: HashMap<Url, u64>,
@@ -460,6 +471,8 @@ pub struct Workspace {
     pending_json_analysis: PendingJsonAnalysis,
     json_analysis_worker_running: bool,
     json_startup_analysis_queued: bool,
+    workspace_revalidation_worker_session: Option<u64>,
+    schema_preview_workers: HashSet<Url>,
     next_document_epoch: u64,
     next_document_revision: u64,
     plugin_workspace_view: Mutex<Option<PluginWorkspaceView>>,
@@ -493,6 +506,7 @@ impl Workspace {
             session_generation: 0,
             scan_generation: 0,
             workspace_revision: 0,
+            symbol_generation: 0,
             document_versions: HashMap::new(),
             document_epochs: HashMap::new(),
             document_revisions: HashMap::new(),
@@ -514,6 +528,8 @@ impl Workspace {
             pending_json_analysis: PendingJsonAnalysis::default(),
             json_analysis_worker_running: false,
             json_startup_analysis_queued: false,
+            workspace_revalidation_worker_session: None,
+            schema_preview_workers: HashSet::new(),
             next_document_epoch: 0,
             next_document_revision: 0,
             plugin_workspace_view: Mutex::new(None),
@@ -594,7 +610,51 @@ impl Workspace {
         self.pending_json_analysis = PendingJsonAnalysis::default();
         self.json_analysis_worker_running = false;
         self.json_startup_analysis_queued = false;
+        self.workspace_revalidation_worker_session = None;
+        self.schema_preview_workers.clear();
         self.phase = WorkspacePhase::LoadingSchema;
+    }
+
+    pub fn reserve_schema_preview_worker(&mut self, uri: &Url) -> Option<u64> {
+        self.schema_preview_workers
+            .insert(uri.clone())
+            .then_some(self.session_generation)
+    }
+
+    pub fn finish_schema_preview_worker_if_current(&mut self, ticket: &ValidationTicket) -> bool {
+        if !self.is_current(ticket) {
+            return false;
+        }
+        self.schema_preview_workers.remove(&ticket.uri);
+        true
+    }
+
+    pub fn finish_schema_preview_worker(&mut self, uri: &Url) {
+        self.schema_preview_workers.remove(uri);
+    }
+
+    pub fn start_workspace_revalidation_worker(&mut self) -> Option<u64> {
+        if self.phase != WorkspacePhase::Ready
+            || self.workspace_revalidation_worker_session == Some(self.session_generation)
+        {
+            return None;
+        }
+        self.workspace_revalidation_worker_session = Some(self.session_generation);
+        Some(self.session_generation)
+    }
+
+    pub fn workspace_revalidation_worker_should_continue(
+        &mut self,
+        session_generation: u64,
+    ) -> bool {
+        if self.workspace_revalidation_worker_session != Some(session_generation) {
+            return false;
+        }
+        if self.phase == WorkspacePhase::Ready && !self.pending_open_tickets().is_empty() {
+            return true;
+        }
+        self.workspace_revalidation_worker_session = None;
+        false
     }
 
     pub fn set_watched_files_client_capabilities(
@@ -986,7 +1046,66 @@ impl Workspace {
                 source.bundled_version.as_deref(),
             );
         }
+        self.symbol_generation = self.symbol_generation.wrapping_add(1);
         self.clear_contextual_views();
+    }
+
+    fn replace_symbol_source(
+        index: &mut SymbolIndex,
+        source: &EffectiveSource,
+        ref_targets: &HashSet<(String, String)>,
+    ) {
+        index.remove_file(&source.stem);
+        index.index_effective_document(
+            source.uri.as_ref(),
+            &source.stem,
+            &source.document,
+            ref_targets,
+            source.kind,
+            source.bundled_version.as_deref(),
+        );
+    }
+
+    pub fn refresh_open_document_symbols(&mut self, uri: &Url) {
+        let Some(stem) = normalized_file_stem_from_uri(uri) else {
+            self.rebuild_effective_symbols();
+            return;
+        };
+        let global_source = self
+            .effective_sources()
+            .into_iter()
+            .find(|source| source.stem.eq_ignore_ascii_case(&stem));
+        let scoped_source = self
+            .uses_directory_scopes()
+            .then(|| {
+                self.effective_sources_for_uri(uri)
+                    .into_iter()
+                    .find(|source| source.stem.eq_ignore_ascii_case(&stem))
+            })
+            .flatten();
+        let Some(global_source) = global_source else {
+            self.rebuild_effective_symbols();
+            return;
+        };
+
+        Self::replace_symbol_source(&mut self.symbols, &global_source, &self.ref_targets);
+        self.symbol_generation = self.symbol_generation.wrapping_add(1);
+
+        let cache_key = if self.uses_directory_scopes() {
+            self.directory_scope_key_for_uri(uri)
+        } else {
+            Some(String::new())
+        };
+        let Some(cache_key) = cache_key else {
+            return;
+        };
+        let source = scoped_source.as_ref().unwrap_or(&global_source);
+        let mut cached = self.directory_symbol_views.lock().unwrap();
+        if let Some(view) = cached.get_mut(&cache_key) {
+            Self::replace_symbol_source(Arc::make_mut(&mut view.index), source, &self.ref_targets);
+            view.session_generation = self.session_generation;
+            view.symbol_generation = self.symbol_generation;
+        }
     }
 
     pub fn mark_failed(&mut self) {
@@ -1217,7 +1336,7 @@ impl Workspace {
         let mut cached = self.directory_symbol_views.lock().unwrap();
         if let Some(view) = cached.get(key)
             && view.session_generation == self.session_generation
-            && view.workspace_revision == self.workspace_revision
+            && view.symbol_generation == self.symbol_generation
         {
             return Arc::clone(&view.index);
         }
@@ -1226,7 +1345,7 @@ impl Workspace {
             key.to_string(),
             DirectorySymbolView {
                 session_generation: self.session_generation,
-                workspace_revision: self.workspace_revision,
+                symbol_generation: self.symbol_generation,
                 index: Arc::clone(&index),
             },
         );
@@ -2355,6 +2474,65 @@ mod tests {
             })
         );
         assert_eq!(workspace.open_documents[&uri].rows[0].cells[0].value, "V2");
+    }
+
+    #[test]
+    fn open_document_symbol_refresh_replaces_only_the_changed_file() {
+        let uri = uri();
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(8);
+        workspace.workspace_directory_scopes = true;
+        workspace
+            .ref_targets
+            .insert(("items".to_string(), "id".to_string()));
+        workspace.accept_open(
+            uri.clone(),
+            1,
+            Arc::new(DocumentData::parse("id\tlabel\nKEY\told", '\t')),
+        );
+        workspace.rebuild_effective_symbols();
+        let first = workspace.symbols_for_uri(&uri);
+        assert!(first.lookup("items", "id", "KEY").is_some());
+
+        let label_edit = Arc::new(DocumentData::parse("id\tlabel\nKEY\tnew", '\t'));
+        workspace.accept_change(&uri, 2, label_edit).unwrap();
+        workspace.refresh_open_document_symbols(&uri);
+        let after_label_edit = workspace.symbols_for_uri(&uri);
+        assert!(after_label_edit.lookup("items", "id", "KEY").is_some());
+
+        let id_edit = Arc::new(DocumentData::parse("id\tlabel\nOTHER\tnew", '\t'));
+        workspace.accept_change(&uri, 3, id_edit).unwrap();
+        workspace.refresh_open_document_symbols(&uri);
+        let after_id_edit = workspace.symbols_for_uri(&uri);
+        assert!(after_id_edit.lookup("items", "id", "KEY").is_none());
+        assert!(after_id_edit.lookup("items", "id", "OTHER").is_some());
+        assert!(first.lookup("items", "id", "KEY").is_some());
+    }
+
+    #[test]
+    fn live_diagnostic_workers_coalesce_and_follow_the_current_session() {
+        let uri = uri();
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(21);
+        workspace.phase = WorkspacePhase::Ready;
+        let first = workspace.accept_open(uri.clone(), 1, doc("V1"));
+
+        assert_eq!(workspace.reserve_schema_preview_worker(&uri), Some(21));
+        assert_eq!(workspace.reserve_schema_preview_worker(&uri), None);
+        let second = workspace.accept_change(&uri, 2, doc("V2")).unwrap();
+        assert!(!workspace.finish_schema_preview_worker_if_current(&first));
+        assert!(workspace.finish_schema_preview_worker_if_current(&second));
+
+        assert_eq!(workspace.start_workspace_revalidation_worker(), Some(21));
+        assert_eq!(workspace.start_workspace_revalidation_worker(), None);
+        assert!(workspace.workspace_revalidation_worker_should_continue(21));
+        assert!(workspace.mark_published(&second));
+        assert!(!workspace.workspace_revalidation_worker_should_continue(21));
+
+        workspace.begin_initialization(22);
+        workspace.phase = WorkspacePhase::Ready;
+        assert_eq!(workspace.reserve_schema_preview_worker(&uri), Some(22));
+        assert_eq!(workspace.start_workspace_revalidation_worker(), Some(22));
     }
 
     #[test]
