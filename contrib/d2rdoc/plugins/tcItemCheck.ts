@@ -525,28 +525,6 @@ function resolveItemName(base: string, rowLine: number): string | null {
     return null;
 }
 
-function resolvedSourceStem(base: string, rowLine: number): string | null {
-    const packedTarget = findPackedItemTarget(base);
-    if (packedTarget) return packedTarget[0];
-    if (generatedTcCode(base)) return "itemtypes";
-    if (lookupKey("uniqueitems", "index", base)) return "uniqueitems";
-    if (lookupKey("setitems", "index", base)) return "setitems";
-    if (resolvesSequentialTc(base, rowLine)) return "treasureclassex";
-    return null;
-}
-
-function sourceDescription(stem: string): string | null {
-    const source = getWorkspaceSource(stem);
-    if (!source) return null;
-    if (source.kind === "bundled") {
-        return "Built-in reference data (game version " + (source.version ?? "unknown") + ")";
-    }
-    const version = source.version ? " (game version " + source.version + ")" : "";
-    if (source.kind === "open") return "Open document" + version;
-    if (source.kind === "sibling") return "TXT file in the same folder" + version;
-    return "TXT file in the current workspace" + version;
-}
-
 // ─── hover ──────────────────────────────────────────────────────────────────
 // Handles both Item# and Prob# columns in TreasureClassEx.txt.
 //
@@ -647,10 +625,6 @@ function hover(ctx: HoverContext): HoverResult | null {
     }
 
     const parts: string[] = [nameContent];
-    const sourceStem = resolvedSourceStem(base, ctx.rowLine);
-    const sourceMeta = sourceStem ? getWorkspaceSource(sourceStem) : null;
-    const source = sourceStem ? sourceDescription(sourceStem) : null;
-    if (source) parts.push("", "Source: " + source);
     if (parsedItem.modifiers.length > 0) {
         parts.push("", "*Modifiers the game will use:*");
         for (const modifier of parsedItem.modifiers) {
@@ -678,9 +652,6 @@ function hover(ctx: HoverContext): HoverResult | null {
             base,
             slot: idx,
             name: resolveItemName(base, ctx.rowLine) || "",
-            sourceFile: sourceStem || "",
-            sourceKind: sourceMeta?.kind || "",
-            sourceVersion: sourceMeta?.version || "",
             modifiers: JSON.stringify(parsedItem.modifiers.map((modifier) => modifier.text)),
             modifierStorage: JSON.stringify(parsedItem.modifiers.map((modifier) => {
                 const parameter = modifier.value?.text ?? "";

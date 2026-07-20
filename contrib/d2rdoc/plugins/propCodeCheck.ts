@@ -148,18 +148,6 @@ function gotoDefinition(ctx: GotoDefinitionContext): GotoDefinitionTarget | null
     return null;
 }
 
-function sourceDescription(stem: string): string | null {
-    const source = getWorkspaceSource(stem);
-    if (!source) return null;
-    if (source.kind === "bundled") {
-        return "Built-in reference data (game version " + (source.version ?? "unknown") + ")";
-    }
-    const version = source.version ? " (game version " + source.version + ")" : "";
-    if (source.kind === "open") return "Open document" + version;
-    if (source.kind === "sibling") return "TXT file in the same folder" + version;
-    return "TXT file in the current workspace" + version;
-}
-
 function hover(ctx: HoverContext): HoverResult | null {
     if (!isPropCodeCol(ctx.file, ctx.col) || !ctx.value) return null;
     let stem: string | null = null;
@@ -173,16 +161,12 @@ function hover(ctx: HoverContext): HoverResult | null {
             legacyContent: `Unknown property code: \`${ctx.value}\`. Choose a code from properties.txt or propertygroups.txt.`,
         };
     }
-    const source = getWorkspaceSource(stem);
     return {
         contentKey: "plugin.property.hover",
         contentArgs: {
             value: ctx.value,
             sourceFile: stem,
-            sourceKind: source?.kind || "",
-            sourceVersion: source?.version || "",
         },
-        legacyContent: `Property: \`${ctx.value}\` (${stem}.txt code)`
-            + (sourceDescription(stem) ? "\n\nSource: " + sourceDescription(stem) : ""),
+        legacyContent: `Property: \`${ctx.value}\` (${stem}.txt code)`,
     };
 }

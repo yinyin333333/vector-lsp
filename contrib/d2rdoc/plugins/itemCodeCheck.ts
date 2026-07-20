@@ -96,18 +96,6 @@ function findCiItemTarget(value: string): [string, string] | null {
     return null;
 }
 
-function sourceDescription(stem: string): string | null {
-    const source = getWorkspaceSource(stem);
-    if (!source) return null;
-    if (source.kind === "bundled") {
-        return "Built-in reference data (game version " + (source.version ?? "unknown") + ")";
-    }
-    const version = source.version ? " (game version " + source.version + ")" : "";
-    if (source.kind === "open") return "Open document" + version;
-    if (source.kind === "sibling") return "TXT file in the same folder" + version;
-    return "TXT file in the current workspace" + version;
-}
-
 type ItemCodeSemantics = "resolved-fixed4" | "raw-fixed4-policy" | "ci-policy";
 
 function itemCodeSemantics(file: string, col: string): ItemCodeSemantics {
@@ -138,17 +126,13 @@ function hover(ctx: HoverContext): HoverResult | null {
     const name = names[0];
     if (!name) return null;
 
-    const source = getWorkspaceSource(target[0]);
     return {
         contentKey: "plugin.item-code.hover",
         contentArgs: {
             code: ctx.value,
             name,
-            sourceKind: source?.kind || "",
-            sourceVersion: source?.version || "",
         },
-        legacyContent: ctx.value + "\n\n" + name
-            + (sourceDescription(target[0]) ? "\n\nSource: " + sourceDescription(target[0]) : ""),
+        legacyContent: ctx.value + "\n" + name,
     };
 }
 

@@ -310,30 +310,6 @@ function resolveOutputBase(base: string, sets: OutputLookupSets): OutputBaseKind
     return null;
 }
 
-function resolvedOutputSourceStem(base: string, kind: OutputBaseKind | null): string | null {
-    if (kind === "item" && utf8Bytes(base).length <= 4) {
-        if (lookupKeyFixed4("weapons", "code", base)) return "weapons";
-        if (lookupKeyFixed4("armor", "code", base)) return "armor";
-        if (lookupKeyFixed4("misc", "code", base)) return "misc";
-    }
-    if (kind === "itemtype" && lookupKeyFixed4("itemtypes", "Code", base)) return "itemtypes";
-    if (kind === "unique" && lookupKey("uniqueitems", "index", base)) return "uniqueitems";
-    if (kind === "set" && lookupKey("setitems", "index", base)) return "setitems";
-    return null;
-}
-
-function sourceDescription(stem: string): string | null {
-    const source = getWorkspaceSource(stem);
-    if (!source) return null;
-    if (source.kind === "bundled") {
-        return "Built-in reference data (game version " + (source.version ?? "unknown") + ")";
-    }
-    const version = source.version ? " (game version " + source.version + ")" : "";
-    if (source.kind === "open") return "Open document" + version;
-    if (source.kind === "sibling") return "TXT file in the same folder" + version;
-    return "TXT file in the current workspace" + version;
-}
-
 function activeCubeRow(row: WorkspaceRow): boolean {
     const enabled = row["enabled"];
     if (enabled === undefined) return true;
@@ -606,12 +582,6 @@ function hover(ctx: HoverContext): HoverResult | null {
     const parts: string[] = [
         outputBaseHover(parsed.base.text, kind, ctx.col, canProveBaseInvalid),
     ];
-    const resolvedStem = resolvedOutputSourceStem(parsed.base.text, kind);
-    if (resolvedStem) {
-        const source = sourceDescription(resolvedStem);
-        if (source) parts.push("", "Source: " + source);
-    }
-
     if (kind === null && canProveBaseInvalid) {
         if (parsed.ignored) {
             const text = parsed.ignored.text || "(empty modifier)";
@@ -627,7 +597,6 @@ function hover(ctx: HoverContext): HoverResult | null {
                 column: ctx.col,
                 kind: kind || "",
                 ignoredSuffix: parsed.ignored?.text || "",
-                sourceFile: resolvedStem || "",
             },
             legacyContent: parts.join("\n"),
         };
@@ -694,7 +663,6 @@ function hover(ctx: HoverContext): HoverResult | null {
                 : "",
             modifiers: JSON.stringify(parsed.modifiers),
             ignoredSuffix: parsed.ignored?.text || "",
-            sourceFile: resolvedStem || "",
         },
         legacyContent: parts.join("\n"),
     };

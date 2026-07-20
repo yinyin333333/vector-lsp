@@ -275,7 +275,18 @@ pub fn localize(locale: Locale, key: &str, args: &Map<String, Value>) -> String 
         text.push_str("\n\n");
         text.push_str(&detail);
     }
-    text
+    compact_plugin_hover_spacing(key, text)
+}
+
+fn compact_plugin_hover_spacing(key: &str, text: String) -> String {
+    if !key.starts_with("plugin.") || !key.contains(".hover") {
+        return text;
+    }
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn value_usize(args: &Map<String, Value>, key: &str) -> usize {
@@ -569,9 +580,6 @@ fn plugin_semantic_detail(locale: Locale, key: &str, args: &Map<String, Value>) 
             ),
         }),
         "plugin.treasure-class.hover" => {
-            let source_file = argument_text(args, "sourceFile");
-            let source_kind = argument_text(args, "sourceKind");
-            let source_version = argument_text(args, "sourceVersion");
             let modifiers = argument_text(args, "modifierStorage");
             let ignored = argument_text(args, "ignoredSuffix");
             let picks = argument_text(args, "picks");
@@ -579,43 +587,43 @@ fn plugin_semantic_detail(locale: Locale, key: &str, args: &Map<String, Value>) 
             let at_least_once = argument_text(args, "atLeastOnceChance");
             Some(match locale {
                 Locale::EnUs => format!(
-                    "Runtime details: per-roll chance {per_roll}; at least once in {picks} picks {at_least_once}; modifier storage {modifiers}; ignored suffix `{ignored}`; source {source_kind} {source_version} ({source_file})."
+                    "Runtime details: per-roll chance {per_roll}; at least once in {picks} picks {at_least_once}; modifier storage {modifiers}; ignored suffix `{ignored}`."
                 ),
                 Locale::KoKr => format!(
-                    "**게임 처리 정보**\n\n회당 확률: {per_roll}\n{picks}회 추첨 중 한 번 이상: {at_least_once}\n수정자 저장값: {modifiers}\n무시되는 접미사: `{ignored}`\n출처: {source_kind} {source_version} ({source_file})"
+                    "**게임 처리 정보**\n회당 확률: {per_roll}\n{picks}회 추첨 중 한 번 이상: {at_least_once}\n수정자 저장값: {modifiers}\n무시되는 접미사: `{ignored}`"
                 ),
                 Locale::ZhCn => format!(
-                    "**游戏处理信息**\n\n单次概率：{per_roll}\n{picks} 次抽取中至少一次：{at_least_once}\n修饰符存储值：{modifiers}\n忽略的后缀：`{ignored}`\n来源：{source_kind} {source_version} ({source_file})"
+                    "**游戏处理信息**\n单次概率：{per_roll}\n{picks} 次抽取中至少一次：{at_least_once}\n修饰符存储值：{modifiers}\n忽略的后缀：`{ignored}`"
                 ),
                 Locale::ZhTw => format!(
-                    "**遊戲處理資訊**\n\n單次機率：{per_roll}\n{picks} 次抽取中至少一次：{at_least_once}\n修飾符儲存值：{modifiers}\n忽略的字尾：`{ignored}`\n來源：{source_kind} {source_version} ({source_file})"
+                    "**遊戲處理資訊**\n單次機率：{per_roll}\n{picks} 次抽取中至少一次：{at_least_once}\n修飾符儲存值：{modifiers}\n忽略的字尾：`{ignored}`"
                 ),
                 Locale::DeDe => format!(
-                    "**Laufzeitdetails**\n\nChance pro Ziehung: {per_roll}\nMindestens einmal bei {picks} Ziehungen: {at_least_once}\nGespeicherte Modifikatoren: {modifiers}\nIgnorierter Suffix: `{ignored}`\nQuelle: {source_kind} {source_version} ({source_file})"
+                    "**Laufzeitdetails**\nChance pro Ziehung: {per_roll}\nMindestens einmal bei {picks} Ziehungen: {at_least_once}\nGespeicherte Modifikatoren: {modifiers}\nIgnorierter Suffix: `{ignored}`"
                 ),
                 Locale::EsEs => format!(
-                    "**Detalles de ejecución**\n\nProbabilidad por tirada: {per_roll}\nAl menos una vez en {picks} tiradas: {at_least_once}\nValores almacenados de modificadores: {modifiers}\nSufijo ignorado: `{ignored}`\nOrigen: {source_kind} {source_version} ({source_file})"
+                    "**Detalles de ejecución**\nProbabilidad por tirada: {per_roll}\nAl menos una vez en {picks} tiradas: {at_least_once}\nValores almacenados de modificadores: {modifiers}\nSufijo ignorado: `{ignored}`"
                 ),
                 Locale::FrFr => format!(
-                    "**Détails d’exécution**\n\nChance par tirage : {per_roll}\nAu moins une fois en {picks} tirages : {at_least_once}\nValeurs stockées des modificateurs : {modifiers}\nSuffixe ignoré : `{ignored}`\nSource : {source_kind} {source_version} ({source_file})"
+                    "**Détails d’exécution**\nChance par tirage : {per_roll}\nAu moins une fois en {picks} tirages : {at_least_once}\nValeurs stockées des modificateurs : {modifiers}\nSuffixe ignoré : `{ignored}`"
                 ),
                 Locale::ItIt => format!(
-                    "**Dettagli di esecuzione**\n\nProbabilità per estrazione: {per_roll}\nAlmeno una volta in {picks} estrazioni: {at_least_once}\nValori memorizzati dei modificatori: {modifiers}\nSuffisso ignorato: `{ignored}`\nOrigine: {source_kind} {source_version} ({source_file})"
+                    "**Dettagli di esecuzione**\nProbabilità per estrazione: {per_roll}\nAlmeno una volta in {picks} estrazioni: {at_least_once}\nValori memorizzati dei modificatori: {modifiers}\nSuffisso ignorato: `{ignored}`"
                 ),
                 Locale::PlPl => format!(
-                    "**Szczegóły działania gry**\n\nSzansa na losowanie: {per_roll}\nCo najmniej raz w {picks} losowaniach: {at_least_once}\nZapisane wartości modyfikatorów: {modifiers}\nIgnorowany sufiks: `{ignored}`\nŹródło: {source_kind} {source_version} ({source_file})"
+                    "**Szczegóły działania gry**\nSzansa na losowanie: {per_roll}\nCo najmniej raz w {picks} losowaniach: {at_least_once}\nZapisane wartości modyfikatorów: {modifiers}\nIgnorowany sufiks: `{ignored}`"
                 ),
                 Locale::EsMx => format!(
-                    "**Detalles de ejecución**\n\nProbabilidad por tirada: {per_roll}\nAl menos una vez en {picks} tiradas: {at_least_once}\nValores guardados de modificadores: {modifiers}\nSufijo ignorado: `{ignored}`\nOrigen: {source_kind} {source_version} ({source_file})"
+                    "**Detalles de ejecución**\nProbabilidad por tirada: {per_roll}\nAl menos una vez en {picks} tiradas: {at_least_once}\nValores guardados de modificadores: {modifiers}\nSufijo ignorado: `{ignored}`"
                 ),
                 Locale::JaJp => format!(
-                    "**ゲーム処理の詳細**\n\n1 回ごとの確率: {per_roll}\n{picks} 回の抽選で少なくとも 1 回: {at_least_once}\n修飾子の保存値: {modifiers}\n無視される接尾辞: `{ignored}`\n出典: {source_kind} {source_version} ({source_file})"
+                    "**ゲーム処理の詳細**\n1 回ごとの確率: {per_roll}\n{picks} 回の抽選で少なくとも 1 回: {at_least_once}\n修飾子の保存値: {modifiers}\n無視される接尾辞: `{ignored}`"
                 ),
                 Locale::PtBr => format!(
-                    "**Detalhes de execução**\n\nChance por sorteio: {per_roll}\nPelo menos uma vez em {picks} sorteios: {at_least_once}\nValores armazenados dos modificadores: {modifiers}\nSufixo ignorado: `{ignored}`\nOrigem: {source_kind} {source_version} ({source_file})"
+                    "**Detalhes de execução**\nChance por sorteio: {per_roll}\nPelo menos uma vez em {picks} sorteios: {at_least_once}\nValores armazenados dos modificadores: {modifiers}\nSufixo ignorado: `{ignored}`"
                 ),
                 Locale::RuRu => format!(
-                    "**Сведения об обработке игрой**\n\nШанс за бросок: {per_roll}\nХотя бы раз за {picks} бросков: {at_least_once}\nСохранённые значения модификаторов: {modifiers}\nИгнорируемый суффикс: `{ignored}`\nИсточник: {source_kind} {source_version} ({source_file})"
+                    "**Сведения об обработке игрой**\nШанс за бросок: {per_roll}\nХотя бы раз за {picks} бросков: {at_least_once}\nСохранённые значения модификаторов: {modifiers}\nИгнорируемый суффикс: `{ignored}`"
                 ),
             })
         }
@@ -1001,7 +1009,7 @@ fn plugin_detail_pl(key: &str) -> Option<&'static str> {
             "Ilość `{quantity}` w `{column}` receptury `{recipe}` w cubemain.txt, wiersz {line}, jest poza zakresem 0..255. Gra zapisuje {storedQuantity} i używa {effectiveQuantity}."
         }
         "plugin.cube-input.hover" => {
-            "**Wejście kostki**\n\nPodstawa: `{base}`\n\nModyfikatory: {modifiers}\n\nŹródło: {sourceFile} ({sourceKind} {sourceVersion})"
+            "**Wejście kostki**\nPodstawa: `{base}`\nModyfikatory: {modifiers}"
         }
         "plugin.cube-output.invalid-base" => {
             "Podstawa wyjścia `{value}` w `{column}` receptury `{recipe}` w cubemain.txt, wiersz {line}, jest nieprawidłowa."
@@ -1025,7 +1033,7 @@ fn plugin_detail_pl(key: &str) -> Option<&'static str> {
             "**Nieprawidłowa podstawa wyjścia kostki**\n\nNie znaleziono `{base}`. Ignorowany sufiks: `{ignoredSuffix}`."
         }
         "plugin.cube-output.hover" => {
-            "**Wyjście kostki**\n\nPodstawa: `{base}` ({kind})\nWejście: `{input}`\nModyfikatory: {modifiers}\nIgnorowany sufiks: `{ignoredSuffix}`\nŹródło: {sourceFile}"
+            "**Wyjście kostki**\nPodstawa: `{base}` ({kind})\nWejście: `{input}`\nModyfikatory: {modifiers}\nIgnorowany sufiks: `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**Wartość wyliczenia**\n\nWartość: `{value}`\nNazwa: {name}\nParametry: {parameters}\n\n{description}\n\nDodatkowe pola: {extraFields}"
@@ -1039,9 +1047,7 @@ fn plugin_detail_pl(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "Kod przedmiotu `{value}` nie istnieje w weapons, armor ani misc. Sprawdź, czy jest to zamierzony kod."
         }
-        "plugin.item-code.hover" => {
-            "**Kod przedmiotu**\n\n`{code}`\n\n{name}\n\nŹródło: {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**Kod przedmiotu**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**Kod:** {code}",
         "plugin.property.unknown-marker" => {
             "Wartość `{value}` zaczyna się od `*`, ale nie jest znanym kodem właściwości. Używaj tego znacznika tylko dla obsługiwanych kodów właściwości."
@@ -1052,9 +1058,7 @@ fn plugin_detail_pl(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**Nieznany kod właściwości**\n\n`{value}` nie występuje w properties.txt ani propertygroups.txt."
         }
-        "plugin.property.hover" => {
-            "**Właściwość**\n\n`{value}` (kod w {sourceFile}.txt)\n\nŹródło: {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Właściwość**\n`{value}` (kod w {sourceFile}.txt)",
         "plugin.tc-item.after-first-gap" => {
             "Wartość `{value}` w `{column}` klasy skarbu `{treasureClass}` znajduje się po pierwszym pustym slocie przedmiotu i jest ignorowana przez grę."
         }
@@ -1092,7 +1096,7 @@ fn plugin_detail_pl(key: &str) -> Option<&'static str> {
             "**Wpis klasy skarbu po luce**\n\nOd pustego slotu przedmiotu {firstEmptySlot} gra ignoruje podstawę przedmiotu `{base}`."
         }
         "plugin.treasure-class.hover" => {
-            "**Klasa skarbu**\n\n`{base}`\n{name}\n\nSlot: {slot}\nLosowania: {picks}\nPrawdopodobieństwo: {probability}\nModyfikatory: {modifiers}\nIgnorowany sufiks: `{ignoredSuffix}`\nŹródło: {sourceFile}"
+            "**Klasa skarbu**\n`{base}`\n{name}\nSlot: {slot}\nLosowania: {picks}\nPrawdopodobieństwo: {probability}\nModyfikatory: {modifiers}\nIgnorowany sufiks: `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -1206,7 +1210,7 @@ fn plugin_detail_it(key: &str) -> Option<&'static str> {
             "La quantità `{quantity}` in `{column}` della ricetta `{recipe}` in cubemain.txt, riga {line}, è fuori da 0..255. Il gioco memorizza {storedQuantity} e usa {effectiveQuantity}."
         }
         "plugin.cube-input.hover" => {
-            "**Input del cubo**\n\nBase: `{base}`\n\nModificatori: {modifiers}\n\nOrigine: {sourceFile} ({sourceKind} {sourceVersion})"
+            "**Input del cubo**\nBase: `{base}`\nModificatori: {modifiers}"
         }
         "plugin.cube-output.invalid-base" => {
             "La base di output `{value}` in `{column}` della ricetta `{recipe}` in cubemain.txt, riga {line}, non è valida."
@@ -1230,7 +1234,7 @@ fn plugin_detail_it(key: &str) -> Option<&'static str> {
             "**Base di output del cubo non valida**\n\n`{base}` non è stata trovata. Suffisso ignorato: `{ignoredSuffix}`."
         }
         "plugin.cube-output.hover" => {
-            "**Output del cubo**\n\nBase: `{base}` ({kind})\nInput: `{input}`\nModificatori: {modifiers}\nSuffisso ignorato: `{ignoredSuffix}`\nOrigine: {sourceFile}"
+            "**Output del cubo**\nBase: `{base}` ({kind})\nInput: `{input}`\nModificatori: {modifiers}\nSuffisso ignorato: `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**Valore di enumerazione**\n\nValore: `{value}`\nNome: {name}\nParametri: {parameters}\n\n{description}\n\nCampi aggiuntivi: {extraFields}"
@@ -1244,9 +1248,7 @@ fn plugin_detail_it(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "Il codice oggetto `{value}` non esiste in weapons, armor o misc. Verificare che sia il codice desiderato."
         }
-        "plugin.item-code.hover" => {
-            "**Codice oggetto**\n\n`{code}`\n\n{name}\n\nOrigine: {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**Codice oggetto**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**Codice:** {code}",
         "plugin.property.unknown-marker" => {
             "Il valore `{value}` inizia con `*`, ma non è un codice proprietà noto. Usare questo marcatore solo per codici proprietà supportati."
@@ -1257,9 +1259,7 @@ fn plugin_detail_it(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**Codice proprietà sconosciuto**\n\n`{value}` non è presente in properties.txt o propertygroups.txt."
         }
-        "plugin.property.hover" => {
-            "**Proprieta**\n\n`{value}` (codice in {sourceFile}.txt)\n\nOrigine: {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Proprieta**\n`{value}` (codice in {sourceFile}.txt)",
         "plugin.tc-item.after-first-gap" => {
             "Il valore `{value}` in `{column}` della classe tesoro `{treasureClass}` si trova dopo il primo slot oggetto vuoto ed è ignorato dal gioco."
         }
@@ -1297,7 +1297,7 @@ fn plugin_detail_it(key: &str) -> Option<&'static str> {
             "**Voce della classe tesoro dopo un vuoto**\n\nDallo slot oggetto vuoto {firstEmptySlot}, il gioco ignora la base oggetto `{base}`."
         }
         "plugin.treasure-class.hover" => {
-            "**Classe tesoro**\n\n`{base}`\n{name}\n\nSlot: {slot}\nScelte: {picks}\nProbabilità: {probability}\nModificatori: {modifiers}\nSuffisso ignorato: `{ignoredSuffix}`\nOrigine: {sourceFile}"
+            "**Classe tesoro**\n`{base}`\n{name}\nSlot: {slot}\nScelte: {picks}\nProbabilità: {probability}\nModificatori: {modifiers}\nSuffisso ignorato: `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -1412,7 +1412,7 @@ fn plugin_detail_fr(key: &str) -> Option<&'static str> {
             "La quantité `{quantity}` dans `{column}` de la recette `{recipe}` de cubemain.txt, ligne {line}, est hors de 0..255. Le jeu enregistre {storedQuantity} et utilise {effectiveQuantity}."
         }
         "plugin.cube-input.hover" => {
-            "**Entrée du cube**\n\nBase : `{base}`\n\nModificateurs : {modifiers}\n\nSource : {sourceFile} ({sourceKind} {sourceVersion})"
+            "**Entrée du cube**\nBase : `{base}`\nModificateurs : {modifiers}"
         }
         "plugin.cube-output.invalid-base" => {
             "La base de sortie `{value}` dans `{column}` de la recette `{recipe}` de cubemain.txt, ligne {line}, n'est pas valide."
@@ -1434,7 +1434,7 @@ fn plugin_detail_fr(key: &str) -> Option<&'static str> {
             "**Base de sortie du cube non valide**\n\n`{base}` est introuvable. Suffixe ignoré : `{ignoredSuffix}`."
         }
         "plugin.cube-output.hover" => {
-            "**Sortie du cube**\n\nBase : `{base}` ({kind})\nEntrée : `{input}`\nModificateurs : {modifiers}\nSuffixe ignoré : `{ignoredSuffix}`\nSource : {sourceFile}"
+            "**Sortie du cube**\nBase : `{base}` ({kind})\nEntrée : `{input}`\nModificateurs : {modifiers}\nSuffixe ignoré : `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**Valeur d'énumération**\n\nValeur : `{value}`\nNom : {name}\nParamètres : {parameters}\n\n{description}\n\nChamps supplémentaires : {extraFields}"
@@ -1448,9 +1448,7 @@ fn plugin_detail_fr(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "Le code d'objet `{value}` n'existe pas dans weapons, armor ou misc. Vérifiez qu'il s'agit bien du code voulu."
         }
-        "plugin.item-code.hover" => {
-            "**Code d'objet**\n\n`{code}`\n\n{name}\n\nSource : {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**Code d'objet**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**Code** : {code}",
         "plugin.property.unknown-marker" => {
             "La valeur `{value}` commence par `*`, mais ce n'est pas un code de propriété connu. Utilisez ce marqueur uniquement pour les codes de propriété pris en charge."
@@ -1461,9 +1459,7 @@ fn plugin_detail_fr(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**Code de propriété inconnu**\n\n`{value}` est introuvable dans properties.txt ou propertygroups.txt."
         }
-        "plugin.property.hover" => {
-            "**Propriété**\n\n`{value}` (code de {sourceFile}.txt)\n\nSource : {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Propriété**\n`{value}` (code de {sourceFile}.txt)",
         "plugin.tc-item.after-first-gap" => {
             "La valeur `{value}` dans `{column}` de la classe de trésor `{treasureClass}` se trouve après le premier emplacement d'objet vide et est ignorée par le jeu."
         }
@@ -1501,7 +1497,7 @@ fn plugin_detail_fr(key: &str) -> Option<&'static str> {
             "**Entrée de classe de trésor après un vide**\n\nÀ partir de l'emplacement d'objet vide {firstEmptySlot}, le jeu ignore la base d'objet `{base}`."
         }
         "plugin.treasure-class.hover" => {
-            "**Classe de trésor**\n\n`{base}`\n{name}\n\nEmplacement : {slot}\nChoix : {picks}\nProbabilité : {probability}\nModificateurs : {modifiers}\nSuffixe ignoré : `{ignoredSuffix}`\nSource : {sourceFile}"
+            "**Classe de trésor**\n`{base}`\n{name}\nEmplacement : {slot}\nChoix : {picks}\nProbabilité : {probability}\nModificateurs : {modifiers}\nSuffixe ignoré : `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -1618,7 +1614,7 @@ fn plugin_detail_es(key: &str) -> Option<&'static str> {
             "La cantidad `{quantity}` de `{column}` en la receta `{recipe}` de cubemain.txt, línea {line}, está fuera de 0..255. El juego guarda {storedQuantity} y usa {effectiveQuantity}."
         }
         "plugin.cube-input.hover" => {
-            "**Entrada del cubo**\n\nBase: `{base}`\n\nModificadores: {modifiers}\n\nOrigen: {sourceFile} ({sourceKind} {sourceVersion})"
+            "**Entrada del cubo**\nBase: `{base}`\nModificadores: {modifiers}"
         }
         "plugin.cube-output.invalid-base" => {
             "La base de salida `{value}` de `{column}` en la receta `{recipe}` de cubemain.txt, línea {line}, no es válida."
@@ -1642,7 +1638,7 @@ fn plugin_detail_es(key: &str) -> Option<&'static str> {
             "**Base de salida de cubo no válida**\n\nNo se encuentra `{base}`. Sufijo ignorado: `{ignoredSuffix}`."
         }
         "plugin.cube-output.hover" => {
-            "**Salida del cubo**\n\nBase: `{base}` ({kind})\nEntrada: `{input}`\nModificadores: {modifiers}\nSufijo ignorado: `{ignoredSuffix}`\nOrigen: {sourceFile}"
+            "**Salida del cubo**\nBase: `{base}` ({kind})\nEntrada: `{input}`\nModificadores: {modifiers}\nSufijo ignorado: `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**Valor de enumeración**\n\nValor: `{value}`\nNombre: {name}\nParámetros: {parameters}\n\n{description}\n\nCampos adicionales: {extraFields}"
@@ -1656,9 +1652,7 @@ fn plugin_detail_es(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "El código de objeto `{value}` no existe en weapons, armor ni misc. Compruebe que sea el código deseado."
         }
-        "plugin.item-code.hover" => {
-            "**Código de objeto**\n\n`{code}`\n\n{name}\n\nOrigen: {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**Código de objeto**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**Código:** {code}",
         "plugin.property.unknown-marker" => {
             "El valor `{value}` empieza por `*`, pero no es un código de propiedad conocido. Use este marcador solo con códigos de propiedad admitidos."
@@ -1669,9 +1663,7 @@ fn plugin_detail_es(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**Código de propiedad desconocido**\n\nNo se encuentra `{value}` en properties.txt ni propertygroups.txt."
         }
-        "plugin.property.hover" => {
-            "**Propiedad**\n\n`{value}` (código de {sourceFile}.txt)\n\nOrigen: {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Propiedad**\n`{value}` (código de {sourceFile}.txt)",
         "plugin.tc-item.after-first-gap" => {
             "El valor `{value}` de `{column}` en la clase de tesoro `{treasureClass}` aparece después de la primera posición de objeto vacía y el juego lo ignora."
         }
@@ -1709,7 +1701,7 @@ fn plugin_detail_es(key: &str) -> Option<&'static str> {
             "**Entrada de clase de tesoro tras un hueco**\n\nDesde la posición de objeto vacía {firstEmptySlot}, el juego ignora la base de objeto `{base}`."
         }
         "plugin.treasure-class.hover" => {
-            "**Clase de tesoro**\n\n`{base}`\n{name}\n\nPosición: {slot}\nSelecciones: {picks}\nProbabilidad: {probability}\nModificadores: {modifiers}\nSufijo ignorado: `{ignoredSuffix}`\nOrigen: {sourceFile}"
+            "**Clase de tesoro**\n`{base}`\n{name}\nPosición: {slot}\nSelecciones: {picks}\nProbabilidad: {probability}\nModificadores: {modifiers}\nSufijo ignorado: `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -1825,7 +1817,7 @@ fn plugin_detail_pt_br(key: &str) -> Option<&'static str> {
             "A quantidade `{quantity}` em `{column}` da receita `{recipe}` em cubemain.txt, linha {line}, está fora de 0..255. O jogo armazena {storedQuantity} e usa {effectiveQuantity}."
         }
         "plugin.cube-input.hover" => {
-            "**Entrada do cubo**\n\nBase: `{base}`\n\nModificadores: {modifiers}\n\nOrigem: {sourceFile} ({sourceKind} {sourceVersion})"
+            "**Entrada do cubo**\nBase: `{base}`\nModificadores: {modifiers}"
         }
         "plugin.cube-output.invalid-base" => {
             "A base de saída `{value}` em `{column}` da receita `{recipe}` em cubemain.txt, linha {line}, não é válida."
@@ -1847,7 +1839,7 @@ fn plugin_detail_pt_br(key: &str) -> Option<&'static str> {
             "**Base de saída do cubo inválida**\n\n`{base}` não foi encontrada. Sufixo ignorado: `{ignoredSuffix}`."
         }
         "plugin.cube-output.hover" => {
-            "**Saída do cubo**\n\nBase: `{base}` ({kind})\nEntrada: `{input}`\nModificadores: {modifiers}\nSufixo ignorado: `{ignoredSuffix}`\nOrigem: {sourceFile}"
+            "**Saída do cubo**\nBase: `{base}` ({kind})\nEntrada: `{input}`\nModificadores: {modifiers}\nSufixo ignorado: `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**Valor da enumeracao**\n\nValor: `{value}`\nNome: {name}\nParametros: {parameters}\n\n{description}\n\nCampos adicionais: {extraFields}"
@@ -1861,9 +1853,7 @@ fn plugin_detail_pt_br(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "O código de item `{value}` não existe em weapons, armor ou misc. Verifique se este é o código desejado."
         }
-        "plugin.item-code.hover" => {
-            "**Código do item**\n\n`{code}`\n\n{name}\n\nOrigem: {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**Código do item**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**Codigo:** {code}",
         "plugin.property.unknown-marker" => {
             "O valor `{value}` comeca com `*`, mas nao e um codigo de propriedade conhecido. Use este marcador somente com codigos de propriedade aceitos."
@@ -1874,9 +1864,7 @@ fn plugin_detail_pt_br(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**Codigo de propriedade desconhecido**\n\n`{value}` nao foi encontrado em properties.txt nem em propertygroups.txt."
         }
-        "plugin.property.hover" => {
-            "**Propriedade**\n\n`{value}` (codigo de {sourceFile}.txt)\n\nOrigem: {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Propriedade**\n`{value}` (codigo de {sourceFile}.txt)",
         "plugin.tc-item.after-first-gap" => {
             "O valor `{value}` em `{column}` na classe de tesouro `{treasureClass}` aparece depois do primeiro espaço de item vazio e o jogo o ignora."
         }
@@ -1914,7 +1902,7 @@ fn plugin_detail_pt_br(key: &str) -> Option<&'static str> {
             "**Entrada de classe de tesouro após uma lacuna**\n\nA partir do espaço de item vazio {firstEmptySlot}, o jogo ignora a base de item `{base}`."
         }
         "plugin.treasure-class.hover" => {
-            "**Classe de tesouro**\n\n`{base}`\n{name}\n\nPosição: {slot}\nSeleções: {picks}\nProbabilidade: {probability}\nModificadores: {modifiers}\nSufixo ignorado: `{ignoredSuffix}`\nOrigem: {sourceFile}"
+            "**Classe de tesouro**\n`{base}`\n{name}\nPosição: {slot}\nSeleções: {picks}\nProbabilidade: {probability}\nModificadores: {modifiers}\nSufixo ignorado: `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -2032,7 +2020,7 @@ fn plugin_detail_es_mx(key: &str) -> Option<&'static str> {
             "La cantidad `{quantity}` de `{column}` en la receta `{recipe}` de cubemain.txt, línea {line}, está fuera de 0..255. El juego guarda {storedQuantity} y usa {effectiveQuantity}."
         }
         "plugin.cube-input.hover" => {
-            "**Entrada del cubo**\n\nBase: `{base}`\n\nModificadores: {modifiers}\n\nOrigen: {sourceFile} ({sourceKind} {sourceVersion})"
+            "**Entrada del cubo**\nBase: `{base}`\nModificadores: {modifiers}"
         }
         "plugin.cube-output.invalid-base" => {
             "La base de salida `{value}` de `{column}` en la receta `{recipe}` de cubemain.txt, línea {line}, no es válida."
@@ -2056,7 +2044,7 @@ fn plugin_detail_es_mx(key: &str) -> Option<&'static str> {
             "**Base de salida del cubo no válida**\n\nNo se encontró `{base}`. Sufijo ignorado: `{ignoredSuffix}`."
         }
         "plugin.cube-output.hover" => {
-            "**Salida del cubo**\n\nBase: `{base}` ({kind})\nEntrada: `{input}`\nModificadores: {modifiers}\nSufijo ignorado: `{ignoredSuffix}`\nOrigen: {sourceFile}"
+            "**Salida del cubo**\nBase: `{base}` ({kind})\nEntrada: `{input}`\nModificadores: {modifiers}\nSufijo ignorado: `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**Valor de enumeracion**\n\nValor: `{value}`\nNombre: {name}\nParametros: {parameters}\n\n{description}\n\nCampos extra: {extraFields}"
@@ -2070,9 +2058,7 @@ fn plugin_detail_es_mx(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "El código de objeto `{value}` no existe en weapons, armor ni misc. Revisa que sea el código que querías."
         }
-        "plugin.item-code.hover" => {
-            "**Código de objeto**\n\n`{code}`\n\n{name}\n\nOrigen: {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**Código de objeto**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**Codigo:** {code}",
         "plugin.property.unknown-marker" => {
             "El valor `{value}` empieza con `*`, pero no es un codigo de propiedad conocido. Usa ese marcador solo con codigos de propiedad admitidos."
@@ -2083,9 +2069,7 @@ fn plugin_detail_es_mx(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**Codigo de propiedad desconocido**\n\nNo se encontro `{value}` en properties.txt ni propertygroups.txt."
         }
-        "plugin.property.hover" => {
-            "**Propiedad**\n\n`{value}` (codigo de {sourceFile}.txt)\n\nOrigen: {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Propiedad**\n`{value}` (codigo de {sourceFile}.txt)",
         "plugin.tc-item.after-first-gap" => {
             "El valor `{value}` de `{column}` en la clase de tesoro `{treasureClass}` aparece después del primer espacio vacío de objeto y el juego lo ignora."
         }
@@ -2123,7 +2107,7 @@ fn plugin_detail_es_mx(key: &str) -> Option<&'static str> {
             "**Entrada de clase de tesoro después de un espacio vacío**\n\nDesde el espacio vacío de objeto {firstEmptySlot}, el juego ignora la base de objeto `{base}`."
         }
         "plugin.treasure-class.hover" => {
-            "**Clase de tesoro**\n\n`{base}`\n{name}\n\nPosición: {slot}\nSelecciones: {picks}\nProbabilidad: {probability}\nModificadores: {modifiers}\nSufijo ignorado: `{ignoredSuffix}`\nOrigen: {sourceFile}"
+            "**Clase de tesoro**\n`{base}`\n{name}\nPosición: {slot}\nSelecciones: {picks}\nProbabilidad: {probability}\nModificadores: {modifiers}\nSufijo ignorado: `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -2240,7 +2224,7 @@ fn plugin_detail_de(key: &str) -> Option<&'static str> {
             "Die Menge `{quantity}` in `{column}` des Rezepts `{recipe}` in cubemain.txt, Zeile {line}, liegt außerhalb von 0..255. Das Spiel speichert {storedQuantity} und verwendet {effectiveQuantity}."
         }
         "plugin.cube-input.hover" => {
-            "**Würfel-Eingabe**\n\nBase: `{base}`\n\nModifikatoren: {modifiers}\n\nQuelle: {sourceFile} ({sourceKind} {sourceVersion})"
+            "**Würfel-Eingabe**\nBase: `{base}`\nModifikatoren: {modifiers}"
         }
         "plugin.cube-output.invalid-base" => {
             "Die Ausgabe-Base `{value}` in `{column}` des Rezepts `{recipe}` in cubemain.txt, Zeile {line}, ist ungültig."
@@ -2262,7 +2246,7 @@ fn plugin_detail_de(key: &str) -> Option<&'static str> {
             "**Ungültige Würfel-Ausgabe-Base**\n\n`{base}` kann nicht aufgelöst werden. Ignorierter Suffix: `{ignoredSuffix}`."
         }
         "plugin.cube-output.hover" => {
-            "**Würfel-Ausgabe**\n\nBase: `{base}` ({kind})\nEingabe: `{input}`\nModifikatoren: {modifiers}\nIgnorierter Suffix: `{ignoredSuffix}`\nQuelle: {sourceFile}"
+            "**Würfel-Ausgabe**\nBase: `{base}` ({kind})\nEingabe: `{input}`\nModifikatoren: {modifiers}\nIgnorierter Suffix: `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**Aufzählungswert**\n\nWert: `{value}`\nName: {name}\nParameter: {parameters}\n\n{description}\n\nZusätzliche Felder: {extraFields}"
@@ -2276,9 +2260,7 @@ fn plugin_detail_de(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "Der Gegenstandscode `{value}` ist nicht in weapons, armor oder misc vorhanden. Prüfen Sie, ob dies der beabsichtigte Code ist."
         }
-        "plugin.item-code.hover" => {
-            "**Gegenstandscode**\n\n`{code}`\n\n{name}\n\nQuelle: {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**Gegenstandscode**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**Code**: {code}",
         "plugin.property.unknown-marker" => {
             "Der Wert `{value}` beginnt mit `*`, ist aber kein bekannter property-Code. Verwenden Sie den Marker nur für unterstützte property-Codes."
@@ -2289,9 +2271,7 @@ fn plugin_detail_de(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**Unbekannter property-Code**\n\n`{value}` wurde weder in properties.txt noch in propertygroups.txt gefunden."
         }
-        "plugin.property.hover" => {
-            "**Property**\n\n`{value}` ({sourceFile}.txt-Code)\n\nQuelle: {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Property**\n`{value}` ({sourceFile}.txt-Code)",
         "plugin.tc-item.after-first-gap" => {
             "Der Wert `{value}` in `{column}` der Treasure Class `{treasureClass}` liegt nach dem ersten leeren Item-Slot und wird vom Spiel ignoriert."
         }
@@ -2329,7 +2309,7 @@ fn plugin_detail_de(key: &str) -> Option<&'static str> {
             "**Treasure-Class-Eintrag nach Lücke**\n\nAb dem leeren Item-Slot {firstEmptySlot} wird die Item-Base `{base}` vom Spiel ignoriert."
         }
         "plugin.treasure-class.hover" => {
-            "**Treasure Class**\n\n`{base}`\n{name}\n\nSlot: {slot}\nPicks: {picks}\nWahrscheinlichkeit: {probability}\nModifikatoren: {modifiers}\nIgnorierter Suffix: `{ignoredSuffix}`\nQuelle: {sourceFile}"
+            "**Treasure Class**\n`{base}`\n{name}\nSlot: {slot}\nPicks: {picks}\nWahrscheinlichkeit: {probability}\nModifikatoren: {modifiers}\nIgnorierter Suffix: `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -2431,9 +2411,7 @@ fn plugin_detail_ko(key: &str) -> Option<&'static str> {
         "plugin.cube-input.u8-range" => {
             "cubemain.txt {line}행의 recipe `{recipe}`: `{column}` 수량 값은 `{quantity}`입니다. 허용 범위는 0..255입니다. 게임이 읽는 값: {storedQuantity}. 사용하는 수량: {effectiveQuantity}개."
         }
-        "plugin.cube-input.hover" => {
-            "**큐브 입력**\n\nBase: `{base}`\n\n수정자: {modifiers}\n\n출처: {sourceFile} ({sourceKind} {sourceVersion})"
-        }
+        "plugin.cube-input.hover" => "**큐브 입력**\nBase: `{base}`\n수정자: {modifiers}",
         "plugin.cube-output.invalid-base" => {
             "cubemain.txt {line}행의 recipe `{recipe}`: 올바르지 않은 `{column}` 출력 Base: `{value}`."
         }
@@ -2456,7 +2434,7 @@ fn plugin_detail_ko(key: &str) -> Option<&'static str> {
             "**유효하지 않은 큐브 출력 Base**\n\n해석할 수 없는 Base: `{base}`. 무시되는 접미사: `{ignoredSuffix}`."
         }
         "plugin.cube-output.hover" => {
-            "**큐브 출력**\n\nBase: `{base}` ({kind})\n입력: `{input}`\n수정자: {modifiers}\n무시되는 접미사: `{ignoredSuffix}`\n출처: {sourceFile}"
+            "**큐브 출력**\nBase: `{base}` ({kind})\n입력: `{input}`\n수정자: {modifiers}\n무시되는 접미사: `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**열거 값**\n\n값: `{value}`\n이름: {name}\n매개변수: {parameters}\n\n{description}\n\n추가 필드: {extraFields}"
@@ -2470,9 +2448,7 @@ fn plugin_detail_ko(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "weapons.txt, armor.txt 또는 misc.txt에서 찾을 수 없는 아이템 코드: `{value}`. 의도한 코드인지 확인하세요."
         }
-        "plugin.item-code.hover" => {
-            "**아이템 코드**\n\n`{code}`\n\n{name}\n\n출처: {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**아이템 코드**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**코드**: {code}",
         "plugin.property.unknown-marker" => {
             "`*`로 시작하지만 알려진 property code가 아닌 값: `{value}`. 의도적인 marker일 때만 유지하세요."
@@ -2483,9 +2459,7 @@ fn plugin_detail_ko(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**알 수 없는 property code**\n\nproperties.txt 또는 propertygroups.txt에서 찾을 수 없는 값: `{value}`."
         }
-        "plugin.property.hover" => {
-            "**Property**\n\n`{value}` ({sourceFile}.txt code)\n\n출처: {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Property**\n`{value}` ({sourceFile}.txt code)",
         "plugin.tc-item.after-first-gap" => {
             "Treasure Class `{treasureClass}`에서 첫 번째 빈 Item 슬롯 뒤라 게임이 무시하는 `{column}` 값: `{value}`."
         }
@@ -2523,7 +2497,7 @@ fn plugin_detail_ko(key: &str) -> Option<&'static str> {
             "**무시되는 Treasure Class 항목**\n\n첫 번째 빈 Item 슬롯은 Item{firstEmptySlot}입니다. `{base}` 항목은 게임에서 사용되지 않습니다."
         }
         "plugin.treasure-class.hover" => {
-            "**Treasure Class 항목**\n\n`{base}`\n{name}\n\n슬롯: {slot}\n추첨 횟수: {picks}\n확률 값: {probability}\n수정자: {modifiers}\n무시되는 접미사: `{ignoredSuffix}`\n출처: {sourceFile}"
+            "**Treasure Class 항목**\n`{base}`\n{name}\n슬롯: {slot}\n추첨 횟수: {picks}\n확률 값: {probability}\n수정자: {modifiers}\n무시되는 접미사: `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -2616,9 +2590,7 @@ fn plugin_detail_ja(key: &str) -> Option<&'static str> {
         "plugin.cube-input.u8-range" => {
             "cubemain.txt の行 {line}、レシピ `{recipe}` の `{column}` にある数量 `{quantity}` は 0..255 の範囲外です。ゲームは {storedQuantity} を保存し、{effectiveQuantity} を使用します。"
         }
-        "plugin.cube-input.hover" => {
-            "**キューブ入力**\n\n基本項目: `{base}`\n\n修飾子: {modifiers}\n\n出典: {sourceFile} ({sourceKind} {sourceVersion})"
-        }
+        "plugin.cube-input.hover" => "**キューブ入力**\n基本項目: `{base}`\n修飾子: {modifiers}",
         "plugin.cube-output.invalid-base" => {
             "cubemain.txt の行 {line}、レシピ `{recipe}` の `{column}` 出力の基本項目 `{value}` は無効です。"
         }
@@ -2641,7 +2613,7 @@ fn plugin_detail_ja(key: &str) -> Option<&'static str> {
             "**無効なキューブ出力の基本項目**\n\n`{base}` は見つかりません。無視される接尾辞: `{ignoredSuffix}`。"
         }
         "plugin.cube-output.hover" => {
-            "**キューブ出力**\n\n基本項目: `{base}` ({kind})\n入力: `{input}`\n修飾子: {modifiers}\n無視される接尾辞: `{ignoredSuffix}`\n出典: {sourceFile}"
+            "**キューブ出力**\n基本項目: `{base}` ({kind})\n入力: `{input}`\n修飾子: {modifiers}\n無視される接尾辞: `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**列挙値**\n\n値: `{value}`\n名前: {name}\nパラメーター: {parameters}\n\n{description}\n\n追加フィールド: {extraFields}"
@@ -2655,9 +2627,7 @@ fn plugin_detail_ja(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "アイテムコード `{value}` は weapons、armor、または misc に存在しません。コードを確認してください。"
         }
-        "plugin.item-code.hover" => {
-            "**アイテムコード**\n\n`{code}`\n\n{name}\n\n出典: {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**アイテムコード**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**コード**: {code}",
         "plugin.property.unknown-marker" => {
             "値 `{value}` は `*` で始まっていますが、既知の property code ではありません。正しい marker とコードだけを使用してください。"
@@ -2668,9 +2638,7 @@ fn plugin_detail_ja(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**不明な property code**\n\n`{value}` は properties.txt または propertygroups.txt に見つかりません。"
         }
-        "plugin.property.hover" => {
-            "**Property**\n\n`{value}` ({sourceFile}.txt code)\n\n出典: {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Property**\n`{value}` ({sourceFile}.txt code)",
         "plugin.tc-item.after-first-gap" => {
             "Treasure Class `{treasureClass}` の `{column}` 値 `{value}` は最初の空のアイテムスロットより後にあるため、ゲームでは無視されます。"
         }
@@ -2708,7 +2676,7 @@ fn plugin_detail_ja(key: &str) -> Option<&'static str> {
             "**Treasure Class の項目は無視されます**\n\n最初の空のアイテムスロットは Item{firstEmptySlot} です。そのため `{base}` は使用されません。"
         }
         "plugin.treasure-class.hover" => {
-            "**Treasure Class の項目**\n\n`{base}`\n{name}\n\nスロット: {slot}\n抽選回数: {picks}\n確率: {probability}\n修飾子: {modifiers}\n無視される接尾辞: `{ignoredSuffix}`\n出典: {sourceFile}"
+            "**Treasure Class の項目**\n`{base}`\n{name}\nスロット: {slot}\n抽選回数: {picks}\n確率: {probability}\n修飾子: {modifiers}\n無視される接尾辞: `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -2811,9 +2779,7 @@ fn plugin_detail_ru(key: &str) -> Option<&'static str> {
         "plugin.cube-input.u8-range" => {
             "Количество `{quantity}` в `{column}` рецепта `{recipe}` в cubemain.txt, строка {line}, вне диапазона 0..255. Игра сохранит {storedQuantity} и использует {effectiveQuantity}."
         }
-        "plugin.cube-input.hover" => {
-            "**Вход куба**\n\nБаза: `{base}`\n\nМодификаторы: {modifiers}\n\nИсточник: {sourceFile} ({sourceKind} {sourceVersion})"
-        }
+        "plugin.cube-input.hover" => "**Вход куба**\nБаза: `{base}`\nМодификаторы: {modifiers}",
         "plugin.cube-output.invalid-base" => {
             "Базовый предмет выхода `{value}` в `{column}` рецепта `{recipe}` в cubemain.txt, строка {line}, недопустим."
         }
@@ -2836,7 +2802,7 @@ fn plugin_detail_ru(key: &str) -> Option<&'static str> {
             "**Недопустимая база выхода куба**\n\n`{base}` не найден. Игнорируемый суффикс: `{ignoredSuffix}`."
         }
         "plugin.cube-output.hover" => {
-            "**Выход куба**\n\nБаза: `{base}` ({kind})\nВход: `{input}`\nМодификаторы: {modifiers}\nИгнорируемый суффикс: `{ignoredSuffix}`\nИсточник: {sourceFile}"
+            "**Выход куба**\nБаза: `{base}` ({kind})\nВход: `{input}`\nМодификаторы: {modifiers}\nИгнорируемый суффикс: `{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**Перечисление**\n\nЗначение: `{value}`\nИмя: {name}\nПараметры: {parameters}\n\n{description}\n\nДополнительные поля: {extraFields}"
@@ -2850,9 +2816,7 @@ fn plugin_detail_ru(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "Код предмета `{value}` не найден в weapons, armor или misc. Укажите существующий код базового предмета."
         }
-        "plugin.item-code.hover" => {
-            "**Код предмета**\n\n`{code}`\n\n{name}\n\nИсточник: {sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**Код предмета**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**Код предмета:** {code}",
         "plugin.property.unknown-marker" => {
             "Значение `{value}` начинается с `*`, но не является известным кодом свойства. Проверьте маркер и код свойства."
@@ -2863,9 +2827,7 @@ fn plugin_detail_ru(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**Неизвестный код свойства**\n\n`{value}` не найден в properties.txt или propertygroups.txt."
         }
-        "plugin.property.hover" => {
-            "**Свойство**\n\n`{value}` (код из {sourceFile}.txt)\n\nИсточник: {sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Свойство**\n`{value}` (код из {sourceFile}.txt)",
         "plugin.tc-item.after-first-gap" => {
             "В Treasure Class `{treasureClass}` значение `{value}` в `{column}` находится после первого пустого слота Item и игнорируется."
         }
@@ -2903,7 +2865,7 @@ fn plugin_detail_ru(key: &str) -> Option<&'static str> {
             "**Запись Treasure Class игнорируется**\n\n`{base}` находится после первого пустого слота Item {firstEmptySlot}, поэтому игра не читает этот слот Item."
         }
         "plugin.treasure-class.hover" => {
-            "**Запись Treasure Class**\n\n`{base}`\n{name}\n\nСлот: {slot}, picks: {picks}, вероятность: {probability}\nМодификаторы: {modifiers}\nИгнорируемый суффикс: `{ignoredSuffix}`\nИсточник: {sourceFile}"
+            "**Запись Treasure Class**\n`{base}`\n{name}\nСлот: {slot}, picks: {picks}, вероятность: {probability}\nМодификаторы: {modifiers}\nИгнорируемый суффикс: `{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -2982,9 +2944,7 @@ fn plugin_detail_zh_cn(key: &str) -> Option<&'static str> {
         "plugin.cube-input.u8-range" => {
             "cubemain.txt 第 {line} 行 recipe `{recipe}` 的 `{column}` 数量 `{quantity}` 超出 0..255。游戏读取为 {storedQuantity}，并使用 {effectiveQuantity} 个。"
         }
-        "plugin.cube-input.hover" => {
-            "**魔盒输入**\n\nBase: `{base}`\n\n修饰符：{modifiers}\n\n来源：{sourceFile} ({sourceKind} {sourceVersion})"
-        }
+        "plugin.cube-input.hover" => "**魔盒输入**\nBase: `{base}`\n修饰符：{modifiers}",
         "plugin.cube-output.invalid-base" => {
             "cubemain.txt 第 {line} 行 recipe `{recipe}` 的 `{column}` 输出 base `{value}` 无效。"
         }
@@ -3005,7 +2965,7 @@ fn plugin_detail_zh_cn(key: &str) -> Option<&'static str> {
             "**无效的魔盒输出 base**\n\n无法解析 `{base}`。被忽略的后缀：`{ignoredSuffix}`。"
         }
         "plugin.cube-output.hover" => {
-            "**魔盒输出**\n\n基础项：`{base}` ({kind})\n输入：`{input}`\n修饰符：{modifiers}\n忽略的后缀：`{ignoredSuffix}`\n来源：{sourceFile}"
+            "**魔盒输出**\n基础项：`{base}` ({kind})\n输入：`{input}`\n修饰符：{modifiers}\n忽略的后缀：`{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**枚举值**\n\n值：`{value}`\n名称：{name}\n参数：{parameters}\n\n{description}\n\n额外字段：{extraFields}"
@@ -3017,9 +2977,7 @@ fn plugin_detail_zh_cn(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "物品代码 `{value}` 不在 weapons、armor 或 misc 中。请确认该代码是否符合预期。"
         }
-        "plugin.item-code.hover" => {
-            "**物品代码**\n\n`{code}`\n\n{name}\n\n来源：{sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**物品代码**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**代码：**{code}",
         "plugin.property.unknown-marker" => {
             "值 `{value}` 以 `*` 开头，但不是已知的 property code。仅在它是有意的 marker 时保留。"
@@ -3030,9 +2988,7 @@ fn plugin_detail_zh_cn(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**未知的 property code**\n\n在 properties.txt 或 propertygroups.txt 中找不到 `{value}`。"
         }
-        "plugin.property.hover" => {
-            "**Property**\n\n`{value}` ({sourceFile}.txt code)\n\n来源：{sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Property**\n`{value}` ({sourceFile}.txt code)",
         "plugin.tc-item.after-first-gap" => {
             "Treasure Class `{treasureClass}` 的 `{column}` 值 `{value}` 位于第一个空物品槽位之后，游戏会忽略它。"
         }
@@ -3070,7 +3026,7 @@ fn plugin_detail_zh_cn(key: &str) -> Option<&'static str> {
             "**Treasure Class 项目被忽略**\n\n第一个空物品槽位是 Item{firstEmptySlot}，因此 `{base}` 不会被使用。"
         }
         "plugin.treasure-class.hover" => {
-            "**Treasure Class 项目**\n\n`{base}`\n{name}\n\n槽位：{slot}\n抽取次数：{picks}\n概率：{probability}\n修饰符：{modifiers}\n忽略的后缀：`{ignoredSuffix}`\n来源：{sourceFile}"
+            "**Treasure Class 项目**\n`{base}`\n{name}\n槽位：{slot}\n抽取次数：{picks}\n概率：{probability}\n修饰符：{modifiers}\n忽略的后缀：`{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -3151,9 +3107,7 @@ fn plugin_detail_zh_tw(key: &str) -> Option<&'static str> {
         "plugin.cube-input.u8-range" => {
             "cubemain.txt 第 {line} 行 recipe `{recipe}` 的 `{column}` 數量 `{quantity}` 超出 0..255。遊戲讀取為 {storedQuantity}，並使用 {effectiveQuantity} 個。"
         }
-        "plugin.cube-input.hover" => {
-            "**魔盒輸入**\n\nBase: `{base}`\n\n修飾符：{modifiers}\n\n來源：{sourceFile} ({sourceKind} {sourceVersion})"
-        }
+        "plugin.cube-input.hover" => "**魔盒輸入**\nBase: `{base}`\n修飾符：{modifiers}",
         "plugin.cube-output.invalid-base" => {
             "cubemain.txt 第 {line} 行 recipe `{recipe}` 的 `{column}` 輸出 base `{value}` 無效。"
         }
@@ -3174,7 +3128,7 @@ fn plugin_detail_zh_tw(key: &str) -> Option<&'static str> {
             "**無效的魔盒輸出 base**\n\n無法解析 `{base}`。被忽略的字尾：`{ignoredSuffix}`。"
         }
         "plugin.cube-output.hover" => {
-            "**魔盒輸出**\n\n基底：`{base}` ({kind})\n輸入：`{input}`\n修飾符：{modifiers}\n忽略的字尾：`{ignoredSuffix}`\n來源：{sourceFile}"
+            "**魔盒輸出**\n基底：`{base}` ({kind})\n輸入：`{input}`\n修飾符：{modifiers}\n忽略的字尾：`{ignoredSuffix}`"
         }
         "plugin.enum.hover" => {
             "**列舉值**\n\n值：`{value}`\n名稱：{name}\n引數：{parameters}\n\n{description}\n\n額外欄位：{extraFields}"
@@ -3186,9 +3140,7 @@ fn plugin_detail_zh_tw(key: &str) -> Option<&'static str> {
         "plugin.item-code.unresolved-policy" => {
             "物品程式碼 `{value}` 不在 weapons、armor 或 misc 中。請確認該程式碼是否符合預期。"
         }
-        "plugin.item-code.hover" => {
-            "**物品程式碼**\n\n`{code}`\n\n{name}\n\n來源：{sourceKind} {sourceVersion}"
-        }
+        "plugin.item-code.hover" => "**物品程式碼**\n`{code}`\n{name}",
         "plugin.item-name.hover" => "{name}\n\n**程式碼：**{code}",
         "plugin.property.unknown-marker" => {
             "值 `{value}` 以 `*` 開頭，但不是已知的 property code。僅在它是有意的 marker 時保留。"
@@ -3199,9 +3151,7 @@ fn plugin_detail_zh_tw(key: &str) -> Option<&'static str> {
         "plugin.property.unknown-hover" => {
             "**未知的 property code**\n\n在 properties.txt 或 propertygroups.txt 中找不到 `{value}`。"
         }
-        "plugin.property.hover" => {
-            "**Property**\n\n`{value}` ({sourceFile}.txt code)\n\n來源：{sourceKind} {sourceVersion}"
-        }
+        "plugin.property.hover" => "**Property**\n`{value}` ({sourceFile}.txt code)",
         "plugin.tc-item.after-first-gap" => {
             "Treasure Class `{treasureClass}` 的 `{column}` 值 `{value}` 位於第一個空物品欄位之後，遊戲會忽略它。"
         }
@@ -3239,7 +3189,7 @@ fn plugin_detail_zh_tw(key: &str) -> Option<&'static str> {
             "**Treasure Class 項目被忽略**\n\n第一個空物品欄位是 Item{firstEmptySlot}，因此 `{base}` 不會被使用。"
         }
         "plugin.treasure-class.hover" => {
-            "**Treasure Class 項目**\n\n`{base}`\n{name}\n\n欄位：{slot}\n抽取次數：{picks}\n機率：{probability}\n修飾符：{modifiers}\n忽略的字尾：`{ignoredSuffix}`\n來源：{sourceFile}"
+            "**Treasure Class 項目**\n`{base}`\n{name}\n欄位：{slot}\n抽取次數：{picks}\n機率：{probability}\n修飾符：{modifiers}\n忽略的字尾：`{ignoredSuffix}`"
         }
         _ => return None,
     })
@@ -3403,7 +3353,7 @@ pub fn localized_plugin_diagnostic(
     // Bundled plugins use stable keys.  Custom plugins can keep an explicit
     // message for enUS compatibility; non-English sessions never expose that
     // completed English sentence as their translated product UI.
-    diagnostic.message = if locale == Locale::EnUs {
+    let message = if locale == Locale::EnUs {
         fallback
             .clone()
             .unwrap_or_else(|| localize(locale, key, &args))
@@ -3415,6 +3365,7 @@ pub fn localized_plugin_diagnostic(
         // pretending it was translated by vector-lsp.
         fallback.unwrap_or_else(|| localize(locale, key, &args))
     };
+    diagnostic.message = compact_plugin_hover_spacing(key, message);
     diagnostic.data = Some(merge_data(diagnostic.data.take(), key, Value::Object(args)));
     diagnostic
 }
@@ -5201,6 +5152,77 @@ mod tests {
             assert!(reference.contains("{value}") && reference.contains("{stored}"));
             assert!(reference.contains("{file}") && reference.contains("{column}"));
             assert!(!reference.contains("{source}"));
+        }
+    }
+
+    #[test]
+    fn plugin_hovers_omit_source_provenance_and_blank_lines() {
+        const SOURCE_FREE_KEYS: &[&str] = &[
+            "plugin.cube-input.hover",
+            "plugin.cube-output.hover",
+            "plugin.item-code.hover",
+            "plugin.treasure-class.hover",
+        ];
+        let hover_args = args([
+            ("base", json!("gld")),
+            ("code", json!("gld")),
+            ("name", json!("Gold")),
+            ("kind", json!("item")),
+            ("input", json!("")),
+            ("modifiers", json!("mul=1024")),
+            ("modifierStorage", json!("mul=1024")),
+            ("ignoredSuffix", json!("")),
+            ("slot", json!(1)),
+            ("picks", json!(1)),
+            ("probability", json!(1)),
+            ("perRollChance", json!("100%")),
+            ("atLeastOnceChance", json!("100%")),
+            ("sourceFile", json!("SOURCE_FILE_SENTINEL")),
+            ("sourceKind", json!("SOURCE_KIND_SENTINEL")),
+            ("sourceVersion", json!("SOURCE_VERSION_SENTINEL")),
+        ]);
+
+        for locale in Locale::ALL
+            .into_iter()
+            .filter(|locale| *locale != Locale::EnUs)
+        {
+            for key in SOURCE_FREE_KEYS {
+                let text = localize(locale, key, &hover_args);
+                assert!(
+                    !text.contains("SOURCE_"),
+                    "{locale:?} {key} exposes source data"
+                );
+                assert!(
+                    !text.contains("\n\n"),
+                    "{locale:?} {key} contains a blank line"
+                );
+            }
+        }
+
+        let english = localized_plugin_diagnostic(
+            Locale::EnUs,
+            "plugin.treasure-class.hover",
+            hover_args,
+            Some("gld\n\nGold\n\nChance: 100%".to_string()),
+            Diagnostic::default(),
+        );
+        assert_eq!(english.message, "gld\nGold\nChance: 100%");
+    }
+
+    #[test]
+    fn bundled_plugin_sources_do_not_build_source_provenance_lines() {
+        const SOURCES: &[&str] = &[
+            include_str!("../contrib/d2rdoc/plugins/cubeInputCheck.ts"),
+            include_str!("../contrib/d2rdoc/plugins/cubeOutputCheck.ts"),
+            include_str!("../contrib/d2rdoc/plugins/itemCodeCheck.ts"),
+            include_str!("../contrib/d2rdoc/plugins/propCodeCheck.ts"),
+            include_str!("../contrib/d2rdoc/plugins/tcItemCheck.ts"),
+        ];
+        for source in SOURCES {
+            assert!(!source.contains("Source: "));
+            assert!(!source.contains("sourceDescription"));
+            assert!(!source.contains("sourceKind"));
+            assert!(!source.contains("sourceVersion"));
         }
     }
 }

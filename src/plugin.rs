@@ -3066,7 +3066,7 @@ function validate(ctx: PluginContext): string[] {
     }
 
     #[tokio::test]
-    async fn cube_output_hover_reports_the_effective_reference_source() {
+    async fn cube_output_hover_omits_the_effective_reference_source() {
         let files =
             with_cube_output_files(("cubemain", "description\tenabled\toutput\nrow\t1\thpot\n"));
         let mut fx = fixture(&files);
@@ -3087,10 +3087,9 @@ function validate(ctx: PluginContext): string[] {
         let hover = host
             .hover(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
             .await
-            .expect("cube output source hover");
+            .expect("cube output hover");
         assert!(
-            hover.contains("four-character item code")
-                && hover.contains("Source: TXT file in the same folder (game version 3.2)"),
+            hover.contains("four-character item code") && !hover.contains("Source:"),
             "{hover}"
         );
     }
@@ -3393,8 +3392,8 @@ function validate(ctx: PluginContext): string[] {
             "hover should include modifier text: {hover}"
         );
         assert!(
-            hover.contains("Source: TXT file in the current workspace"),
-            "hover should expose the effective reference source: {hover}"
+            !hover.contains("Source:"),
+            "hover should omit reference provenance: {hover}"
         );
 
         let target = host
@@ -3447,10 +3446,9 @@ function validate(ctx: PluginContext): string[] {
         let hover = host
             .hover(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
             .await
-            .expect("property source hover");
+            .expect("property hover");
         assert!(
-            hover.contains("properties.txt code")
-                && hover.contains("Source: Built-in reference data (game version 3.2)"),
+            hover.contains("properties.txt code") && !hover.contains("Source:"),
             "{hover}"
         );
     }
@@ -3920,8 +3918,7 @@ function validate(ctx: PluginContext): string[] {
             .await
             .expect("Rune hover");
         assert!(
-            hover.contains("Staff")
-                && hover.contains("Source: TXT file in the same folder (game version 3.2)"),
+            hover.contains("Staff") && !hover.contains("Source:"),
             "{hover}"
         );
         let target = host
@@ -4173,8 +4170,7 @@ function validate(ctx: PluginContext): string[] {
             .await
             .expect("TC hover");
         assert!(
-            hover.contains("Healing Potion")
-                && hover.contains("Source: TXT file in the current workspace"),
+            hover.contains("Healing Potion") && !hover.contains("Source:"),
             "{hover}"
         );
         assert!(
@@ -4199,8 +4195,8 @@ function validate(ctx: PluginContext): string[] {
             .expect("generated TC hover");
         assert!(
             generated_hover.contains("Generated Treasure Class")
-                && generated_hover.contains("Source: TXT file in the current workspace"),
-            "finite generated named-TC provenance: {generated_hover}"
+                && !generated_hover.contains("Source:"),
+            "generated named-TC hover: {generated_hover}"
         );
         let generated_target = host
             .goto_definition(
@@ -4227,7 +4223,7 @@ function validate(ctx: PluginContext): string[] {
             .expect("unresolved TC item still exposes probability context");
         assert!(
             !invalid_generated_hover.contains("Generated Treasure Class")
-                && !invalid_generated_hover.contains("Source: TXT file in the current workspace"),
+                && !invalid_generated_hover.contains("Source:"),
             "arbitrary suffix must not inherit ItemTypes provenance: {invalid_generated_hover}"
         );
         assert!(
@@ -4251,8 +4247,7 @@ function validate(ctx: PluginContext): string[] {
             .await
             .expect("forward TC hover keeps probability context");
         assert!(
-            !forward_hover.contains("Treasure Class")
-                && !forward_hover.contains("Source: TXT file in the current workspace"),
+            !forward_hover.contains("Treasure Class") && !forward_hover.contains("Source:"),
             "a later TC row must not resolve in hover: {forward_hover}"
         );
         assert!(
@@ -4272,8 +4267,7 @@ function validate(ctx: PluginContext): string[] {
             .await
             .expect("self TC hover");
         assert!(
-            self_hover.contains("Treasure Class")
-                && self_hover.contains("Source: TXT file in the current workspace"),
+            self_hover.contains("Treasure Class") && !self_hover.contains("Source:"),
             "the current row is already in the sequential TC map: {self_hover}"
         );
         assert_eq!(

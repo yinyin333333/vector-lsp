@@ -431,18 +431,6 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
 
 // ─── hover ────────────────────────────────────────────────────────────────────
 
-function sourceDescription(stem: string): string | null {
-    const source = getWorkspaceSource(stem);
-    if (!source) return null;
-    if (source.kind === "bundled") {
-        return "Built-in reference data (game version " + (source.version ?? "unknown") + ")";
-    }
-    const version = source.version ? " (game version " + source.version + ")" : "";
-    if (source.kind === "open") return "Open document" + version;
-    if (source.kind === "sibling") return "TXT file in the same folder" + version;
-    return "TXT file in the current workspace" + version;
-}
-
 function hover(ctx: HoverContext): HoverResult | null {
     if (ctx.file !== "cubemain") return null;
     if (!isInputCol(ctx.col)) return null;
@@ -453,8 +441,6 @@ function hover(ctx: HoverContext): HoverResult | null {
     if (!base) return null;
 
     const parts: string[] = [];
-    let resolvedStem: string | null = null;
-
     if (base === "any") {
         parts.push("**any** — Accepts any item");
     } else {
@@ -472,21 +458,13 @@ function hover(ctx: HoverContext): HoverResult | null {
 
         if (itemNames.length > 0) {
             parts.push("**" + base + "** — " + itemNames[0]);
-            resolvedStem = itemCode && itemMatch ? itemMatch[0] : "itemtypes";
         } else if (lookupKey("uniqueitems", "index", base)) {
             parts.push("**" + base + "** (Unique Item)");
-            resolvedStem = "uniqueitems";
         } else if (lookupKey("setitems", "index", base)) {
             parts.push("**" + base + "** (Set Item)");
-            resolvedStem = "setitems";
         } else {
             return null;
         }
-    }
-
-    if (resolvedStem) {
-        const source = sourceDescription(resolvedStem);
-        if (source) parts.push("", "Source: " + source);
     }
 
     if (parsed.qualifiers.length > 0) {
@@ -510,7 +488,6 @@ function hover(ctx: HoverContext): HoverResult | null {
             + "`; the game uses `" + (storedQty || 1) + "` item(s). Use 0 through 255.");
     }
 
-    const source = resolvedStem ? getWorkspaceSource(resolvedStem) : null;
     const stoppedAt = parsed.ignoredSuffix
         ? (parsed.ignoredSuffix.text.split(",")[0] || "")
         : "";
@@ -521,9 +498,6 @@ function hover(ctx: HoverContext): HoverResult | null {
         contentKey: "plugin.cube-input.hover",
         contentArgs: {
             base,
-            sourceFile: resolvedStem || "",
-            sourceKind: source?.kind || "",
-            sourceVersion: source?.version || "",
             modifiers: JSON.stringify(parsed.qualifiers.map((qualifier) => qualifier.text)),
             stoppedAt,
             quantity: parsed.qty || "",
