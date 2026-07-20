@@ -7,7 +7,7 @@
 //! bundled data and fallback tables are never inputs.
 
 use serde::de::IgnoredAny;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url};
 
 use crate::document::{DocumentData, utf16_len};
+use crate::i18n::{self, Locale};
 use crate::settings::{JsonDiagnosticRules, JsonRuleAction};
 
 const REQUIRED_STRING_FIELDS: &[&str] = &[
@@ -173,7 +174,27 @@ pub struct JsonDiagnosticReport {
     /// Includes every physical top-level JSON file, even an invalid file that
     /// d2rlint skips, so a caller can clear diagnostics published previously.
     pub batches: Vec<JsonDiagnosticBatch>,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<JsonLogWarning>,
+}
+
+/// Product-authored JSON analysis logs retain a stable key and named data
+/// until the backend renders them for the current client locale.
+#[derive(Debug, PartialEq)]
+pub struct JsonLogWarning {
+    pub message_key: &'static str,
+    pub message_args: Map<String, Value>,
+}
+
+impl JsonLogWarning {
+    fn new(
+        message_key: &'static str,
+        message_args: impl IntoIterator<Item = (&'static str, Value)>,
+    ) -> Self {
+        Self {
+            message_key,
+            message_args: i18n::args(message_args),
+        }
+    }
 }
 
 /// Unsaved localization JSON buffers supplied by the editor, keyed by the
@@ -307,6 +328,24 @@ pub fn analyze_with_rules_profile_and_open_json(
     evidence_profile: JsonEvidenceProfile,
     open_json_sources: OpenJsonSources,
 ) -> JsonDiagnosticReport {
+    analyze_with_rules_profile_and_open_json_localized(
+        primary_documents,
+        rules,
+        trigger,
+        evidence_profile,
+        open_json_sources,
+        Locale::EnUs,
+    )
+}
+
+pub fn analyze_with_rules_profile_and_open_json_localized(
+    primary_documents: Vec<PrimaryTxtDocument>,
+    rules: JsonDiagnosticRules,
+    trigger: JsonAnalysisTrigger,
+    evidence_profile: JsonEvidenceProfile,
+    open_json_sources: OpenJsonSources,
+    locale: Locale,
+) -> JsonDiagnosticReport {
     let mut grouped: HashMap<String, (PathBuf, Vec<PrimaryTxtDocument>)> = HashMap::new();
     for input in primary_documents {
         let Some(data_root) = data_root_from_excel_txt(&input.path) else {
@@ -335,6 +374,7 @@ pub fn analyze_with_rules_profile_and_open_json(
             trigger,
             evidence_profile,
             &open_json_sources,
+            locale,
         ) else {
             continue;
         };
@@ -354,6 +394,7 @@ fn analyze_scope(
     trigger: JsonAnalysisTrigger,
     evidence_profile: JsonEvidenceProfile,
     open_json_sources: &OpenJsonSources,
+    locale: Locale,
 ) -> Option<JsonDiagnosticReport> {
     let strings_dir = data_root.join("local").join("lng").join("strings");
     let mut json_paths = direct_files_with_extension(&strings_dir, "json");
@@ -371,9 +412,9 @@ fn analyze_scope(
     let mut files = Vec::new();
     for path in json_paths {
         let Ok(uri) = Url::from_file_path(&path) else {
-            warnings.push(format!(
-                "Could not convert localization JSON path to a URI: {}",
-                path.display()
+            warnings.push(JsonLogWarning::new(
+                "log.json_path_uri",
+                [("path", json!(path.display().to_string()))],
             ));
             continue;
         };
@@ -381,19 +422,27 @@ fn analyze_scope(
         let open_source = open_json_sources.get(&local_path_identity(&path)).cloned();
         let parsed = match (trigger, open_source) {
             (JsonAnalysisTrigger::All, Some(source)) => {
-                parse_string_source(path.clone(), uri, source)
+                parse_string_source_localized(path.clone(), uri, source, locale)
             }
             (JsonAnalysisTrigger::KeyUsageOnly, Some(source)) => {
-                parse_string_source_key_usage(path.clone(), uri, source)
+                parse_string_source_key_usage_localized(path.clone(), uri, source, locale)
             }
-            (JsonAnalysisTrigger::All, None) => parse_string_file(path.clone(), uri),
+            (JsonAnalysisTrigger::All, None) => {
+                parse_string_file_localized(path.clone(), uri, locale)
+            }
             (JsonAnalysisTrigger::KeyUsageOnly, None) => {
-                parse_string_file_key_usage(path.clone(), uri)
+                parse_string_file_key_usage_localized(path.clone(), uri, locale)
             }
         };
         match parsed {
             Ok(file) => files.push(file),
-            Err(error) => warnings.push(format!("Couldn't parse {}: {error}", path.display())),
+            Err(error) => warnings.push(JsonLogWarning::new(
+                "log.json_parse_failed",
+                [
+                    ("path", json!(path.display().to_string())),
+                    ("error", json!(error)),
+                ],
+            )),
         }
     }
 
@@ -401,16 +450,22 @@ fn analyze_scope(
     if trigger == JsonAnalysisTrigger::All
         && let Some(severity) = diagnostic_severity(rules.duplicate_ids)
     {
-        apply_duplicate_ids(&mut files, severity);
+        apply_duplicate_ids(&mut files, severity, locale);
     }
     if trigger == JsonAnalysisTrigger::All
         && let Some(severity) = diagnostic_severity(rules.string_format)
     {
-        apply_string_format(&mut files, severity);
+        apply_string_format(&mut files, severity, locale);
     }
     if let Some(severity) = diagnostic_severity(rules.key_usage) {
         let used_keys = collect_used_keys(data_root, txt_documents, evidence_profile);
-        apply_key_usage(&mut files, &used_keys, rules.key_usage_id_start, severity);
+        apply_key_usage(
+            &mut files,
+            &used_keys,
+            rules.key_usage_id_start,
+            severity,
+            locale,
+        );
     }
 
     let mut diagnostics_by_uri = files
@@ -433,16 +488,33 @@ fn analyze_scope(
 }
 
 fn parse_string_file(path: PathBuf, uri: Url) -> Result<StringFile, String> {
+    parse_string_file_localized(path, uri, Locale::EnUs)
+}
+
+fn parse_string_file_localized(
+    path: PathBuf,
+    uri: Url,
+    locale: Locale,
+) -> Result<StringFile, String> {
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
     let source = String::from_utf8(bytes).map_err(|error| error.to_string())?;
-    parse_string_source(path, uri, source)
+    parse_string_source_localized(path, uri, source, locale)
 }
 
 fn parse_string_source(path: PathBuf, uri: Url, source: String) -> Result<StringFile, String> {
+    parse_string_source_localized(path, uri, source, Locale::EnUs)
+}
+
+fn parse_string_source_localized(
+    path: PathBuf,
+    uri: Url,
+    source: String,
+    locale: Locale,
+) -> Result<StringFile, String> {
     let parse_source = source.strip_prefix('\u{feff}').unwrap_or(&source);
     let value: Value = match serde_json::from_str(parse_source) {
         Ok(value) => value,
-        Err(error) => return Ok(syntax_error_file(path, uri, source, error)),
+        Err(error) => return Ok(syntax_error_file(path, uri, source, error, locale)),
     };
     let Value::Array(values) = value else {
         return Ok(StringFile {
@@ -485,9 +557,17 @@ fn parse_string_source(path: PathBuf, uri: Url, source: String) -> Result<String
 /// values and their lexical spans instead of materializing the full Value tree
 /// and 15-field maps for every entry.
 fn parse_string_file_key_usage(path: PathBuf, uri: Url) -> Result<StringFile, String> {
+    parse_string_file_key_usage_localized(path, uri, Locale::EnUs)
+}
+
+fn parse_string_file_key_usage_localized(
+    path: PathBuf,
+    uri: Url,
+    locale: Locale,
+) -> Result<StringFile, String> {
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
     let source = String::from_utf8(bytes).map_err(|error| error.to_string())?;
-    parse_string_source_key_usage(path, uri, source)
+    parse_string_source_key_usage_localized(path, uri, source, locale)
 }
 
 fn parse_string_source_key_usage(
@@ -495,13 +575,22 @@ fn parse_string_source_key_usage(
     uri: Url,
     source: String,
 ) -> Result<StringFile, String> {
+    parse_string_source_key_usage_localized(path, uri, source, Locale::EnUs)
+}
+
+fn parse_string_source_key_usage_localized(
+    path: PathBuf,
+    uri: Url,
+    source: String,
+    locale: Locale,
+) -> Result<StringFile, String> {
     let parse_source = source.strip_prefix('\u{feff}').unwrap_or(&source);
     if serde_json::from_str::<IgnoredAny>(parse_source).is_err() {
         // Preserve serde_json's detailed message, but publish it as a document
         // diagnostic instead of reducing an invalid file to an empty batch.
         let error = serde_json::from_str::<Value>(parse_source)
             .expect_err("IgnoredAny and Value must agree on JSON validity");
-        return Ok(syntax_error_file(path, uri, source, error));
+        return Ok(syntax_error_file(path, uri, source, error, locale));
     }
 
     let entries = top_level_array_value_spans(&source)
@@ -528,6 +617,7 @@ fn syntax_error_file(
     uri: Url,
     source: String,
     error: serde_json::Error,
+    locale: Locale,
 ) -> StringFile {
     let span = syntax_error_span(&source, &error);
     let diagnostics = vec![rule_diagnostic(
@@ -536,7 +626,9 @@ fn syntax_error_file(
         "Json/Syntax",
         "invalid-json",
         DiagnosticSeverity::ERROR,
-        format!("Invalid localization JSON: {error}"),
+        "json.syntax_invalid",
+        i18n::args([("error", serde_json::json!(error.to_string()))]),
+        locale,
     )];
     StringFile {
         display_stem: display_stem(&path),
@@ -582,7 +674,7 @@ fn syntax_error_span(source: &str, error: &serde_json::Error) -> Span {
     }
 }
 
-fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity) {
+fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity, locale: Locale) {
     let mut global_ids: HashMap<JsMapKey, LoadedStringRecord> = HashMap::new();
     let mut global_keys: HashMap<JsMapKey, LoadedStringRecord> = HashMap::new();
     let mut composite_identity = 0usize;
@@ -605,11 +697,12 @@ fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity) {
                         "Json/DuplicateIds",
                         "invalid-id-range",
                         severity,
-                        format!(
-                            "{}.json: id {} is outside the runtime string ID range 0..65535; the game stores this namespace as uint16",
-                            file.display_stem,
-                            js_string(id)
-                        ),
+                        "json.id_out_of_range",
+                        i18n::args([
+                            ("file", serde_json::json!(file.display_stem)),
+                            ("id", serde_json::json!(js_string(id))),
+                        ]),
+                        locale,
                     ));
                 }
             } else {
@@ -619,11 +712,12 @@ fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity) {
                     "Json/DuplicateIds",
                     "missing-id",
                     severity,
-                    format!(
-                        "{}.json: missing id on entry {}",
-                        file.display_stem,
-                        index + 1
-                    ),
+                    "json.missing_id",
+                    i18n::args([
+                        ("file", serde_json::json!(file.display_stem)),
+                        ("entry", serde_json::json!(index + 1)),
+                    ]),
+                    locale,
                 ));
             }
 
@@ -638,23 +732,18 @@ fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity) {
                     "duplicate-id",
                     severity,
                     if same_file {
-                        format!(
-                            "{}.json: duplicate id {} found on entries {} and {}; entry {} is ignored, so neither its ID nor Key is registered",
-                            file.display_stem,
-                            js_string(id),
-                            previous_record.entry + 1,
-                            index + 1,
-                            index + 1
-                        )
+                        "json.duplicate_id_same"
                     } else {
-                        format!(
-                            "{}.json: duplicate id {} found in {}.json; entry {} is ignored, so neither its ID nor Key is registered",
-                            file.display_stem,
-                            js_string(id),
-                            previous_record.file,
-                            index + 1
-                        )
+                        "json.duplicate_id_cross"
                     },
+                    i18n::args([
+                        ("file", serde_json::json!(file.display_stem)),
+                        ("id", serde_json::json!(js_string(id))),
+                        ("first", serde_json::json!(previous_record.entry + 1)),
+                        ("entry", serde_json::json!(index + 1)),
+                        ("otherFile", serde_json::json!(previous_record.file)),
+                    ]),
+                    locale,
                 ));
                 continue;
             }
@@ -670,23 +759,18 @@ fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity) {
                     "duplicate-key",
                     severity,
                     if same_file {
-                        format!(
-                            "{}.json: duplicate Key '{}' found on entries {} and {}; entry {} is ignored, so neither its ID nor Key is registered",
-                            file.display_stem,
-                            js_string(key_value),
-                            previous_record.entry + 1,
-                            index + 1,
-                            index + 1
-                        )
+                        "json.duplicate_key_same"
                     } else {
-                        format!(
-                            "{}.json: duplicate Key '{}' found in {}.json; entry {} is ignored, so neither its ID nor Key is registered",
-                            file.display_stem,
-                            js_string(key_value),
-                            previous_record.file,
-                            index + 1
-                        )
+                        "json.duplicate_key_cross"
                     },
+                    i18n::args([
+                        ("file", serde_json::json!(file.display_stem)),
+                        ("keyValue", serde_json::json!(js_string(key_value))),
+                        ("first", serde_json::json!(previous_record.entry + 1)),
+                        ("entry", serde_json::json!(index + 1)),
+                        ("otherFile", serde_json::json!(previous_record.file)),
+                    ]),
+                    locale,
                 ));
                 continue;
             }
@@ -705,7 +789,7 @@ fn apply_duplicate_ids(files: &mut [StringFile], severity: DiagnosticSeverity) {
     }
 }
 
-fn apply_string_format(files: &mut [StringFile], severity: DiagnosticSeverity) {
+fn apply_string_format(files: &mut [StringFile], severity: DiagnosticSeverity, locale: Locale) {
     for file in files {
         for (index, entry) in file.entries.iter().enumerate() {
             let missing = REQUIRED_STRING_FIELDS
@@ -726,13 +810,14 @@ fn apply_string_format(files: &mut [StringFile], severity: DiagnosticSeverity) {
                 "Json/StringFormat",
                 "missing-fields",
                 severity,
-                format!(
-                    "{}.json: entry {} ({}) is missing fields: {}",
-                    file.display_stem,
-                    index + 1,
-                    key,
-                    missing.join(", ")
-                ),
+                "json.missing_fields",
+                i18n::args([
+                    ("file", serde_json::json!(file.display_stem)),
+                    ("entry", serde_json::json!(index + 1)),
+                    ("keyValue", serde_json::json!(key)),
+                    ("fields", serde_json::json!(missing.join(", "))),
+                ]),
+                locale,
             ));
         }
     }
@@ -743,6 +828,7 @@ fn apply_key_usage(
     used_keys: &HashSet<String>,
     id_start: f64,
     severity: DiagnosticSeverity,
+    locale: Locale,
 ) {
     for file in files {
         for entry in &file.entries {
@@ -764,12 +850,13 @@ fn apply_key_usage(
                 "Json/KeyUsage",
                 "unused-key",
                 severity,
-                format!(
-                    "{}.json: Key '{}' (id: {}) is not referenced as an entry in any .txt or layout .json file",
-                    file.display_stem,
-                    js_string(key),
-                    js_string(id)
-                ),
+                "json.unused_key",
+                i18n::args([
+                    ("file", serde_json::json!(file.display_stem)),
+                    ("keyValue", serde_json::json!(js_string(key))),
+                    ("id", serde_json::json!(js_string(id))),
+                ]),
+                locale,
             ));
         }
     }
@@ -889,17 +976,23 @@ fn rule_diagnostic(
     rule: &str,
     kind: &str,
     severity: DiagnosticSeverity,
-    message: String,
+    message_key: &'static str,
+    message_args: serde_json::Map<String, Value>,
+    locale: Locale,
 ) -> Diagnostic {
-    Diagnostic {
-        range: source_range(source, span),
-        severity: Some(severity),
-        code: Some(NumberOrString::String(rule.to_string())),
-        source: Some("d2rlint".to_string()),
-        message,
-        data: Some(serde_json::json!({ "kind": kind })),
-        ..Default::default()
-    }
+    i18n::localized_diagnostic(
+        locale,
+        message_key,
+        message_args,
+        Diagnostic {
+            range: source_range(source, span),
+            severity: Some(severity),
+            code: Some(NumberOrString::String(rule.to_string())),
+            source: Some("d2rlint".to_string()),
+            data: Some(serde_json::json!({ "kind": kind })),
+            ..Default::default()
+        },
+    )
 }
 
 fn diagnostic_severity(action: JsonRuleAction) -> Option<DiagnosticSeverity> {

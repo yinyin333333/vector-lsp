@@ -14,4 +14,8 @@ pub struct CliArgs {
     /// Deterministic TXTeditor launch mode: ignore workspace config and force stdio LSP.
     #[arg(long)]
     pub editor_mode: bool,
+    /// Product-message locale for CLI/single-shot. LSP initialize locale wins
+    /// for an editor session.
+    #[arg(long)]
+    pub locale: Option<String>,
 }

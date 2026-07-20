@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use tower_lsp::lsp_types::{Diagnostic, Location, Position, Range, Url};
 
 use crate::document::{DocumentData, utf16_len};
+use crate::i18n::Locale;
 use crate::json_diagnostics::{
     OpenJsonSources, PrimaryTxtDocument, data_root_from_excel_txt,
     local_path_identity as json_path_identity,
@@ -400,6 +401,9 @@ pub struct OpenJsonDocument {
 }
 
 pub struct Workspace {
+    /// Negotiated locale for this LSP service/session. It lives beside the
+    /// workspace state so TCP clients cannot observe one another's setting.
+    pub locale: Locale,
     pub root_uri: Option<Url>,
     pub reference_root_uri: Option<Url>,
     pub reference_context_mode: ReferenceContextMode,
@@ -483,6 +487,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new() -> Self {
         Self {
+            locale: Locale::EnUs,
             root_uri: None,
             reference_root_uri: None,
             reference_context_mode: ReferenceContextMode::Workspace,
@@ -1847,6 +1852,19 @@ impl Workspace {
             .collect()
     }
 
+    /// Change only the presentation locale.  The semantic workspace and
+    /// source files are untouched, while clearing publication markers makes
+    /// every currently open document eligible for a re-rendered diagnostic.
+    pub fn set_locale(&mut self, locale: Locale) -> bool {
+        if self.locale == locale {
+            return false;
+        }
+        self.locale = locale;
+        self.workspace_revision = self.workspace_revision.wrapping_add(1);
+        self.published_revisions.clear();
+        true
+    }
+
     pub fn pending_open_tickets(&self) -> Vec<ValidationTicket> {
         self.open_tickets()
             .into_iter()
@@ -2803,6 +2821,20 @@ mod tests {
             HashSet::from([target_uri, source_uri, unrelated_uri]),
             "restoring a plugin target must conservatively revalidate open dependents so stale errors clear"
         );
+    }
+
+    #[test]
+    fn locale_change_republishes_open_documents_without_changing_content() {
+        let uri = named_uri("locale");
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(1);
+        workspace.accept_open(uri, 1, doc("KEY"));
+        mark_all_open_documents_published(&mut workspace);
+
+        assert!(workspace.set_locale(Locale::KoKr));
+        assert_eq!(workspace.locale, Locale::KoKr);
+        assert_eq!(workspace.pending_open_tickets().len(), 1);
+        assert!(!workspace.set_locale(Locale::KoKr));
     }
 
     #[test]

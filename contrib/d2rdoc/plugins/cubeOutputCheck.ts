@@ -356,7 +356,14 @@ function cubeOutputDiagnostic(
         col: start,
         endCol: (row.__colstarts[column] || 0) + Math.max(span.end, span.start + 1),
         severity,
-        message,
+        messageKey: "plugin." + code,
+        messageArgs: {
+            line: row.__line + 1,
+            column,
+            value: span.text,
+            recipe: String(row["description"] ?? ""),
+        },
+        legacyMessage: message,
         code,
         data: { rule: "cubeOutputCheck", kind },
     };
@@ -587,7 +594,11 @@ function hover(ctx: HoverContext): HoverResult | null {
 
     const parsed = parseOutput(ctx.value);
     if (!parsed.base.text) {
-        return { content: "**Base:** empty (invalid cube output base)" };
+        return {
+            contentKey: "plugin.cube-output.empty-base-hover",
+            contentArgs: { column: ctx.col },
+            legacyContent: "**Base:** empty (invalid cube output base)",
+        };
     }
     const sets = outputLookupSets();
     const canProveBaseInvalid = outputTargetsAvailable();
@@ -609,7 +620,17 @@ function hover(ctx: HoverContext): HoverResult | null {
                 `**Ignored text:** \`${text}\` — the base is invalid, so the game does not create this output.`,
             );
         }
-        return { content: parts.join("\n") };
+        return {
+            contentKey: "plugin.cube-output.invalid-hover",
+            contentArgs: {
+                base: parsed.base.text,
+                column: ctx.col,
+                kind: kind || "",
+                ignoredSuffix: parsed.ignored?.text || "",
+                sourceFile: resolvedStem || "",
+            },
+            legacyContent: parts.join("\n"),
+        };
     }
 
     if (kind === "useitem" || kind === "usetype") {
@@ -662,5 +683,19 @@ function hover(ctx: HoverContext): HoverResult | null {
         }
     }
 
-    return { content: parts.join("\n") };
+    return {
+        contentKey: "plugin.cube-output.hover",
+        contentArgs: {
+            base: parsed.base.text,
+            column: ctx.col,
+            kind: kind || "",
+            input: (kind === "useitem" || kind === "usetype")
+                ? (ctx.row["input " + outputOrdinal(ctx.col)] || "")
+                : "",
+            modifiers: JSON.stringify(parsed.modifiers),
+            ignoredSuffix: parsed.ignored?.text || "",
+            sourceFile: resolvedStem || "",
+        },
+        legacyContent: parts.join("\n"),
+    };
 }

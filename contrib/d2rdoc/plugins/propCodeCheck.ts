@@ -124,7 +124,11 @@ function checkPropCode(
             endCol:   c + val.length,
             severity: "warning",
             code: marker ? "property.unknown-marker" : "property.unknown-code",
-            message: marker
+            messageKey: marker
+                ? "plugin.property.unknown-marker"
+                : "plugin.property.unknown-code",
+            messageArgs: { value: val },
+            legacyMessage: marker
                 ? `This value starts with '*', but it is not a known property code. Keep it only if it is intentionally used as a marker.`
                 : `Unknown property code '${val}'. Choose a code from properties.txt or propertygroups.txt.`,
         });
@@ -163,11 +167,22 @@ function hover(ctx: HoverContext): HoverResult | null {
     else if (propertyGroupsEnabled() && lookupKey("propertygroups", "code", ctx.value)) stem = "propertygroups";
     if (!stem) {
         if (!propTargetsAvailable()) return null;
-        return { content: `Unknown property code: \`${ctx.value}\`. Choose a code from properties.txt or propertygroups.txt.` };
+        return {
+            contentKey: "plugin.property.unknown-hover",
+            contentArgs: { value: ctx.value },
+            legacyContent: `Unknown property code: \`${ctx.value}\`. Choose a code from properties.txt or propertygroups.txt.`,
+        };
     }
-    const source = sourceDescription(stem);
+    const source = getWorkspaceSource(stem);
     return {
-        content: `Property: \`${ctx.value}\` (${stem}.txt code)`
-            + (source ? "\n\nSource: " + source : ""),
+        contentKey: "plugin.property.hover",
+        contentArgs: {
+            value: ctx.value,
+            sourceFile: stem,
+            sourceKind: source?.kind || "",
+            sourceVersion: source?.version || "",
+        },
+        legacyContent: `Property: \`${ctx.value}\` (${stem}.txt code)`
+            + (sourceDescription(stem) ? "\n\nSource: " + sourceDescription(stem) : ""),
     };
 }

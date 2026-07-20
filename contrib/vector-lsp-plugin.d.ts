@@ -56,7 +56,20 @@ interface PluginDiagnostic {
     endCol?: number;
     /** Defaults to `"warning"`. */
     severity?: "error" | "warning" | "info" | "hint";
-    message: string;
+    /**
+     * Legacy already-localized diagnostic text. Prefer `messageKey` and
+     * `messageArgs` so the host can render this in the active UI language.
+     */
+    message?: string;
+    /** Stable host-localized message key (for example `plugin.calc.unknownSkill`). */
+    messageKey?: string;
+    /** Named values interpolated by the host's localized message template. */
+    messageArgs?: Record<string, string | number | boolean>;
+    /**
+     * Exact en-US fallback text retained for compatibility. The host must not
+     * translate or parse this; use `messageKey` for localized rendering.
+     */
+    legacyMessage?: string;
     /** Optional machine-readable diagnostic code forwarded to LSP clients. */
     code?: string | number;
     /** Optional structured diagnostic metadata forwarded to LSP clients. */
@@ -186,7 +199,8 @@ declare function getColumn(file: string, col: string): ColumnInfo | null;
  *           line: row.__line,
  *           col: row.__colstarts["input " + i] || 0,
  *           severity: "warning",
- *           message: "input " + i + " is required when numinputs=" + n,
+ *           messageKey: "plugin.example.input-required",
+ *           messageArgs: { input: i, numinputs: n },
  *         });
  *       }
  *     }
@@ -214,8 +228,14 @@ interface HoverContext {
 }
 
 interface HoverResult {
-    /** Markdown content appended after the schema description (if any). */
-    content: string;
+    /** Legacy already-localized Markdown appended after the schema description. */
+    content?: string;
+    /** Stable host-localized Markdown key. Prefer this to `content`. */
+    contentKey?: string;
+    /** Named values interpolated by the host's localized Markdown template. */
+    contentArgs?: Record<string, string | number | boolean>;
+    /** Exact en-US fallback Markdown retained for compatibility only. */
+    legacyContent?: string;
 }
 
 /**
@@ -246,7 +266,10 @@ declare function getEnumTable(file: string, col: string): { headers: string[]; r
  *   var ops = { "1": "Add value", "2": "Multiply", "3": "Set value" };
  *   var label = ops[ctx.value];
  *   if (!label) return null;
- *   return { content: "Op **" + ctx.value + "**: " + label };
+ *   return {
+ *     contentKey: "plugin.example.operation",
+ *     contentArgs: { value: ctx.value, label },
+ *   };
  * }
  */
 declare function hover(ctx: HoverContext): HoverResult | null;

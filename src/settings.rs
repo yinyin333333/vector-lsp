@@ -1,6 +1,8 @@
 use serde::{Deserialize, Deserializer};
 use std::path::PathBuf;
 
+use crate::i18n::Locale;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum JsonRuleAction {
     Ignore,
@@ -222,6 +224,10 @@ pub struct VectorLspSettings {
     /// these diagnostics on for a mod that does not contain string JSON files.
     #[serde(default, deserialize_with = "deserialize_bool_or_string")]
     pub json_diagnostics: bool,
+    /// Default product-message locale for CLI/single-shot runs. LSP sessions
+    /// use their negotiated locale and fall back to enUS when it is omitted.
+    #[serde(default = "default_locale")]
+    pub locale: String,
     /// Action for d2rlint's Json/DuplicateIds rule.
     #[serde(default)]
     pub json_duplicate_ids_action: JsonRuleAction,
@@ -241,6 +247,10 @@ pub struct VectorLspSettings {
 }
 
 impl VectorLspSettings {
+    pub fn configured_locale(&self) -> Locale {
+        Locale::normalize(Some(&self.locale))
+    }
+
     pub fn delimiter_char(&self) -> char {
         self.delimiter.chars().next().unwrap_or('\t')
     }
@@ -331,6 +341,7 @@ impl Default for VectorLspSettings {
             schema_variant: String::new(),
             reference_variant: String::new(),
             json_diagnostics: false,
+            locale: default_locale(),
             json_duplicate_ids_action: JsonRuleAction::Warn,
             json_string_format_action: JsonRuleAction::Warn,
             json_key_usage_action: JsonRuleAction::Ignore,
@@ -345,6 +356,10 @@ fn default_schema_loader() -> String {
 
 fn default_delimiter() -> String {
     "\t".to_string()
+}
+
+fn default_locale() -> String {
+    Locale::EnUs.as_str().to_string()
 }
 
 fn default_extension() -> String {

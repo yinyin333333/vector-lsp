@@ -32,48 +32,39 @@ function hover(ctx: HoverContext): HoverResult | null {
         else if (h === "description" || h === "desc") descIdx = i;
     }
 
-    const parts: string[] = [];
-
-    // Line 1: the code value itself.
-    parts.push(ctx.value);
-
-    // Line 2: function/enum name if present.
-    if (nameIdx >= 0 && matched[nameIdx]) {
-        parts.push(matched[nameIdx]);
-    }
-
-    // Blank line before body sections.
-    parts.push("");
-
-    if (paramsIdx >= 0 && matched[paramsIdx]) {
-        const paramList = matched[paramsIdx]
+    const name = nameIdx >= 0 ? (matched[nameIdx] || "") : "";
+    const parameters = paramsIdx >= 0 && matched[paramsIdx]
+        ? matched[paramsIdx]
             .split(/[\r\n]+/)
             .map((s: string) => s.trim())
             .filter((s: string) => s.length > 0)
-            .join(", ");
-        parts.push("**Parameters:** " + paramList);
-    }
-
-    if (descIdx >= 0 && matched[descIdx]) {
-        parts.push(matched[descIdx]);
-    }
-
-    // Fallback for tables with none of the standard column names: show all
-    // non-code columns with their header label.
+            .join(", ")
+        : "";
+    const description = descIdx >= 0 ? (matched[descIdx] || "") : "";
+    const extraFields: Record<string, string> = {};
+    const legacyParts: string[] = [ctx.value];
+    if (name) legacyParts.push(name);
+    legacyParts.push("");
+    if (parameters) legacyParts.push("**Parameters:** " + parameters);
+    if (description) legacyParts.push(description);
     if (nameIdx < 0 && paramsIdx < 0 && descIdx < 0) {
         for (let i = 1; i < headers.length; i++) {
             if (matched[i]) {
-                parts.push("**" + headers[i] + ":** " + matched[i]);
+                extraFields[headers[i]] = matched[i];
+                legacyParts.push("**" + headers[i] + ":** " + matched[i]);
             }
         }
     }
-
-    // Drop trailing blank lines.
-    while (parts.length > 0 && parts[parts.length - 1] === "") {
-        parts.pop();
-    }
-
-    if (parts.length === 0) return null;
-
-    return { content: parts.join("\n") };
+    while (legacyParts.length > 0 && legacyParts[legacyParts.length - 1] === "") legacyParts.pop();
+    return {
+        contentKey: "plugin.enum.hover",
+        contentArgs: {
+            value: ctx.value,
+            name,
+            parameters,
+            description,
+            extraFields: JSON.stringify(extraFields),
+        },
+        legacyContent: legacyParts.join("\n"),
+    };
 }

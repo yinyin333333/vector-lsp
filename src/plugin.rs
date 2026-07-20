@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url};
 
 use crate::document::DocumentData;
+use crate::i18n::{self, Locale};
 use crate::runtime::{ScriptRuntime, WorkspaceFileSnapshot, WorkspaceIndex, WorkspaceSourceInfo};
 use crate::schema::Schema;
 use crate::source_selection::{
@@ -29,7 +30,16 @@ struct RawDiag {
     /// "error" | "warning" | "info" | "hint" — defaults to "warning"
     #[serde(default)]
     severity: String,
-    message: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(rename = "messageKey", default)]
+    message_key: Option<String>,
+    #[serde(rename = "messageArgs", default)]
+    message_args: Option<serde_json::Map<String, Value>>,
+    /// Compatibility text supplied by bundled plugins for enUS only. It is
+    /// never analyzed or translated; keyed localization remains authoritative.
+    #[serde(rename = "legacyMessage", default)]
+    legacy_message: Option<String>,
     #[serde(default)]
     code: Option<NumberOrString>,
     #[serde(default)]
@@ -37,7 +47,7 @@ struct RawDiag {
 }
 
 impl RawDiag {
-    fn into_lsp(self) -> Diagnostic {
+    fn into_lsp(self, locale: Locale) -> Diagnostic {
         let severity = match self.severity.as_str() {
             "error" => DiagnosticSeverity::ERROR,
             "info" | "information" => DiagnosticSeverity::INFORMATION,
@@ -49,7 +59,7 @@ impl RawDiag {
         } else {
             self.col
         };
-        Diagnostic {
+        let diagnostic = Diagnostic {
             range: Range {
                 start: Position {
                     line: self.line,
@@ -63,9 +73,19 @@ impl RawDiag {
             severity: Some(severity),
             code: self.code,
             source: Some("vector-lsp/plugin".into()),
-            message: self.message,
+            message: self.message.clone().unwrap_or_default(),
             data: self.data,
             ..Default::default()
+        };
+        match self.message_key {
+            Some(key) => i18n::localized_plugin_diagnostic(
+                locale,
+                &key,
+                self.message_args.unwrap_or_default(),
+                self.legacy_message.or(self.message),
+                diagnostic,
+            ),
+            None => diagnostic,
         }
     }
 }
@@ -76,7 +96,14 @@ impl RawDiag {
 
 #[derive(Deserialize)]
 struct RawHover {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(rename = "contentKey", default)]
+    content_key: Option<String>,
+    #[serde(rename = "contentArgs", default)]
+    content_args: Option<serde_json::Map<String, Value>>,
+    #[serde(rename = "legacyContent", default)]
+    legacy_content: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,12 +222,14 @@ enum PluginRequest {
         ctx: String,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        locale: Locale,
         reply: oneshot::Sender<Vec<Diagnostic>>,
     },
     Hover {
         ctx: Value,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        locale: Locale,
         reply: oneshot::Sender<Option<String>>,
     },
     GotoDefinition {
@@ -361,6 +390,7 @@ impl PluginHost {
                         ctx,
                         index,
                         snapshot,
+                        locale,
                         reply,
                     } => {
                         install_workspace_view(&mut rt, &mut last_snapshot_ptr, index, snapshot);
@@ -370,6 +400,7 @@ impl PluginHost {
                             ctx,
                             operation_counts.validate,
                             execution_budget,
+                            locale,
                         );
                         let _ = reply.send(diags);
                     }
@@ -377,6 +408,7 @@ impl PluginHost {
                         ctx,
                         index,
                         snapshot,
+                        locale,
                         reply,
                     } => {
                         install_workspace_view(&mut rt, &mut last_snapshot_ptr, index, snapshot);
@@ -391,6 +423,7 @@ impl PluginHost {
                             ctx_json,
                             operation_counts.hover,
                             execution_budget,
+                            locale,
                         );
                         if debug {
                             eprintln!("[hover-debug] result={result:?}");
@@ -483,6 +516,19 @@ impl PluginHost {
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
     ) -> Vec<Diagnostic> {
+        self.run_localized(ctx, index, snapshot, Locale::EnUs).await
+    }
+
+    /// Run plugins and render their keyed product messages for one LSP
+    /// session.  The locale travels with the request rather than mutating the
+    /// dedicated runtime shared by cloned handles.
+    pub async fn run_localized(
+        &self,
+        ctx: String,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
+        locale: Locale,
+    ) -> Vec<Diagnostic> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
@@ -490,6 +536,7 @@ impl PluginHost {
                 ctx,
                 index,
                 snapshot,
+                locale,
                 reply: reply_tx,
             })
             .await
@@ -520,6 +567,17 @@ impl PluginHost {
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
     ) -> Option<String> {
+        self.hover_localized(ctx, index, snapshot, Locale::EnUs)
+            .await
+    }
+
+    pub async fn hover_localized(
+        &self,
+        ctx: Value,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
+        locale: Locale,
+    ) -> Option<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
@@ -527,6 +585,7 @@ impl PluginHost {
                 ctx,
                 index,
                 snapshot,
+                locale,
                 reply: reply_tx,
             })
             .await
@@ -676,6 +735,7 @@ fn run_validation_plugins(
     ctx_json: String,
     plugin_count: usize,
     budget: Duration,
+    locale: Locale,
 ) -> Vec<Diagnostic> {
     if !prepare_plugin_context(runtime, health, "validate", ctx_json, budget) {
         return vec![];
@@ -688,7 +748,7 @@ fn run_validation_plugins(
             report_plugin_timeout(runtime, health, "validate");
             continue;
         }
-        diagnostics.extend(validation_results(raw, health));
+        diagnostics.extend(validation_results(raw, health, locale));
     }
     clear_plugin_request_state(runtime);
     diagnostics
@@ -700,6 +760,7 @@ fn run_hover_plugins(
     ctx_json: String,
     plugin_count: usize,
     budget: Duration,
+    locale: Locale,
 ) -> Option<String> {
     if !prepare_plugin_context(runtime, health, "hover", ctx_json, budget) {
         return None;
@@ -718,7 +779,7 @@ fn run_hover_plugins(
         if value.is_null() {
             continue;
         }
-        if let Some(content) = hover_value(value, health) {
+        if let Some(content) = hover_value(value, health, locale) {
             result = Some(content);
             break;
         }
@@ -727,10 +788,22 @@ fn run_hover_plugins(
     result
 }
 
-fn hover_value(value: Value, health: &PluginHealth) -> Option<String> {
+fn hover_value(value: Value, health: &PluginHealth, locale: Locale) -> Option<String> {
     match value {
         value @ Value::Object(_) => match serde_json::from_value::<RawHover>(value) {
-            Ok(hover) => Some(hover.content),
+            Ok(hover) => match hover.content_key {
+                Some(key) => Some(
+                    i18n::localized_plugin_diagnostic(
+                        locale,
+                        &key,
+                        hover.content_args.unwrap_or_default(),
+                        hover.legacy_content.or(hover.content),
+                        Diagnostic::default(),
+                    )
+                    .message,
+                ),
+                None => hover.content,
+            },
             Err(error) => {
                 health.report_once(
                     "hover-shape",
@@ -881,7 +954,11 @@ fn report_plugin_timeout(runtime: &mut ScriptRuntime, health: &PluginHealth, ope
     let _ = runtime.exec("__plugin_timeout_cleanup__", "__activePluginName=null;");
 }
 
-fn validation_results(raw: anyhow::Result<Value>, health: &PluginHealth) -> Vec<Diagnostic> {
+fn validation_results(
+    raw: anyhow::Result<Value>,
+    health: &PluginHealth,
+    locale: Locale,
+) -> Vec<Diagnostic> {
     let runs = match raw.and_then(|value| {
         serde_json::from_value::<Vec<RawPluginValidation>>(value).map_err(Into::into)
     }) {
@@ -904,9 +981,11 @@ fn validation_results(raw: anyhow::Result<Value>, health: &PluginHealth) -> Vec<
             continue;
         }
         match serde_json::from_value::<Vec<RawDiag>>(run.diagnostics) {
-            Ok(raw_diagnostics) => {
-                diagnostics.extend(raw_diagnostics.into_iter().map(RawDiag::into_lsp))
-            }
+            Ok(raw_diagnostics) => diagnostics.extend(
+                raw_diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.into_lsp(locale)),
+            ),
             Err(error) => health.report_once(
                 format!("validate-shape:{}", run.plugin),
                 format!(
@@ -1684,6 +1763,7 @@ fn strip_ts_declarations(src: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::i18n::Locale;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2274,7 +2354,7 @@ function validate(ctx: PluginContext): string[] {
         }))
         .expect("raw diagnostic should deserialize");
 
-        let diag = raw.into_lsp();
+        let diag = raw.into_lsp(Locale::EnUs);
         assert_eq!(range(&diag), (3, 10, 10));
         assert_code(&diag, "calc.expected-rparen.eof");
         assert_eq!(
@@ -2300,7 +2380,7 @@ function validate(ctx: PluginContext): string[] {
         }))
         .expect("legacy raw diagnostic should deserialize");
 
-        let diag = raw.into_lsp();
+        let diag = raw.into_lsp(Locale::EnUs);
         assert_eq!(range(&diag), (1, 2, 2));
         assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(diag.code, None);
