@@ -121,10 +121,6 @@ pub const CATALOG_KEYS: &[&str] = &[
     "hover.unknown_monpet_stat",
     "hover.unknown_property_stat",
     "hover.unknown_property_stat_noeffect",
-    "hover.source.open",
-    "hover.source.workspace",
-    "hover.source.sibling",
-    "hover.source.bundled",
     "hover.range_valid",
     "hover.reference_resolved",
     "hover.boolean_value",
@@ -3550,10 +3546,6 @@ fn english(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**Unknown stat name**\n\n`{value}` is not a known stat. This property has no effect. Use the exact Stat name from `itemstatcost.txt`."
         }
-        "hover.source.open" => "Open document{version}",
-        "hover.source.workspace" => "TXT file in the current workspace{version}",
-        "hover.source.sibling" => "TXT file in the same folder{version}",
-        "hover.source.bundled" => "Built-in reference data (game version {version})",
         "hover.range_valid" => {
             "**Range code**\n\n`{value}` is valid. The game uses range code `{stored}`."
         }
@@ -3668,10 +3660,6 @@ fn korean(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**알 수 없는 Stat 이름**\n\n`itemstatcost.txt`에 `{value}`라는 Stat 항목이 없습니다. 이 property에는 효과가 적용되지 않습니다. 정확히 일치하는 Stat 이름을 사용하세요."
         }
-        "hover.source.open" => "열린 문서{version}",
-        "hover.source.workspace" => "현재 작업 영역의 TXT 파일{version}",
-        "hover.source.sibling" => "같은 폴더의 TXT 파일{version}",
-        "hover.source.bundled" => "내장 참조 데이터(게임 버전 {version})",
         "hover.range_valid" => {
             "**Range 코드**\n\n입력한 값: `{value}`. 게임에서 사용하는 range 코드: `{stored}`."
         }
@@ -3777,10 +3765,6 @@ fn chinese_simplified(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**未知的 Stat 名称**\n\n`{value}` 不是已知的 Stat。此 property 没有效果。请使用 `itemstatcost.txt` 中准确的 Stat 名称。"
         }
-        "hover.source.open" => "打开的文档{version}",
-        "hover.source.workspace" => "当前工作区中的 TXT 文件{version}",
-        "hover.source.sibling" => "同一文件夹中的 TXT 文件{version}",
-        "hover.source.bundled" => "内置参考数据（游戏版本 {version}）",
         "hover.range_valid" => "**Range 代码**\n\n`{value}` 有效。游戏使用 range 代码 `{stored}`。",
         "hover.reference_resolved" => {
             "**引用信息**\n\n`{value}` → `{stored}`，位于 `{file}.{column}`"
@@ -3892,10 +3876,6 @@ fn german(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**Unbekannter Stat-Name**\n\n`{value}` ist kein bekannter Stat. Diese Eigenschaft hat keine Wirkung. Verwenden Sie den exakten Stat-Namen aus `itemstatcost.txt`."
         }
-        "hover.source.open" => "Geöffnetes Dokument{version}",
-        "hover.source.workspace" => "TXT-Datei im aktuellen Arbeitsbereich{version}",
-        "hover.source.sibling" => "TXT-Datei im selben Ordner{version}",
-        "hover.source.bundled" => "Integrierte Referenzdaten (Spielversion {version})",
         "hover.range_valid" => {
             "**Bereichscode**\n\n`{value}` ist gültig. Das Spiel verwendet Bereichscode `{stored}`."
         }
@@ -4009,10 +3989,6 @@ fn french(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**Nom de Stat inconnu**\n\n`{value}` n’est pas un Stat connu. Cette propriété n’a aucun effet. Utilisez le nom Stat exact de `itemstatcost.txt`."
         }
-        "hover.source.open" => "Document ouvert{version}",
-        "hover.source.workspace" => "Fichier TXT de l’espace de travail actuel{version}",
-        "hover.source.sibling" => "Fichier TXT du même dossier{version}",
-        "hover.source.bundled" => "Données de référence intégrées (version du jeu {version})",
         "hover.range_valid" => {
             "**Code de plage**\n\n`{value}` est valide. Le jeu utilise le code `{stored}`."
         }
@@ -4128,10 +4104,6 @@ fn italian(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**Nome Stat sconosciuto**\n\n`{value}` non è uno Stat noto. Questa proprietà non ha effetto. Usare il nome Stat esatto da `itemstatcost.txt`."
         }
-        "hover.source.open" => "Documento aperto{version}",
-        "hover.source.workspace" => "File TXT nell’area di lavoro corrente{version}",
-        "hover.source.sibling" => "File TXT nella stessa cartella{version}",
-        "hover.source.bundled" => "Dati di riferimento integrati (versione del gioco {version})",
         "hover.range_valid" => {
             "**Codice intervallo**\n\n`{value}` è valido. Il gioco usa il codice `{stored}`."
         }
@@ -4245,10 +4217,6 @@ fn chinese_traditional(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**未知的 Stat 名稱**\n\n`{value}` 不是已知的 Stat。此 property 不會生效。請使用 `itemstatcost.txt` 中完全一致的 Stat 名稱。"
         }
-        "hover.source.open" => "開啟的文件{version}",
-        "hover.source.workspace" => "目前工作區中的 TXT 檔案{version}",
-        "hover.source.sibling" => "同一資料夾中的 TXT 檔案{version}",
-        "hover.source.bundled" => "內建參照資料（遊戲版本 {version}）",
         "hover.range_valid" => "**Range 代碼**\n\n`{value}` 有效。遊戲使用 range 代碼 `{stored}`。",
         "hover.reference_resolved" => {
             "**參照資訊**\n\n`{value}` → `{stored}` 位於 `{file}.{column}`"
@@ -4358,10 +4326,6 @@ fn japanese(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**不明な Stat 名**\n\n`{value}` は既知の Stat ではありません。この property は効果を持ちません。`itemstatcost.txt` にある完全一致の Stat 名を使用してください。"
         }
-        "hover.source.open" => "開いているドキュメント{version}",
-        "hover.source.workspace" => "現在のワークスペース内の TXT ファイル{version}",
-        "hover.source.sibling" => "同じフォルダー内の TXT ファイル{version}",
-        "hover.source.bundled" => "組み込み参照データ（ゲームバージョン {version}）",
         "hover.range_valid" => {
             "**Range コード**\n\n`{value}` は有効です。ゲームは range コード `{stored}` を使用します。"
         }
@@ -4473,10 +4437,6 @@ fn brazilian_portuguese(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**Nome de Stat desconhecido**\n\n`{value}` não é um Stat conhecido. Esta property não tem efeito. Use o nome de Stat exatamente como aparece em `itemstatcost.txt`."
         }
-        "hover.source.open" => "Documento aberto{version}",
-        "hover.source.workspace" => "Arquivo TXT no espaço de trabalho atual{version}",
-        "hover.source.sibling" => "Arquivo TXT na mesma pasta{version}",
-        "hover.source.bundled" => "Dados de referência integrados (versão do jogo {version})",
         "hover.range_valid" => {
             "**Código range**\n\n`{value}` é válido. O jogo usa o código range `{stored}`."
         }
@@ -4594,10 +4554,6 @@ fn russian(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**Неизвестное имя Stat**\n\n`{value}` не является известным Stat. Это свойство не действует. Используйте точное имя Stat из `itemstatcost.txt`."
         }
-        "hover.source.open" => "Открытый документ{version}",
-        "hover.source.workspace" => "Файл TXT в текущей рабочей области{version}",
-        "hover.source.sibling" => "Файл TXT в той же папке{version}",
-        "hover.source.bundled" => "Встроенные справочные данные (версия игры {version})",
         "hover.range_valid" => {
             "**Код range**\n\n`{value}` допустим. Игра использует код range `{stored}`."
         }
@@ -4709,10 +4665,6 @@ fn spanish(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**Nombre de Stat desconocido**\n\n`{value}` no es un Stat conocido. Esta propiedad no tiene efecto. Use el nombre Stat exacto de `itemstatcost.txt`."
         }
-        "hover.source.open" => "Documento abierto{version}",
-        "hover.source.workspace" => "Archivo TXT del espacio de trabajo actual{version}",
-        "hover.source.sibling" => "Archivo TXT de la misma carpeta{version}",
-        "hover.source.bundled" => "Datos de referencia integrados (versión del juego {version})",
         "hover.range_valid" => {
             "**Código de rango**\n\n`{value}` es válido. El juego usa el código de rango `{stored}`."
         }
@@ -4828,10 +4780,6 @@ fn polish(key: &str) -> &'static str {
         "hover.unknown_property_stat_noeffect" => {
             "**Nieznana nazwa Stat**\n\n`{value}` nie jest znanym Stat. Ta właściwość nie ma efektu. Użyj dokładnej nazwy Stat z `itemstatcost.txt`."
         }
-        "hover.source.open" => "Otwarty dokument{version}",
-        "hover.source.workspace" => "Plik TXT w bieżącym obszarze roboczym{version}",
-        "hover.source.sibling" => "Plik TXT w tym samym folderze{version}",
-        "hover.source.bundled" => "Wbudowane dane referencyjne (wersja gry {version})",
         "hover.range_valid" => {
             "**Kod zakresu**\n\n`{value}` jest prawidłowy. Gra używa kodu zakresu `{stored}`."
         }
