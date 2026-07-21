@@ -362,9 +362,16 @@ pub struct ValidationTicket {
     pub client_version: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PendingWatchedChanges {
-    pub txt: bool,
+    pub force_txt_rescan: bool,
+    pub txt_paths: Vec<PathBuf>,
+}
+
+impl PendingWatchedChanges {
+    pub fn requested(&self) -> bool {
+        self.force_txt_rescan || !self.txt_paths.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -452,7 +459,7 @@ pub struct Workspace {
     document_epochs: HashMap<Url, u64>,
     document_revisions: HashMap<Url, u64>,
     published_revisions: HashMap<Url, u64>,
-    published_disk_diagnostics: HashSet<Url>,
+    published_disk_diagnostics: HashMap<Url, Vec<Diagnostic>>,
     /// JSON publications are tracked separately from stem-selected TXT
     /// diagnostics. Diagnostics and their LSP document version form one
     /// atomic snapshot so unchanged-result suppression cannot observe a
@@ -516,7 +523,7 @@ impl Workspace {
             document_epochs: HashMap::new(),
             document_revisions: HashMap::new(),
             published_revisions: HashMap::new(),
-            published_disk_diagnostics: HashSet::new(),
+            published_disk_diagnostics: HashMap::new(),
             published_json_diagnostics: HashMap::new(),
             json_input_generation: 0,
             watched_files_dynamic_registration: false,
@@ -651,11 +658,18 @@ impl Workspace {
     pub fn workspace_revalidation_worker_should_continue(
         &mut self,
         session_generation: u64,
+        completed_scan_generation: u64,
+        completed_workspace_revision: u64,
     ) -> bool {
         if self.workspace_revalidation_worker_session != Some(session_generation) {
             return false;
         }
-        if self.phase == WorkspacePhase::Ready && !self.pending_open_tickets().is_empty() {
+        if self.phase == WorkspacePhase::Ready
+            && self.session_generation == session_generation
+            && (self.scan_generation != completed_scan_generation
+                || self.workspace_revision != completed_workspace_revision
+                || !self.pending_open_tickets().is_empty())
+        {
             return true;
         }
         self.workspace_revalidation_worker_session = None;
@@ -797,14 +811,39 @@ impl Workspace {
         ids
     }
 
-    pub fn queue_watched_changes(&mut self, txt: bool) -> (u64, bool) {
+    pub fn queue_watched_changes(&mut self, force_txt_rescan: bool) -> (u64, bool) {
         self.watched_change_generation = self.watched_change_generation.wrapping_add(1);
-        self.pending_watched_changes.txt |= txt;
-        if txt {
+        self.pending_watched_changes.force_txt_rescan |= force_txt_rescan;
+        if force_txt_rescan {
             // Invalidate every validation ticket immediately. The quiet-window
             // rescan will allocate the generation that it actually commits.
             self.begin_scan();
         }
+        let start_worker = !self.watched_change_worker_running;
+        self.watched_change_worker_running = true;
+        (self.watched_change_generation, start_worker)
+    }
+
+    pub fn queue_watched_txt_paths<I>(&mut self, paths: I) -> (u64, bool)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let mut requested = false;
+        for path in paths {
+            requested = true;
+            if !self
+                .pending_watched_changes
+                .txt_paths
+                .iter()
+                .any(|existing| same_local_path(existing, &path))
+            {
+                self.pending_watched_changes.txt_paths.push(path);
+            }
+        }
+        if !requested {
+            return (self.watched_change_generation, false);
+        }
+        self.watched_change_generation = self.watched_change_generation.wrapping_add(1);
         let start_worker = !self.watched_change_worker_running;
         self.watched_change_worker_running = true;
         (self.watched_change_generation, start_worker)
@@ -840,14 +879,14 @@ impl Workspace {
             return None;
         }
         let pending = std::mem::take(&mut self.pending_watched_changes);
-        pending.txt.then_some(pending)
+        pending.requested().then_some(pending)
     }
 
     pub fn finish_watched_change_worker_if_idle(&mut self, session_generation: u64) -> bool {
         if self.session_generation != session_generation {
             return true;
         }
-        if self.pending_watched_changes.txt {
+        if self.pending_watched_changes.requested() {
             return false;
         }
         self.watched_change_worker_running = false;
@@ -1579,6 +1618,15 @@ impl Workspace {
         local_path_is_within(path, &reference_root)
     }
 
+    pub fn disk_path_present(&self, path: &std::path::Path) -> bool {
+        let paths = if self.reference_tier_owns_path(path) {
+            &self.reference_root_present_paths
+        } else {
+            &self.workspace_present_paths
+        };
+        Self::set_contains_local_path(paths, path)
+    }
+
     pub fn cached_disk_document(&self, path: &std::path::Path) -> Option<Arc<DocumentData>> {
         let cache = if self.reference_tier_owns_path(path) {
             &self.reference_root_cache
@@ -1744,11 +1792,18 @@ impl Workspace {
         data_root_from_excel_txt(&path)
     }
 
-    pub fn record_disk_diagnostics(&mut self, uri: Url, has_diagnostics: bool) {
-        if has_diagnostics {
-            self.published_disk_diagnostics.insert(uri);
-        } else {
+    pub fn disk_diagnostics_match(&self, uri: &Url, diagnostics: &[Diagnostic]) -> bool {
+        match self.published_disk_diagnostics.get(uri) {
+            Some(published) => published == diagnostics,
+            None => diagnostics.is_empty(),
+        }
+    }
+
+    pub fn record_disk_diagnostics(&mut self, uri: Url, diagnostics: Vec<Diagnostic>) {
+        if diagnostics.is_empty() {
             self.published_disk_diagnostics.remove(&uri);
+        } else {
+            self.published_disk_diagnostics.insert(uri, diagnostics);
         }
     }
 
@@ -1826,7 +1881,8 @@ impl Workspace {
             .collect::<HashSet<_>>();
         let mut obsolete = self
             .published_disk_diagnostics
-            .difference(&current)
+            .keys()
+            .filter(|uri| !current.contains(*uri))
             .cloned()
             .collect::<Vec<_>>();
         obsolete.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -1866,10 +1922,18 @@ impl Workspace {
     }
 
     pub fn pending_open_tickets(&self) -> Vec<ValidationTicket> {
-        self.open_tickets()
+        let mut tickets = self
+            .open_tickets()
             .into_iter()
             .filter(|ticket| self.needs_publish(ticket))
-            .collect()
+            .collect::<Vec<_>>();
+        tickets.sort_by(|left, right| {
+            right
+                .document_revision
+                .cmp(&left.document_revision)
+                .then_with(|| left.uri.as_str().cmp(right.uri.as_str()))
+        });
+        tickets
     }
 
     pub fn needs_publish(&self, ticket: &ValidationTicket) -> bool {
@@ -2136,6 +2200,28 @@ mod tests {
     }
 
     #[test]
+    fn concrete_watched_paths_wait_for_disk_verification_before_rescan() {
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(17);
+        let initial_scan = workspace.begin_scan();
+        workspace.phase = WorkspacePhase::Ready;
+        let path = std::env::temp_dir().join("watched-items.txt");
+
+        let (generation, start_worker) = workspace.queue_watched_txt_paths([path.clone()]);
+        assert!(start_worker);
+        assert_eq!(workspace.scan_generation, initial_scan);
+        let (latest_generation, second_worker) = workspace.queue_watched_txt_paths([path.clone()]);
+        assert!(!second_worker);
+        assert!(latest_generation > generation);
+        let pending = workspace
+            .take_watched_changes(17, latest_generation)
+            .unwrap();
+        assert!(!pending.force_txt_rescan);
+        assert_eq!(pending.txt_paths, vec![path]);
+        assert!(workspace.finish_watched_change_worker_if_idle(17));
+    }
+
+    #[test]
     fn nested_reference_descendant_below_a_primary_folder_keeps_its_tier() {
         let base = std::env::temp_dir().join("vlsp-nested-reference-descendant");
         let reference_root = base.join("reference");
@@ -2298,8 +2384,25 @@ mod tests {
         let json_uri = Url::parse("file:///workspace/monsters.json").unwrap();
         let txt_uri = Url::parse("file:///workspace/monsters.txt").unwrap();
         workspace.record_json_diagnostics(json_uri.clone(), vec![Diagnostic::default()]);
-        workspace.record_disk_diagnostics(txt_uri, true);
+        workspace.record_disk_diagnostics(txt_uri, vec![Diagnostic::default()]);
         assert_eq!(workspace.published_json_diagnostic_uris(), vec![json_uri]);
+    }
+
+    #[test]
+    fn disk_publications_suppress_unchanged_snapshots_and_forget_clears() {
+        let mut workspace = Workspace::new();
+        let uri = Url::parse("file:///workspace/skills.txt").unwrap();
+        let diagnostics = vec![Diagnostic {
+            message: "same diagnostics".to_string(),
+            ..Diagnostic::default()
+        }];
+
+        assert!(workspace.disk_diagnostics_match(&uri, &[]));
+        assert!(!workspace.disk_diagnostics_match(&uri, &diagnostics));
+        workspace.record_disk_diagnostics(uri.clone(), diagnostics.clone());
+        assert!(workspace.disk_diagnostics_match(&uri, &diagnostics));
+        workspace.forget_disk_diagnostics(&uri);
+        assert!(!workspace.disk_diagnostics_match(&uri, &diagnostics));
     }
 
     #[test]
@@ -2543,14 +2646,45 @@ mod tests {
 
         assert_eq!(workspace.start_workspace_revalidation_worker(), Some(21));
         assert_eq!(workspace.start_workspace_revalidation_worker(), None);
-        assert!(workspace.workspace_revalidation_worker_should_continue(21));
+        let completed_scan_generation = workspace.scan_generation;
+        let completed_workspace_revision = workspace.workspace_revision;
+        assert!(workspace.workspace_revalidation_worker_should_continue(
+            21,
+            completed_scan_generation,
+            completed_workspace_revision
+        ));
         assert!(workspace.mark_published(&second));
-        assert!(!workspace.workspace_revalidation_worker_should_continue(21));
+        assert!(!workspace.workspace_revalidation_worker_should_continue(
+            21,
+            completed_scan_generation,
+            completed_workspace_revision
+        ));
 
         workspace.begin_initialization(22);
         workspace.phase = WorkspacePhase::Ready;
         assert_eq!(workspace.reserve_schema_preview_worker(&uri), Some(22));
         assert_eq!(workspace.start_workspace_revalidation_worker(), Some(22));
+    }
+
+    #[test]
+    fn pending_open_tickets_prioritize_the_most_recent_edit() {
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(31);
+        workspace.phase = WorkspacePhase::Ready;
+        let older_uri = named_uri("older");
+        let latest_uri = named_uri("latest");
+        workspace.accept_open(older_uri.clone(), 1, doc("OLD"));
+        workspace.accept_open(latest_uri.clone(), 1, doc("BEFORE"));
+        mark_all_open_documents_published(&mut workspace);
+
+        workspace
+            .accept_change(&latest_uri, 2, doc("AFTER"))
+            .expect("latest edit should be accepted");
+        let pending = workspace.pending_open_tickets();
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].uri, latest_uri);
+        assert_eq!(pending[1].uri, older_uri);
     }
 
     #[test]

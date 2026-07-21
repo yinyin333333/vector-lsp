@@ -3613,7 +3613,7 @@ function validate(ctx: PluginContext): string[] {
                 assert_eq!(
                     diag.message,
                     format!(
-                        "{identifier} is interpreted as {interpreted_as} because SkillCalc identifiers use only the first four characters. Use pa{parameter} to reference Param{parameter}."
+                        "{identifier} is interpreted as {interpreted_as} because SkillCalc identifiers use only the first four characters."
                     )
                 );
                 assert_eq!(range(diag), (1, 4, 4 + identifier.len() as u32));
@@ -3688,7 +3688,7 @@ function validate(ctx: PluginContext): string[] {
             assert_eq!(
                 diagnostic.message,
                 format!(
-                    "Decimal values are not supported here. The game reads '{formula}' as '{consumed}' and ignores '{ignored}'. Use an integer expression that matches your intent."
+                    "Decimal values are not supported here. The game reads '{formula}' as '{consumed}' and ignores '{ignored}'."
                 )
             );
             assert_eq!(data_str(diagnostic, "consumedPrefix"), consumed);

@@ -1314,11 +1314,14 @@ mod tests {
             &SymbolIndex::new(),
             Some("3.1"),
         );
-        assert!(
-            diagnostics_3_1
-                .iter()
-                .all(|diagnostic| diagnostic.data.is_none())
-        );
+        assert!(diagnostics_3_1.iter().all(|diagnostic| {
+            diagnostic
+                .data
+                .as_ref()
+                .and_then(|data| data.get("rule"))
+                .and_then(|value| value.as_str())
+                != Some("hit-summon-mode")
+        }));
     }
 
     #[test]

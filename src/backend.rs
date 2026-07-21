@@ -32,6 +32,7 @@ enum VectorLspReady {}
 enum VectorLspFailed {}
 
 const SCAN_CONCURRENCY: usize = 4;
+const WORKSPACE_REVALIDATION_QUIET_WINDOW: Duration = Duration::from_millis(75);
 const WATCHED_FILES_QUIET_WINDOW: Duration = Duration::from_millis(250);
 const INITIAL_WATCH_REGISTRATION_GRACE: Duration = Duration::from_millis(50);
 type ParsedWorkspaceDocument = (Url, std::path::PathBuf, String, Arc<DocumentData>);
@@ -182,6 +183,12 @@ impl Backend {
         let key = normalized_file_stem_from_uri(uri)
             .map(|stem| format!("stem:{stem}"))
             .unwrap_or_else(|| format!("uri:{uri}"));
+        let mut gates = self.publish_gates.lock().await;
+        Arc::clone(gates.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+    }
+
+    async fn document_mutation_gate(&self, uri: &Url) -> Arc<Mutex<()>> {
+        let key = format!("mutation-uri:{uri}");
         let mut gates = self.publish_gates.lock().await;
         Arc::clone(gates.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
     }
@@ -1129,6 +1136,70 @@ impl Backend {
                 })
     }
 
+    async fn watched_txt_path_requires_rescan(
+        &self,
+        session_generation: u64,
+        path: &std::path::Path,
+    ) -> bool {
+        {
+            let workspace = self.workspace.read().await;
+            if workspace.session_generation != session_generation
+                || !self.is_watched_txt_path(&workspace, path)
+            {
+                return false;
+            }
+        }
+
+        let disk_document = match self.read_file(path).await {
+            Ok(text) => Some(Arc::new(DocumentData::parse(
+                &text,
+                self.settings.delimiter_char(),
+            ))),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                None
+            }
+            Err(_) => return true,
+        };
+
+        let workspace = self.workspace.read().await;
+        if workspace.session_generation != session_generation
+            || !self.is_watched_txt_path(&workspace, path)
+        {
+            return false;
+        }
+        let cached = workspace.cached_disk_document(path);
+        let present = workspace.disk_path_present(path);
+        match disk_document {
+            Some(document) => {
+                !present
+                    || cached
+                        .as_deref()
+                        .is_none_or(|cached| cached != document.as_ref())
+            }
+            None => present || cached.is_some(),
+        }
+    }
+
+    async fn watched_txt_paths_require_rescan(
+        &self,
+        session_generation: u64,
+        paths: Vec<std::path::PathBuf>,
+    ) -> bool {
+        for path in paths {
+            if self
+                .watched_txt_path_requires_rescan(session_generation, &path)
+                .await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn watched_json_event(
         workspace: &Workspace,
         path: &std::path::Path,
@@ -1186,7 +1257,11 @@ impl Backend {
                 continue;
             };
 
-            if pending.txt {
+            let requires_scan = pending.force_txt_rescan
+                || self
+                    .watched_txt_paths_require_rescan(session_generation, pending.txt_paths)
+                    .await;
+            if requires_scan {
                 self.scan_and_index_workspace(Instant::now(), Duration::ZERO)
                     .await;
             }
@@ -1348,7 +1423,7 @@ impl Backend {
 
     async fn validate_open_ticket(&self, ticket: &ValidationTicket) -> Option<Vec<Diagnostic>> {
         let locale = self.locale().await;
-        let (schema_diags, plugin_data) = {
+        let (stem, doc, schema, symbols, reference_version, plugin_view) = {
             let ws = self.workspace.read().await;
             if !ws.is_current(ticket) {
                 return None;
@@ -1356,33 +1431,51 @@ impl Backend {
             let doc = ws.open_documents.get(&ticket.uri)?.clone();
             let stem = Self::file_stem(&ticket.uri);
             let symbols = ws.symbols_for_uri(&ticket.uri);
-            let schema_diags = diagnostics::validate_document_for_locale(
-                &stem,
-                &doc,
-                ws.schema.as_deref(),
-                &symbols,
-                ws.reference_version.as_deref(),
-                locale,
-            );
-            let plugin_data = self
+            let plugin_view = self
                 .plugin_host
                 .as_ref()
                 .filter(|host| host.validates_file(&stem))
-                .map(|_| {
-                    let ctx = plugin::build_context(&stem, &doc);
-                    let view = ws.plugin_workspace_view_for_uri(&ticket.uri);
-                    (ctx, view.index, view.snapshot)
-                });
-            (schema_diags, plugin_data)
+                .map(|_| ws.plugin_workspace_view_for_uri(&ticket.uri));
+            (
+                stem,
+                doc,
+                ws.schema.clone(),
+                symbols,
+                ws.reference_version.clone(),
+                plugin_view,
+            )
         };
-        let plugin_diags = match (plugin_data, &self.plugin_host) {
-            (Some((ctx, idx, snap)), Some(host)) => {
-                host.run_localized(ctx, idx, snap, locale).await
+        let validation_stem = stem.clone();
+        let validation_doc = Arc::clone(&doc);
+        let mut diagnostics = tokio::task::spawn_blocking(move || {
+            diagnostics::validate_document_for_locale(
+                &validation_stem,
+                &validation_doc,
+                schema.as_deref(),
+                &symbols,
+                reference_version.as_deref(),
+                locale,
+            )
+        })
+        .await
+        .ok()?;
+        if !self.workspace.read().await.is_current(ticket) {
+            return None;
+        }
+        if let (Some(view), Some(host)) = (plugin_view, &self.plugin_host) {
+            diagnostics.extend(
+                host.run_localized(
+                    plugin::build_context(&stem, &doc),
+                    view.index,
+                    view.snapshot,
+                    locale,
+                )
+                .await,
+            );
+            if !self.workspace.read().await.is_current(ticket) {
+                return None;
             }
-            _ => vec![],
-        };
-        let mut diagnostics = schema_diags;
-        diagnostics.extend(plugin_diags);
+        }
         Some(diagnostics)
     }
 
@@ -1435,15 +1528,67 @@ impl Backend {
 
     async fn run_workspace_revalidation_worker(self, session_generation: u64) {
         loop {
-            self.revalidate_workspace_after_change().await;
+            let Some((scan_generation, workspace_revision)) = self
+                .wait_for_workspace_revalidation_quiet_window(session_generation)
+                .await
+            else {
+                return;
+            };
+            self.revalidate_workspace_revision(scan_generation, workspace_revision)
+                .await;
             if !self
                 .workspace
                 .write()
                 .await
-                .workspace_revalidation_worker_should_continue(session_generation)
+                .workspace_revalidation_worker_should_continue(
+                    session_generation,
+                    scan_generation,
+                    workspace_revision,
+                )
             {
                 return;
             }
+        }
+    }
+
+    async fn wait_for_workspace_revalidation_quiet_window(
+        &self,
+        session_generation: u64,
+    ) -> Option<(u64, u64)> {
+        loop {
+            let before = {
+                let ws = self.workspace.read().await;
+                if ws.phase != WorkspacePhase::Ready || ws.session_generation != session_generation
+                {
+                    return None;
+                }
+                (ws.scan_generation, ws.workspace_revision)
+            };
+            tokio::time::sleep(WORKSPACE_REVALIDATION_QUIET_WINDOW).await;
+            let ws = self.workspace.read().await;
+            if ws.phase != WorkspacePhase::Ready || ws.session_generation != session_generation {
+                return None;
+            }
+            let after = (ws.scan_generation, ws.workspace_revision);
+            if after == before {
+                return Some(after);
+            }
+        }
+    }
+
+    async fn queue_workspace_revalidation(&self) {
+        if let Some(session_generation) = self
+            .workspace
+            .write()
+            .await
+            .start_workspace_revalidation_worker()
+        {
+            let backend = self.clone();
+            tokio::spawn(async move {
+                backend
+                    .run_workspace_revalidation_worker(session_generation)
+                    .await;
+            });
         }
     }
 
@@ -1488,18 +1633,25 @@ impl Backend {
     ) -> bool {
         let gate = self.publish_gate(&uri).await;
         let _guard = gate.lock().await;
-        let current = {
+        let (current, unchanged) = {
             let ws = self.workspace.read().await;
-            ws.scan_generation == scan_generation
+            let current = ws.scan_generation == scan_generation
                 && ws.workspace_revision == workspace_revision
                 && matches!(
                     ws.phase,
                     WorkspacePhase::Reconciling | WorkspacePhase::Ready
                 )
-                && ws.disk_diagnostics_allowed(&uri)
+                && ws.disk_diagnostics_allowed(&uri);
+            (
+                current,
+                current && ws.disk_diagnostics_match(&uri, &diagnostics),
+            )
         };
+        if unchanged {
+            return true;
+        }
         if current {
-            let has_diagnostics = !diagnostics.is_empty();
+            let published_diagnostics = diagnostics.clone();
             self.client
                 .publish_diagnostics(uri.clone(), diagnostics, None)
                 .await;
@@ -1512,7 +1664,7 @@ impl Backend {
                 )
                 && ws.disk_diagnostics_allowed(&uri);
             if still_current {
-                ws.record_disk_diagnostics(uri, has_diagnostics);
+                ws.record_disk_diagnostics(uri, published_diagnostics);
                 true
             } else {
                 ws.forget_disk_diagnostics(&uri);
@@ -1554,12 +1706,25 @@ impl Backend {
         self.clear_obsolete_disk_diagnostics_except(None).await;
     }
 
+    async fn validation_revision_is_current(
+        &self,
+        scan_generation: u64,
+        workspace_revision: u64,
+    ) -> bool {
+        let ws = self.workspace.read().await;
+        ws.scan_generation == scan_generation
+            && ws.workspace_revision == workspace_revision
+            && matches!(
+                ws.phase,
+                WorkspacePhase::Reconciling | WorkspacePhase::Ready
+            )
+    }
+
     async fn validate_disk_documents_for_revision(
         &self,
         scan_generation: u64,
         workspace_revision: u64,
     ) -> bool {
-        self.clear_obsolete_disk_diagnostics().await;
         let locale = self.locale().await;
         let (schema, documents, reference_version) = {
             let ws = self.workspace.read().await;
@@ -1613,6 +1778,12 @@ impl Backend {
         results.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
 
         for (uri, stem, document, plugin_view, mut diagnostics) in results {
+            if !self
+                .validation_revision_is_current(scan_generation, workspace_revision)
+                .await
+            {
+                return false;
+            }
             if let (Some(view), Some(host)) = (plugin_view, &self.plugin_host) {
                 diagnostics.extend(
                     host.run_localized(
@@ -1623,6 +1794,12 @@ impl Backend {
                     )
                     .await,
                 );
+                if !self
+                    .validation_revision_is_current(scan_generation, workspace_revision)
+                    .await
+                {
+                    return false;
+                }
             }
             if !self
                 .publish_disk_if_current(scan_generation, workspace_revision, uri, diagnostics)
@@ -1640,34 +1817,39 @@ impl Backend {
             )
     }
 
-    async fn revalidate_workspace_after_change(&self) {
-        loop {
-            let (scan_generation, workspace_revision) = {
-                let ws = self.workspace.read().await;
-                if ws.phase != WorkspacePhase::Ready {
-                    return;
-                }
-                (ws.scan_generation, ws.workspace_revision)
-            };
+    async fn revalidate_workspace_revision(
+        &self,
+        scan_generation: u64,
+        workspace_revision: u64,
+    ) -> bool {
+        self.clear_obsolete_disk_diagnostics().await;
+        let pending = self.workspace.read().await.pending_open_tickets();
+        for ticket in pending {
             if !self
-                .validate_disk_documents_for_revision(scan_generation, workspace_revision)
+                .validation_revision_is_current(scan_generation, workspace_revision)
                 .await
             {
-                continue;
+                return false;
             }
-            let pending = self.workspace.read().await.pending_open_tickets();
-            for ticket in pending {
-                self.validate_and_publish_open(ticket).await;
-            }
-            let ws = self.workspace.read().await;
-            if ws.phase == WorkspacePhase::Ready
-                && ws.scan_generation == scan_generation
-                && ws.workspace_revision == workspace_revision
-                && ws.pending_open_tickets().is_empty()
+            self.validate_and_publish_open(ticket).await;
+            if !self
+                .validation_revision_is_current(scan_generation, workspace_revision)
+                .await
             {
-                return;
+                return false;
             }
         }
+        if !self
+            .validate_disk_documents_for_revision(scan_generation, workspace_revision)
+            .await
+        {
+            return false;
+        }
+        let ws = self.workspace.read().await;
+        ws.phase == WorkspacePhase::Ready
+            && ws.scan_generation == scan_generation
+            && ws.workspace_revision == workspace_revision
+            && ws.pending_open_tickets().is_empty()
     }
 
     async fn reconcile_open_documents_until_ready(&self, scan_generation: u64) {
@@ -1680,62 +1862,63 @@ impl Backend {
                 }
                 ws.workspace_revision
             };
+            let pending = self.workspace.read().await.pending_open_tickets();
+            if !pending.is_empty() {
+                for ticket in pending {
+                    self.validate_and_publish_open(ticket).await;
+                }
+                continue;
+            }
+            self.clear_obsolete_disk_diagnostics().await;
             if !self
                 .validate_disk_documents_for_revision(scan_generation, workspace_revision)
                 .await
             {
                 continue;
             }
-            let pending = self.workspace.read().await.pending_open_tickets();
-            if pending.is_empty() {
-                let ready = {
-                    let mut ws = self.workspace.write().await;
-                    if ws.workspace_revision != workspace_revision
-                        || !ws.mark_ready_if_reconciled(scan_generation)
-                    {
-                        None
-                    } else {
-                        let queue_startup_json = ws.claim_json_startup_analysis()
-                            && self.json_diagnostics_enabled()
-                            && !ws.primary_json_data_roots().is_empty();
-                        let queue_txt_registration_catch_up =
-                            ws.take_txt_watch_registration_catch_up();
-                        Some((
-                            VectorLspReadyParams {
-                                session_generation: ws.session_generation,
-                                scan_generation: ws.scan_generation,
-                                workspace_revision: ws.workspace_revision,
-                                root_uri: ws.root_uri.clone(),
-                            },
-                            queue_startup_json,
-                            queue_txt_registration_catch_up,
-                        ))
-                    }
-                };
-                if let Some((params, queue_startup_json, queue_txt_registration_catch_up)) = ready {
-                    self.client
-                        .send_notification::<VectorLspReady>(params)
+            let ready = {
+                let mut ws = self.workspace.write().await;
+                if ws.workspace_revision != workspace_revision
+                    || !ws.mark_ready_if_reconciled(scan_generation)
+                {
+                    None
+                } else {
+                    let queue_startup_json = ws.claim_json_startup_analysis()
+                        && self.json_diagnostics_enabled()
+                        && !ws.primary_json_data_roots().is_empty();
+                    let queue_txt_registration_catch_up = ws.take_txt_watch_registration_catch_up();
+                    Some((
+                        VectorLspReadyParams {
+                            session_generation: ws.session_generation,
+                            scan_generation: ws.scan_generation,
+                            workspace_revision: ws.workspace_revision,
+                            root_uri: ws.root_uri.clone(),
+                        },
+                        queue_startup_json,
+                        queue_txt_registration_catch_up,
+                    ))
+                }
+            };
+            if let Some((params, queue_startup_json, queue_txt_registration_catch_up)) = ready {
+                self.client
+                    .send_notification::<VectorLspReady>(params)
+                    .await;
+                if queue_startup_json {
+                    self.queue_json_analysis(JsonAnalysisTrigger::All, false)
                         .await;
-                    if queue_startup_json {
-                        self.queue_json_analysis(JsonAnalysisTrigger::All, false)
-                            .await;
-                    }
-                    if queue_txt_registration_catch_up {
-                        let (session_generation, start_worker) = {
-                            let mut workspace = self.workspace.write().await;
-                            let (_, start_worker) = workspace.queue_watched_changes(true);
-                            (workspace.session_generation, start_worker)
-                        };
-                        if start_worker {
-                            self.spawn_watched_change_worker(session_generation);
-                        }
+                }
+                if queue_txt_registration_catch_up {
+                    let (session_generation, start_worker) = {
+                        let mut workspace = self.workspace.write().await;
+                        let (_, start_worker) = workspace.queue_watched_changes(true);
+                        (workspace.session_generation, start_worker)
+                    };
+                    if start_worker {
+                        self.spawn_watched_change_worker(session_generation);
                     }
                 }
-                return;
             }
-            for ticket in pending {
-                self.validate_and_publish_open(ticket).await;
-            }
+            return;
         }
     }
 
@@ -2528,9 +2711,8 @@ impl LanguageServer for Backend {
         }
 
         // A locale switch is presentation-only, but the LSP carries rendered
-        // messages. Re-run all currently published diagnostics immediately;
-        // the workspace tickets protect semantic state from concurrent edits.
-        self.revalidate_workspace_after_change().await;
+        // messages. Queue one coalesced refresh of all published diagnostics.
+        self.queue_workspace_revalidation().await;
         self.queue_json_analysis(JsonAnalysisTrigger::All, false)
             .await;
     }
@@ -2546,7 +2728,7 @@ impl LanguageServer for Backend {
         let mutation_gate = if is_json {
             self.json_publish_gate(&uri).await
         } else {
-            self.publish_gate(&uri).await
+            self.document_mutation_gate(&uri).await
         };
         let mutation_guard = mutation_gate.lock().await;
         let json_enabled = self.json_diagnostics_enabled();
@@ -2616,10 +2798,10 @@ impl LanguageServer for Backend {
                 self.clear_obsolete_disk_diagnostics_except(Some(&ticket.uri))
                     .await;
                 if !self.validate_and_publish_open(ticket).await {
-                    self.revalidate_workspace_after_change().await;
+                    self.queue_workspace_revalidation().await;
                 }
             } else {
-                self.revalidate_workspace_after_change().await;
+                self.queue_workspace_revalidation().await;
             }
         }
         if let Some(trigger) = json_trigger {
@@ -2634,7 +2816,7 @@ impl LanguageServer for Backend {
         let mutation_gate = if is_json {
             self.json_publish_gate(&uri).await
         } else {
-            self.publish_gate(&uri).await
+            self.document_mutation_gate(&uri).await
         };
         let mutation_guard = mutation_gate.lock().await;
         let json_enabled = self.json_diagnostics_enabled();
@@ -2744,19 +2926,7 @@ impl LanguageServer for Backend {
                             .await;
                     });
                 }
-                if let Some(session_generation) = self
-                    .workspace
-                    .write()
-                    .await
-                    .start_workspace_revalidation_worker()
-                {
-                    let backend = self.clone();
-                    tokio::spawn(async move {
-                        backend
-                            .run_workspace_revalidation_worker(session_generation)
-                            .await;
-                    });
-                }
+                self.queue_workspace_revalidation().await;
             }
             Ok((false, _, _)) => {}
             Err(error) => self.report_rejected_change(&uri, error).await,
@@ -2773,7 +2943,7 @@ impl LanguageServer for Backend {
         let mutation_gate = if is_json {
             self.json_publish_gate(&uri).await
         } else {
-            self.publish_gate(&uri).await
+            self.document_mutation_gate(&uri).await
         };
         let mutation_guard = mutation_gate.lock().await;
         let json_enabled = self.json_diagnostics_enabled();
@@ -2860,9 +3030,12 @@ impl LanguageServer for Backend {
                 roots_after,
             )
         };
+        let publication_gate = self.publish_gate(&uri).await;
+        let publication_guard = publication_gate.lock().await;
         self.client
             .publish_diagnostics(uri.clone(), vec![], None)
             .await;
+        drop(publication_guard);
         drop(mutation_guard);
         if let Some(error) = reload_error {
             self.client
@@ -2880,7 +3053,7 @@ impl LanguageServer for Backend {
                 .await;
         }
         if ready {
-            self.revalidate_workspace_after_change().await;
+            self.queue_workspace_revalidation().await;
         }
         if let Some(trigger) = json_trigger {
             self.register_json_watch_roots(json_roots).await;
@@ -2889,16 +3062,22 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let (txt, json_trigger, bootstrap, json_roots) = {
+        let (txt_paths, json_trigger, bootstrap, json_roots) = {
             let workspace = self.workspace.read().await;
-            let mut txt = false;
+            let mut txt_paths = Vec::<std::path::PathBuf>::new();
             let mut json_trigger = None;
             let mut bootstrap = false;
             for change in params.changes {
                 let Ok(path) = change.uri.to_file_path() else {
                     continue;
                 };
-                txt |= self.is_watched_txt_path(&workspace, &path);
+                if self.is_watched_txt_path(&workspace, &path)
+                    && !txt_paths
+                        .iter()
+                        .any(|existing| same_local_path(existing, &path))
+                {
+                    txt_paths.push(path.clone());
+                }
                 if self.json_diagnostics_enabled() {
                     let (event_trigger, event_bootstrap) =
                         Self::watched_json_event(&workspace, &path);
@@ -2911,7 +3090,7 @@ impl LanguageServer for Backend {
                 }
             }
             (
-                txt,
+                txt_paths,
                 json_trigger,
                 bootstrap,
                 workspace.primary_json_data_roots(),
@@ -2925,10 +3104,10 @@ impl LanguageServer for Backend {
         {
             self.queue_json_analysis(trigger, true).await;
         }
-        if txt {
+        if !txt_paths.is_empty() {
             let (session_generation, start_worker) = {
                 let mut workspace = self.workspace.write().await;
-                let (_, start_worker) = workspace.queue_watched_changes(true);
+                let (_, start_worker) = workspace.queue_watched_txt_paths(txt_paths);
                 (workspace.session_generation, start_worker)
             };
             if start_worker {
@@ -4298,6 +4477,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_stem_documents_share_publication_but_not_mutation_gates() {
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        let settings = Arc::new(VectorLspSettings::default());
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+        let root = Url::parse("file:///mod/states.txt").unwrap();
+        let base = Url::parse("file:///mod/base/states.txt").unwrap();
+
+        let root_mutation = service.inner().document_mutation_gate(&root).await;
+        let base_mutation = service.inner().document_mutation_gate(&base).await;
+        assert!(!Arc::ptr_eq(&root_mutation, &base_mutation));
+        let root_publication = service.inner().publish_gate(&root).await;
+        let base_publication = service.inner().publish_gate(&base).await;
+        assert!(Arc::ptr_eq(&root_publication, &base_publication));
+    }
+
+    #[tokio::test]
     async fn watched_file_burst_returns_immediately_and_runs_one_latest_scan() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4359,7 +4562,7 @@ mod tests {
 
         let ws = workspace.read().await;
         assert_eq!(ws.phase, WorkspacePhase::Ready);
-        assert_eq!(ws.scan_generation, 2 + BURST + 1);
+        assert_eq!(ws.scan_generation, 3);
         assert_eq!(ws.workspace_revision, 8);
         assert_eq!(
             ws.file_cache
@@ -4674,7 +4877,7 @@ mod tests {
                 text_document: TextDocumentIdentifier::new(txt_uri.clone()),
             })
             .await;
-        {
+        let scan_generation_after_close = {
             let ws = workspace.read().await;
             let disk = ws
                 .file_cache
@@ -4689,7 +4892,23 @@ mod tests {
                     .resolve("skills", "id", "DISK-SAVED", ReferenceResolver::AsciiCi)
                     .is_some()
             );
-        }
+            ws.scan_generation
+        };
+        service
+            .inner()
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![
+                    FileEvent::new(txt_uri.clone(), FileChangeType::DELETED),
+                    FileEvent::new(txt_uri.clone(), FileChangeType::CREATED),
+                    FileEvent::new(txt_uri, FileChangeType::CHANGED),
+                ],
+            })
+            .await;
+        wait_for_watched_change_worker(&workspace).await;
+        assert_eq!(
+            workspace.read().await.scan_generation,
+            scan_generation_after_close
+        );
         std::fs::remove_dir_all(base).unwrap();
         socket_task.abort();
     }

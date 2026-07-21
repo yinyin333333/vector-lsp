@@ -258,7 +258,11 @@ pub fn args(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> Map<Strin
 }
 
 pub fn localize(locale: Locale, key: &str, args: &Map<String, Value>) -> String {
-    let mut text = interpolate(&catalog_template(locale, key), &values_arg(args));
+    let mut values = values_arg(args);
+    if key.starts_with("plugin.calc.") {
+        values.insert("values".to_string(), Value::String(String::new()));
+    }
+    let mut text = interpolate(&catalog_template(locale, key), &values);
     if key == "diag.reference.unresolved"
         && let Some(note) = reference_whitespace_note(locale, args)
     {
@@ -912,13 +916,13 @@ fn plugin_detail_pl(key: &str) -> Option<&'static str> {
             "Nieznana wartość pocisku `{identifier}`. Gra traktuje ją jako 0, więc ta część obliczenia nie działa."
         }
         "plugin.calc.unterminated-string" => {
-            "Łańcuch w wyrażeniu obliczenia nie został zakończony. Dodaj końcowy cudzysłów. {values}"
+            "Łańcuch w wyrażeniu obliczenia nie został zakończony. {values}"
         }
         "plugin.calc.unexpected-character" => {
             "Wyrażenie obliczenia zawiera niedozwolony znak lub symbol. Wskazana pozycja zawiera `{actual}`."
         }
         "plugin.calc.unexpected-eof" => {
-            "Wyrażenie obliczenia kończy się przed ukończeniem. Dodaj brakujący element na końcu wyrażenia. {values}"
+            "Wyrażenie obliczenia kończy się przed ukończeniem. {values}"
         }
         "plugin.calc.unexpected-token" => {
             "Wyrażenie obliczenia zawiera nieoczekiwany token `{actual}`."
@@ -979,7 +983,7 @@ fn plugin_detail_pl(key: &str) -> Option<&'static str> {
             "Identyfikator `{identifier}` jest nieznany w bieżącym zakresie obliczenia."
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "Gra wykorzystuje tylko część dziesiętnego prefiksu wyrażenia obliczenia SkillDesc. {values}"
+            "W wyrażeniu SkillDesc `{actual}` gra używa tylko prefiksu całkowitego `{consumedPrefix}` i ignoruje `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "To pole obliczenia wymaga postaci całkowitej. Gra może inaczej oceniać wyrażenia dziesiętne. {values}"
@@ -1111,13 +1115,13 @@ fn plugin_detail_it(key: &str) -> Option<&'static str> {
             "Valore missile sconosciuto `{identifier}`. Il gioco lo tratta come 0, quindi questa parte del calcolo non ha effetto."
         }
         "plugin.calc.unterminated-string" => {
-            "Una stringa nell'espressione di calcolo non termina. Aggiungere una virgoletta di chiusura alla fine della stringa. {values}"
+            "Una stringa nell'espressione di calcolo non termina. {values}"
         }
         "plugin.calc.unexpected-character" => {
             "L'espressione di calcolo contiene un carattere o simbolo non consentito. La posizione indicata contiene `{actual}`."
         }
         "plugin.calc.unexpected-eof" => {
-            "L'espressione di calcolo termina prima di essere completa. Aggiungere l'elemento mancante alla fine dell'espressione. {values}"
+            "L'espressione di calcolo termina prima di essere completa. {values}"
         }
         "plugin.calc.unexpected-token" => {
             "L'espressione di calcolo contiene il token inatteso `{actual}`."
@@ -1180,7 +1184,7 @@ fn plugin_detail_it(key: &str) -> Option<&'static str> {
             "L'identificatore `{identifier}` e sconosciuto nell'ambito di calcolo corrente."
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "Il gioco usa solo in parte il prefisso decimale di un'espressione di calcolo SkillDesc. {values}"
+            "Nell'espressione SkillDesc `{actual}`, il gioco usa solo il prefisso intero `{consumedPrefix}` e ignora `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Questo campo di calcolo richiede una forma intera. Il gioco puo valutare diversamente le espressioni decimali. {values}"
@@ -1315,13 +1319,13 @@ fn plugin_detail_fr(key: &str) -> Option<&'static str> {
             "Valeur de missile inconnue `{identifier}`. Le jeu traite cette valeur comme 0 ; cette partie du calcul n'a donc aucun effet."
         }
         "plugin.calc.unterminated-string" => {
-            "Une chaîne dans l'expression de calcul n'est pas terminée. Ajoutez un guillemet fermant à la fin de la chaîne. {values}"
+            "Une chaîne dans l'expression de calcul n'est pas terminée. {values}"
         }
         "plugin.calc.unexpected-character" => {
             "L'expression de calcul contient un caractère ou symbole non autorisé. La position signalée contient `{actual}`."
         }
         "plugin.calc.unexpected-eof" => {
-            "L'expression de calcul se termine avant d'être complète. Ajoutez l'élément manquant à la fin de l'expression. {values}"
+            "L'expression de calcul se termine avant d'être complète. {values}"
         }
         "plugin.calc.unexpected-token" => {
             "L'expression de calcul contient le jeton inattendu `{actual}`."
@@ -1382,7 +1386,7 @@ fn plugin_detail_fr(key: &str) -> Option<&'static str> {
             "L'identifiant `{identifier}` est inconnu dans la portée de calcul actuelle."
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "Le jeu n'utilise qu'en partie le préfixe décimal d'une expression de calcul SkillDesc. {values}"
+            "Dans l'expression SkillDesc `{actual}`, le jeu utilise uniquement le préfixe entier `{consumedPrefix}` et ignore `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Ce champ de calcul exige une écriture entière. Le jeu peut évaluer différemment les expressions de calcul décimales. {values}"
@@ -1515,13 +1519,13 @@ fn plugin_detail_es(key: &str) -> Option<&'static str> {
             "Valor de misil desconocido `{identifier}`. El juego trata este valor como 0, por lo que esta parte del cálculo no tiene efecto."
         }
         "plugin.calc.unterminated-string" => {
-            "Una cadena de la expresión de cálculo no está terminada. Añada una comilla de cierre al final de la cadena. {values}"
+            "Una cadena de la expresión de cálculo no está terminada. {values}"
         }
         "plugin.calc.unexpected-character" => {
             "La expresión de cálculo contiene un carácter o símbolo no permitido. La posición indicada contiene `{actual}`."
         }
         "plugin.calc.unexpected-eof" => {
-            "La expresión de cálculo termina antes de estar completa. Añada el elemento que falta al final de la expresión. {values}"
+            "La expresión de cálculo termina antes de estar completa. {values}"
         }
         "plugin.calc.unexpected-token" => {
             "La expresión de cálculo contiene el token inesperado `{actual}`."
@@ -1584,7 +1588,7 @@ fn plugin_detail_es(key: &str) -> Option<&'static str> {
             "El identificador `{identifier}` es desconocido en el ámbito de cálculo actual."
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "El juego solo utiliza parcialmente el prefijo decimal de una expresión de cálculo de SkillDesc. {values}"
+            "En la expresión SkillDesc `{actual}`, el juego solo utiliza el prefijo entero `{consumedPrefix}` e ignora `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Este campo de cálculo requiere una expresión entera. El juego puede evaluar de otra manera las expresiones decimales. {values}"
@@ -1720,13 +1724,13 @@ fn plugin_detail_pt_br(key: &str) -> Option<&'static str> {
             "Valor de missil desconhecido `{identifier}`. O jogo trata esse valor como 0, portanto esta parte do calculo nao tem efeito."
         }
         "plugin.calc.unterminated-string" => {
-            "Uma cadeia na expressao de calculo nao foi terminada. Adicione aspas de fechamento ao final da cadeia. {values}"
+            "Uma cadeia na expressao de calculo nao foi terminada. {values}"
         }
         "plugin.calc.unexpected-character" => {
             "A expressao de calculo contem um caractere ou simbolo invalido. A posicao indicada contem `{actual}`."
         }
         "plugin.calc.unexpected-eof" => {
-            "A expressao de calculo termina antes de estar completa. Adicione o elemento que falta ao final da expressao. {values}"
+            "A expressao de calculo termina antes de estar completa. {values}"
         }
         "plugin.calc.unexpected-token" => {
             "A expressao de calculo contem o token inesperado `{actual}`."
@@ -1787,7 +1791,7 @@ fn plugin_detail_pt_br(key: &str) -> Option<&'static str> {
             "O identificador `{identifier}` e desconhecido no escopo atual do calculo."
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "O jogo usa somente parte do prefixo decimal de uma expressao de calculo SkillDesc. {values}"
+            "Na expressao SkillDesc `{actual}`, o jogo usa apenas o prefixo inteiro `{consumedPrefix}` e ignora `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Este campo de calculo exige uma expressao inteira. O jogo pode avaliar expressoes decimais de modo diferente. {values}"
@@ -1921,13 +1925,13 @@ fn plugin_detail_es_mx(key: &str) -> Option<&'static str> {
             "Valor de misil desconocido `{identifier}`. El juego lo toma como 0, asi que esta parte del calculo no tiene efecto."
         }
         "plugin.calc.unterminated-string" => {
-            "Una cadena de la expresion de calculo no esta cerrada. Agrega la comilla final. {values}"
+            "Una cadena de la expresion de calculo no esta cerrada. {values}"
         }
         "plugin.calc.unexpected-character" => {
             "La expresion de calculo tiene un caracter o simbolo no permitido. En la posicion indicada aparece `{actual}`."
         }
         "plugin.calc.unexpected-eof" => {
-            "La expresion de calculo termina antes de completarse. Agrega el elemento que falta al final. {values}"
+            "La expresion de calculo termina antes de completarse. {values}"
         }
         "plugin.calc.unexpected-token" => {
             "La expresion de calculo contiene el token inesperado `{actual}`."
@@ -1990,7 +1994,7 @@ fn plugin_detail_es_mx(key: &str) -> Option<&'static str> {
             "El identificador `{identifier}` no existe en el ambito actual del calculo."
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "El juego solo usa parte del prefijo decimal de una expresion de calculo SkillDesc. {values}"
+            "En la expresion SkillDesc `{actual}`, el juego solo usa el prefijo entero `{consumedPrefix}` e ignora `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Este campo de calculo requiere una expresion entera. El juego puede evaluar distinto las expresiones decimales. {values}"
@@ -2125,13 +2129,13 @@ fn plugin_detail_de(key: &str) -> Option<&'static str> {
             "Unbekannter missile-Wert `{identifier}`. Das Spiel behandelt diesen Wert als 0; dieser Teil der Berechnung hat daher keine Wirkung."
         }
         "plugin.calc.unterminated-string" => {
-            "Eine Zeichenfolge im Berechnungsausdruck wurde nicht geschlossen. Fügen Sie am Ende der Zeichenfolge ein schließendes Anführungszeichen hinzu. {values}"
+            "Eine Zeichenfolge im Berechnungsausdruck wurde nicht geschlossen. {values}"
         }
         "plugin.calc.unexpected-character" => {
             "Der Berechnungsausdruck enthält ein nicht zulässiges Zeichen oder Symbol. An der Fehlerposition steht `{actual}`."
         }
         "plugin.calc.unexpected-eof" => {
-            "Der Berechnungsausdruck endet, bevor er vollständig ist. Fügen Sie das fehlende Element am Ende des Ausdrucks hinzu. {values}"
+            "Der Berechnungsausdruck endet, bevor er vollständig ist. {values}"
         }
         "plugin.calc.unexpected-token" => {
             "Im Berechnungsausdruck wurde das unerwartete Token `{actual}` gefunden."
@@ -2194,7 +2198,7 @@ fn plugin_detail_de(key: &str) -> Option<&'static str> {
             "Der Bezeichner `{identifier}` ist im aktuellen Berechnungsbereich nicht bekannt."
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "Der Dezimalpräfix eines SkillDesc-Berechnungsausdrucks wird vom Spiel nur teilweise verwendet. {values}"
+            "Im SkillDesc-Ausdruck `{actual}` verwendet das Spiel nur das ganzzahlige Präfix `{consumedPrefix}` und ignoriert `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Dieses Berechnungsfeld verlangt eine ganzzahlige Schreibweise. Dezimale Berechnungsausdrücke können vom Spiel anders ausgewertet werden. {values}"
@@ -2326,15 +2330,11 @@ fn plugin_detail_ko(key: &str) -> Option<&'static str> {
         "plugin.calc.unknown-missile-value" => {
             "알 수 없는 Missile 값: `{identifier}`. 게임은 이 값을 0으로 처리하므로 계산식의 이 부분은 적용되지 않습니다."
         }
-        "plugin.calc.unterminated-string" => {
-            "계산식의 따옴표 문자열이 닫히지 않았습니다. 문자열 끝에 닫는 작은따옴표를 추가하세요. {values}"
-        }
+        "plugin.calc.unterminated-string" => "계산식의 따옴표 문자열이 닫히지 않았습니다. {values}",
         "plugin.calc.unexpected-character" => {
             "계산식에 허용되지 않는 문자 또는 접미사가 있습니다. 문제 위치의 값: `{actual}`."
         }
-        "plugin.calc.unexpected-eof" => {
-            "계산식이 완성되기 전에 끝났습니다. 식 끝의 누락된 요소를 추가하세요. {values}"
-        }
+        "plugin.calc.unexpected-eof" => "계산식이 완성되기 전에 끝났습니다. {values}",
         "plugin.calc.unexpected-token" => {
             "계산식에서 예상하지 못한 토큰을 발견했습니다: `{actual}`."
         }
@@ -2382,7 +2382,7 @@ fn plugin_detail_ko(key: &str) -> Option<&'static str> {
             "현재 계산 범위에서 찾을 수 없는 식별자: `{identifier}`."
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "이 SkillDesc 계산식의 소수 접두부는 게임에서 일부만 사용될 수 있습니다. {values}"
+            "SkillDesc 계산식에 소수가 포함되어 있습니다 (`{actual}`). 게임은 정수 부분만 사용하고 소수 부분은 무시합니다 (사용: `{consumedPrefix}`, 무시: `{ignoredSuffix}`)."
         }
         "plugin.calc.decimal-policy" => {
             "이 계산 필드는 정수 표현을 기대합니다. 소수 계산식은 게임에서 다르게 해석될 수 있습니다. {values}"
@@ -2513,15 +2513,11 @@ fn plugin_detail_ja(key: &str) -> Option<&'static str> {
         "plugin.calc.unknown-missile-value" => {
             "不明な missile 値 `{identifier}` です。ゲームでは 0 として扱われるため、この計算部分は機能しません。"
         }
-        "plugin.calc.unterminated-string" => {
-            "計算式内の文字列が閉じられていません。末尾の引用符を追加してください。{values}"
-        }
+        "plugin.calc.unterminated-string" => "計算式内の文字列が閉じられていません。{values}",
         "plugin.calc.unexpected-character" => {
             "計算式に使用できない文字または記号があります。問題の位置の値は `{actual}` です。"
         }
-        "plugin.calc.unexpected-eof" => {
-            "計算式が完結する前に終了しています。式の末尾に不足している要素を追加してください。{values}"
-        }
+        "plugin.calc.unexpected-eof" => "計算式が完結する前に終了しています。{values}",
         "plugin.calc.unexpected-token" => "計算式に予期しないトークン `{actual}` があります。",
         "plugin.calc.wrong-arity" => "計算関数に渡された引数の数が正しくありません。{values}",
         "plugin.calc.expected-quoted-argument" => {
@@ -2561,7 +2557,7 @@ fn plugin_detail_ja(key: &str) -> Option<&'static str> {
             "現在の計算スコープに識別子 `{identifier}` はありません。"
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "ゲームは SkillDesc 計算式の小数接頭辞部分だけを使用します。{values}"
+            "SkillDesc 計算式 `{actual}` では、ゲームは整数部分 `{consumedPrefix}` だけを使用し、`{ignoredSuffix}` を無視します。"
         }
         "plugin.calc.decimal-policy" => {
             "この計算フィールドには整数形式が必要です。ゲームでは小数を含む計算式を異なる方法で評価する場合があります。{values}"
@@ -2692,15 +2688,11 @@ fn plugin_detail_ru(key: &str) -> Option<&'static str> {
         "plugin.calc.unknown-missile-value" => {
             "Неизвестное значение missile `{identifier}`. Игра считает его равным 0, поэтому эта часть формулы не действует."
         }
-        "plugin.calc.unterminated-string" => {
-            "Строка в формуле не завершена. Добавьте закрывающую кавычку. {values}"
-        }
+        "plugin.calc.unterminated-string" => "Строка в формуле не завершена. {values}",
         "plugin.calc.unexpected-character" => {
             "Формула содержит недопустимый символ. В указанной позиции находится `{actual}`."
         }
-        "plugin.calc.unexpected-eof" => {
-            "Формула заканчивается до завершения выражения. Добавьте недостающий элемент в конец формулы. {values}"
-        }
+        "plugin.calc.unexpected-eof" => "Формула заканчивается до завершения выражения. {values}",
         "plugin.calc.unexpected-token" => "Формула содержит неожиданный токен `{actual}`.",
         "plugin.calc.wrong-arity" => "Функция формулы получила неверное число аргументов. {values}",
         "plugin.calc.expected-quoted-argument" => {
@@ -2750,7 +2742,7 @@ fn plugin_detail_ru(key: &str) -> Option<&'static str> {
             "Идентификатор `{identifier}` неизвестен в текущей области видимости формулы."
         }
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "Игра использует только целочисленный префикс десятичной формулы SkillDesc. {values}"
+            "В выражении SkillDesc `{actual}` игра использует только целую часть `{consumedPrefix}` и игнорирует `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Это поле формулы требует целочисленного значения. Игра может иначе вычислять десятичные выражения. {values}"
@@ -2879,13 +2871,11 @@ fn plugin_detail_zh_cn(key: &str) -> Option<&'static str> {
         "plugin.calc.unknown-missile-value" => {
             "未知的 missile 值 `{identifier}`。游戏会将其视为 0，这部分计算不会生效。"
         }
-        "plugin.calc.unterminated-string" => {
-            "计算公式中的引号字符串未闭合。请在末尾补上单引号。{values}"
-        }
+        "plugin.calc.unterminated-string" => "计算公式中的引号字符串未闭合。{values}",
         "plugin.calc.unexpected-character" => {
             "计算公式含有不允许的字符或后缀。问题值：`{actual}`。"
         }
-        "plugin.calc.unexpected-eof" => "计算公式尚未完成便结束了。请补全末尾缺失的部分。{values}",
+        "plugin.calc.unexpected-eof" => "计算公式尚未完成便结束了。{values}",
         "plugin.calc.unexpected-token" => "计算公式中出现了意外的 token `{actual}`。",
         "plugin.calc.wrong-arity" => "计算函数的参数数量不正确。{values}",
         "plugin.calc.expected-quoted-argument" => {
@@ -2919,7 +2909,7 @@ fn plugin_detail_zh_cn(key: &str) -> Option<&'static str> {
         "plugin.unknownMissileIdentifier" => "找不到 missile 计算标识符 `{identifier}`。",
         "plugin.unknownScopeIdentifier" => "当前计算 scope 中找不到标识符 `{identifier}`。",
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "此 SkillDesc 计算公式的小数前缀可能只会被游戏部分使用。{values}"
+            "在 SkillDesc 计算公式 `{actual}` 中，游戏只使用整数部分 `{consumedPrefix}`，并忽略 `{ignoredSuffix}`。"
         }
         "plugin.calc.decimal-policy" => {
             "此计算字段应使用整数写法；小数公式可能被游戏以不同方式解释。{values}"
@@ -3042,13 +3032,11 @@ fn plugin_detail_zh_tw(key: &str) -> Option<&'static str> {
         "plugin.calc.unknown-missile-value" => {
             "未知的 missile 值 `{identifier}`。遊戲會將其視為 0，這部分計算不會生效。"
         }
-        "plugin.calc.unterminated-string" => {
-            "計算公式中的引號字串未閉合。請在末尾補上單引號。{values}"
-        }
+        "plugin.calc.unterminated-string" => "計算公式中的引號字串未閉合。{values}",
         "plugin.calc.unexpected-character" => {
             "計算公式含有不允許的字元或字尾。問題值：`{actual}`。"
         }
-        "plugin.calc.unexpected-eof" => "計算公式尚未完成便結束了。請補全末尾缺失的部分。{values}",
+        "plugin.calc.unexpected-eof" => "計算公式尚未完成便結束了。{values}",
         "plugin.calc.unexpected-token" => "計算公式中出現了意外的 token `{actual}`。",
         "plugin.calc.wrong-arity" => "計算函式的引數數量不正確。{values}",
         "plugin.calc.expected-quoted-argument" => {
@@ -3082,7 +3070,7 @@ fn plugin_detail_zh_tw(key: &str) -> Option<&'static str> {
         "plugin.unknownMissileIdentifier" => "找不到 missile 計算識別符號 `{identifier}`。",
         "plugin.unknownScopeIdentifier" => "當前計算 scope 中找不到識別符號 `{identifier}`。",
         "plugin.calc.skilldesc-decimal-prefix" => {
-            "此 SkillDesc 計算公式的小數字首可能只會被遊戲部分使用。{values}"
+            "在 SkillDesc 計算公式 `{actual}` 中，遊戲只使用整數部分 `{consumedPrefix}`，並忽略 `{ignoredSuffix}`。"
         }
         "plugin.calc.decimal-policy" => {
             "此計算欄位應使用整數寫法；小數公式可能被遊戲以不同方式解釋。{values}"
@@ -3339,7 +3327,12 @@ pub fn localized_diagnostic(
     mut diagnostic: Diagnostic,
 ) -> Diagnostic {
     diagnostic.message = localize(locale, key, &args);
-    diagnostic.data = Some(merge_data(diagnostic.data.take(), key, Value::Object(args)));
+    diagnostic.data = Some(merge_data(
+        diagnostic.data.take(),
+        key,
+        Value::Object(args),
+        is_bundled_plugin_key(key),
+    ));
     diagnostic
 }
 
@@ -3365,12 +3358,384 @@ pub fn localized_plugin_diagnostic(
         // pretending it was translated by vector-lsp.
         fallback.unwrap_or_else(|| localize(locale, key, &args))
     };
-    diagnostic.message = compact_plugin_hover_spacing(key, message);
-    diagnostic.data = Some(merge_data(diagnostic.data.take(), key, Value::Object(args)));
+    let message = if locale == Locale::EnUs && key.starts_with("plugin.calc.") {
+        strip_english_plugin_guidance(key, message, diagnostic.data.as_ref())
+    } else {
+        message
+    };
+    diagnostic.message = compact_plugin_hover_spacing(key, message)
+        .trim()
+        .to_string();
+    let mut data = merge_data(
+        diagnostic.data.take(),
+        key,
+        Value::Object(args),
+        locale != Locale::EnUs && is_bundled_plugin_key(key),
+    );
+    if let Some((heading, guidance)) = localized_plugin_guidance(locale, key, &data)
+        && let Value::Object(fields) = &mut data
+    {
+        fields.insert(
+            "localizedGuidanceHeading".to_string(),
+            Value::String(heading),
+        );
+        fields.insert("localizedGuidance".to_string(), Value::String(guidance));
+    }
+    diagnostic.data = Some(data);
     diagnostic
 }
 
-fn merge_data(existing: Option<Value>, key: &str, message_args: Value) -> Value {
+fn strip_english_plugin_guidance(key: &str, message: String, data: Option<&Value>) -> String {
+    let mut result = message.trim().to_string();
+    let hint = data
+        .and_then(Value::as_object)
+        .and_then(|fields| fields.get("hint"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(hint) = hint
+        && result.ends_with(hint)
+    {
+        result.truncate(result.len() - hint.len());
+        result = result.trim_end().to_string();
+    }
+    if key == "plugin.calc.expected-rparen.eof"
+        && let Some(prefix) = result.strip_suffix(" Add the missing ')'.")
+    {
+        result = prefix.trim_end().to_string();
+    }
+    result
+}
+
+fn localized_plugin_guidance(locale: Locale, key: &str, data: &Value) -> Option<(String, String)> {
+    let action = match key {
+        "plugin.calc.skill-param-alias" => "alias",
+        "plugin.calc.unterminated-string" => "close-string",
+        "plugin.calc.unexpected-character" => "replace-character",
+        "plugin.calc.unexpected-eof" => "complete-expression",
+        "plugin.calc.unexpected-token" => "replace-token",
+        "plugin.calc.wrong-arity" => "argument-count",
+        "plugin.calc.expected-quoted-argument" => "quote-argument",
+        "plugin.calc.expected-dot-identifier" => "dot-identifier",
+        "plugin.calc.skilldesc-decimal-prefix" => "integer-expression",
+        "plugin.calc.decimal-policy" => "integer-policy",
+        "plugin.calc.prefix-stop" => "rewrite-expression",
+        key if key.starts_with("plugin.calc.expected-") && key.ends_with(".eof") => "insert-at-end",
+        key if key.starts_with("plugin.calc.expected-") => "insert-before",
+        _ => return None,
+    };
+    let (heading, template) = localized_guidance_template(locale, action)?;
+    let fields = data.as_object()?;
+    Some((heading.to_string(), interpolate(template, fields)))
+}
+
+fn localized_guidance_template(
+    locale: Locale,
+    action: &str,
+) -> Option<(&'static str, &'static str)> {
+    let (heading, template) = match locale {
+        Locale::EnUs => (
+            "What to do",
+            match action {
+                "alias" => "Use `{suggestion}` to reference `{parameter}`.",
+                "close-string" => "Close the string with a single quote.",
+                "replace-character" => "Remove or replace `{actual}` at the marked position.",
+                "complete-expression" => "Complete the expression before the end of the formula.",
+                "replace-token" => "Remove or replace the token `{actual}`.",
+                "argument-count" => "Use exactly {expected} arguments.",
+                "quote-argument" => "Wrap the first argument in single quotes.",
+                "dot-identifier" => "Add an identifier after `.`.",
+                "insert-at-end" => "Insert `{insertText}` at the end of the expression.",
+                "insert-before" => "Insert `{insertText}` before `{actual}`.",
+                "integer-expression" => "Use an integer expression that matches your intent.",
+                "integer-policy" => {
+                    "Use an integer expression unless this field is known to support decimals."
+                }
+                "rewrite-expression" => {
+                    "Rewrite the expression if the ignored part is intended to run."
+                }
+                _ => return None,
+            },
+        ),
+        Locale::PlPl => (
+            "Co zrobić",
+            match action {
+                "alias" => "Aby odwołać się do `{parameter}`, użyj `{suggestion}`.",
+                "close-string" => "Zamknij ciąg pojedynczym cudzysłowem.",
+                "replace-character" => "Usuń lub zastąp znak `{actual}` we wskazanym miejscu.",
+                "complete-expression" => "Uzupełnij wyrażenie przed końcem formuły.",
+                "replace-token" => "Usuń lub zastąp token `{actual}`.",
+                "argument-count" => "Użyj dokładnie {expected} argumentów.",
+                "quote-argument" => "Ujmij pierwszy argument w pojedyncze cudzysłowy.",
+                "dot-identifier" => "Dodaj identyfikator po `.`.",
+                "insert-at-end" => "Dodaj `{insertText}` na końcu wyrażenia.",
+                "insert-before" => "Dodaj `{insertText}` przed `{actual}`.",
+                "integer-expression" => "Użyj wyrażenia całkowitego zgodnego z zamiarem.",
+                "integer-policy" => {
+                    "Użyj wyrażenia całkowitego, chyba że to pole obsługuje wartości dziesiętne."
+                }
+                "rewrite-expression" => {
+                    "Przepisz wyrażenie, jeśli ignorowana część ma zostać wykonana."
+                }
+                _ => return None,
+            },
+        ),
+        Locale::ItIt => (
+            "Come risolvere",
+            match action {
+                "alias" => "Usa `{suggestion}` per fare riferimento a `{parameter}`.",
+                "close-string" => "Chiudi la stringa con un apice singolo.",
+                "replace-character" => "Rimuovi o sostituisci `{actual}` nella posizione indicata.",
+                "complete-expression" => "Completa l'espressione prima della fine della formula.",
+                "replace-token" => "Rimuovi o sostituisci il token `{actual}`.",
+                "argument-count" => "Usa esattamente {expected} argomenti.",
+                "quote-argument" => "Racchiudi il primo argomento tra apici singoli.",
+                "dot-identifier" => "Aggiungi un identificatore dopo `.`.",
+                "insert-at-end" => "Aggiungi `{insertText}` alla fine dell'espressione.",
+                "insert-before" => "Aggiungi `{insertText}` prima di `{actual}`.",
+                "integer-expression" => {
+                    "Usa un'espressione intera coerente con il risultato desiderato."
+                }
+                "integer-policy" => {
+                    "Usa un'espressione intera, salvo che il campo supporti i decimali."
+                }
+                "rewrite-expression" => {
+                    "Riscrivi l'espressione se anche la parte ignorata deve essere eseguita."
+                }
+                _ => return None,
+            },
+        ),
+        Locale::FrFr => (
+            "Que faire",
+            match action {
+                "alias" => "Utilisez `{suggestion}` pour référencer `{parameter}`.",
+                "close-string" => "Fermez la chaîne avec une apostrophe.",
+                "replace-character" => "Supprimez ou remplacez `{actual}` à l'emplacement indiqué.",
+                "complete-expression" => "Complétez l'expression avant la fin de la formule.",
+                "replace-token" => "Supprimez ou remplacez le jeton `{actual}`.",
+                "argument-count" => "Utilisez exactement {expected} arguments.",
+                "quote-argument" => "Entourez le premier argument d'apostrophes.",
+                "dot-identifier" => "Ajoutez un identifiant après `.`.",
+                "insert-at-end" => "Ajoutez `{insertText}` à la fin de l'expression.",
+                "insert-before" => "Ajoutez `{insertText}` avant `{actual}`.",
+                "integer-expression" => {
+                    "Utilisez une expression entière correspondant au résultat voulu."
+                }
+                "integer-policy" => {
+                    "Utilisez une expression entière, sauf si ce champ accepte les décimales."
+                }
+                "rewrite-expression" => {
+                    "Réécrivez l'expression si la partie ignorée doit être exécutée."
+                }
+                _ => return None,
+            },
+        ),
+        Locale::EsEs | Locale::EsMx => (
+            "Qué hacer",
+            match action {
+                "alias" => "Usa `{suggestion}` para hacer referencia a `{parameter}`.",
+                "close-string" => "Cierra la cadena con una comilla simple.",
+                "replace-character" => "Elimina o sustituye `{actual}` en la posición indicada.",
+                "complete-expression" => "Completa la expresión antes del final de la fórmula.",
+                "replace-token" => "Elimina o sustituye el token `{actual}`.",
+                "argument-count" => "Usa exactamente {expected} argumentos.",
+                "quote-argument" => "Escribe el primer argumento entre comillas simples.",
+                "dot-identifier" => "Añade un identificador después de `.`.",
+                "insert-at-end" => "Añade `{insertText}` al final de la expresión.",
+                "insert-before" => "Añade `{insertText}` antes de `{actual}`.",
+                "integer-expression" => {
+                    "Usa una expresión entera que coincida con el resultado deseado."
+                }
+                "integer-policy" => {
+                    "Usa una expresión entera, salvo que este campo admita decimales."
+                }
+                "rewrite-expression" => {
+                    "Reescribe la expresión si la parte ignorada debe ejecutarse."
+                }
+                _ => return None,
+            },
+        ),
+        Locale::PtBr => (
+            "O que fazer",
+            match action {
+                "alias" => "Use `{suggestion}` para referenciar `{parameter}`.",
+                "close-string" => "Feche a cadeia com uma aspa simples.",
+                "replace-character" => "Remova ou substitua `{actual}` na posição indicada.",
+                "complete-expression" => "Complete a expressão antes do fim da fórmula.",
+                "replace-token" => "Remova ou substitua o token `{actual}`.",
+                "argument-count" => "Use exatamente {expected} argumentos.",
+                "quote-argument" => "Coloque o primeiro argumento entre aspas simples.",
+                "dot-identifier" => "Adicione um identificador depois de `.`.",
+                "insert-at-end" => "Adicione `{insertText}` ao final da expressão.",
+                "insert-before" => "Adicione `{insertText}` antes de `{actual}`.",
+                "integer-expression" => {
+                    "Use uma expressão inteira de acordo com o resultado desejado."
+                }
+                "integer-policy" => {
+                    "Use uma expressão inteira, a menos que este campo aceite decimais."
+                }
+                "rewrite-expression" => {
+                    "Reescreva a expressão se a parte ignorada precisar ser executada."
+                }
+                _ => return None,
+            },
+        ),
+        Locale::DeDe => (
+            "Vorgehensweise",
+            match action {
+                "alias" => "Verwenden Sie `{suggestion}`, um auf `{parameter}` zu verweisen.",
+                "close-string" => {
+                    "Schließen Sie die Zeichenfolge mit einem einfachen Anführungszeichen."
+                }
+                "replace-character" => {
+                    "Entfernen oder ersetzen Sie `{actual}` an der markierten Stelle."
+                }
+                "complete-expression" => {
+                    "Vervollständigen Sie den Ausdruck vor dem Ende der Formel."
+                }
+                "replace-token" => "Entfernen oder ersetzen Sie das Token `{actual}`.",
+                "argument-count" => "Verwenden Sie genau {expected} Argumente.",
+                "quote-argument" => "Setzen Sie das erste Argument in einfache Anführungszeichen.",
+                "dot-identifier" => "Fügen Sie nach `.` einen Bezeichner ein.",
+                "insert-at-end" => "Fügen Sie `{insertText}` am Ende des Ausdrucks ein.",
+                "insert-before" => "Fügen Sie `{insertText}` vor `{actual}` ein.",
+                "integer-expression" => {
+                    "Verwenden Sie einen ganzzahligen Ausdruck für das gewünschte Ergebnis."
+                }
+                "integer-policy" => {
+                    "Verwenden Sie einen ganzzahligen Ausdruck, sofern das Feld keine Dezimalwerte unterstützt."
+                }
+                "rewrite-expression" => {
+                    "Schreiben Sie den Ausdruck neu, wenn der ignorierte Teil ausgeführt werden soll."
+                }
+                _ => return None,
+            },
+        ),
+        Locale::KoKr => (
+            "수정 방법",
+            match action {
+                "alias" => "매개변수 `{parameter}` 참조에는 `{suggestion}` 식별자를 사용하세요.",
+                "close-string" => "문자열 끝에 작은따옴표를 추가하세요.",
+                "replace-character" => {
+                    "표시된 위치의 `{actual}` 문자를 제거하거나 올바른 문자로 바꾸세요."
+                }
+                "complete-expression" => "계산식 끝에 누락된 내용을 추가하여 식을 완성하세요.",
+                "replace-token" => "`{actual}` 토큰을 제거하거나 올바른 토큰으로 바꾸세요.",
+                "argument-count" => "인수를 정확히 {expected}개 사용하세요.",
+                "quote-argument" => "첫 번째 인수를 작은따옴표로 감싸세요.",
+                "dot-identifier" => "`.` 뒤에 식별자를 추가하세요.",
+                "insert-at-end" => "계산식 끝에 `{insertText}` 기호를 추가하세요.",
+                "insert-before" => "`{actual}` 앞에 `{insertText}` 기호를 추가하세요.",
+                "integer-expression" => "의도에 맞는 정수 계산식으로 바꾸세요.",
+                "integer-policy" => {
+                    "이 필드가 소수를 지원한다고 확인된 경우가 아니면 정수 계산식을 사용하세요."
+                }
+                "rewrite-expression" => "무시된 부분도 실행해야 한다면 계산식을 다시 작성하세요.",
+                _ => return None,
+            },
+        ),
+        Locale::JaJp => (
+            "対処方法",
+            match action {
+                "alias" => "`{parameter}` を参照するには `{suggestion}` を使用してください。",
+                "close-string" => "文字列の末尾に単一引用符を追加してください。",
+                "replace-character" => {
+                    "指定位置の `{actual}` を削除するか、正しい文字に置き換えてください。"
+                }
+                "complete-expression" => {
+                    "式の末尾に不足している内容を追加して、式を完成させてください。"
+                }
+                "replace-token" => {
+                    "トークン `{actual}` を削除するか、正しいトークンに置き換えてください。"
+                }
+                "argument-count" => "引数を正確に {expected} 個指定してください。",
+                "quote-argument" => "最初の引数を単一引用符で囲んでください。",
+                "dot-identifier" => "`.` の後に識別子を追加してください。",
+                "insert-at-end" => "式の末尾に `{insertText}` を追加してください。",
+                "insert-before" => "`{actual}` の前に `{insertText}` を追加してください。",
+                "integer-expression" => "意図した結果に合う整数式を使用してください。",
+                "integer-policy" => {
+                    "このフィールドが小数をサポートする場合を除き、整数式を使用してください。"
+                }
+                "rewrite-expression" => {
+                    "無視された部分も実行する必要がある場合は、式を書き直してください。"
+                }
+                _ => return None,
+            },
+        ),
+        Locale::RuRu => (
+            "Что делать",
+            match action {
+                "alias" => "Для ссылки на `{parameter}` используйте `{suggestion}`.",
+                "close-string" => "Добавьте одинарную кавычку в конец строки.",
+                "replace-character" => "Удалите или замените `{actual}` в отмеченной позиции.",
+                "complete-expression" => "Добавьте недостающую часть и завершите выражение.",
+                "replace-token" => "Удалите или замените токен `{actual}`.",
+                "argument-count" => "Используйте ровно {expected} аргументов.",
+                "quote-argument" => "Заключите первый аргумент в одинарные кавычки.",
+                "dot-identifier" => "Добавьте идентификатор после `.`.",
+                "insert-at-end" => "Добавьте `{insertText}` в конец выражения.",
+                "insert-before" => "Добавьте `{insertText}` перед `{actual}`.",
+                "integer-expression" => {
+                    "Используйте целочисленное выражение для нужного результата."
+                }
+                "integer-policy" => {
+                    "Используйте целочисленное выражение, если поле не поддерживает дробные значения."
+                }
+                "rewrite-expression" => {
+                    "Перепишите выражение, если игнорируемая часть должна выполняться."
+                }
+                _ => return None,
+            },
+        ),
+        Locale::ZhCn => (
+            "修正方法",
+            match action {
+                "alias" => "请使用 `{suggestion}` 引用 `{parameter}`。",
+                "close-string" => "请在字符串末尾补上单引号。",
+                "replace-character" => "请删除或替换标记位置的 `{actual}`。",
+                "complete-expression" => "请补全公式末尾缺失的内容。",
+                "replace-token" => "请删除或替换 token `{actual}`。",
+                "argument-count" => "请准确使用 {expected} 个参数。",
+                "quote-argument" => "请用单引号括起第一个参数。",
+                "dot-identifier" => "请在 `.` 后添加标识符。",
+                "insert-at-end" => "请在公式末尾添加 `{insertText}`。",
+                "insert-before" => "请在 `{actual}` 前添加 `{insertText}`。",
+                "integer-expression" => "请使用符合预期结果的整数公式。",
+                "integer-policy" => "除非此字段明确支持小数，否则请使用整数公式。",
+                "rewrite-expression" => "如果被忽略的部分也需要执行，请重写公式。",
+                _ => return None,
+            },
+        ),
+        Locale::ZhTw => (
+            "修正方法",
+            match action {
+                "alias" => "請使用 `{suggestion}` 參照 `{parameter}`。",
+                "close-string" => "請在字串末尾補上單引號。",
+                "replace-character" => "請刪除或取代標記位置的 `{actual}`。",
+                "complete-expression" => "請補全公式末尾缺少的內容。",
+                "replace-token" => "請刪除或取代 token `{actual}`。",
+                "argument-count" => "請準確使用 {expected} 個引數。",
+                "quote-argument" => "請用單引號括住第一個引數。",
+                "dot-identifier" => "請在 `.` 後加入識別符號。",
+                "insert-at-end" => "請在公式末尾加入 `{insertText}`。",
+                "insert-before" => "請在 `{actual}` 前加入 `{insertText}`。",
+                "integer-expression" => "請使用符合預期結果的整數公式。",
+                "integer-policy" => "除非此欄位明確支援小數，否則請使用整數公式。",
+                "rewrite-expression" => "如果被忽略的部分也需要執行，請重寫公式。",
+                _ => return None,
+            },
+        ),
+    };
+    Some((heading, template))
+}
+
+fn merge_data(
+    existing: Option<Value>,
+    key: &str,
+    message_args: Value,
+    localized_message: bool,
+) -> Value {
     let mut data = match existing {
         Some(Value::Object(data)) => data,
         Some(value) => {
@@ -3382,6 +3747,10 @@ fn merge_data(existing: Option<Value>, key: &str, message_args: Value) -> Value 
     };
     data.insert("messageKey".to_string(), Value::String(key.to_string()));
     data.insert("messageArgs".to_string(), message_args);
+    data.insert(
+        "localizedMessage".to_string(),
+        Value::Bool(localized_message),
+    );
     Value::Object(data)
 }
 
@@ -4857,10 +5226,7 @@ mod tests {
             "{:?}",
             catalog_parity_errors()
         );
-        for locale in Locale::ALL
-            .into_iter()
-            .filter(|locale| *locale != Locale::EnUs)
-        {
+        for locale in Locale::ALL {
             for (key, template) in catalog(locale) {
                 assert!(
                     !template.contains("Plugin diagnostic"),
@@ -4868,6 +5234,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn english_calc_message_and_guidance_are_rendered_as_separate_sections() {
+        let diagnostic = localized_plugin_diagnostic(
+            Locale::EnUs,
+            "plugin.calc.skilldesc-decimal-prefix",
+            args([
+                ("actual", json!("-6.25")),
+                ("consumedPrefix", json!("-6")),
+                ("ignoredSuffix", json!(".25")),
+            ]),
+            Some(
+                "Decimal values are not supported here. The game reads '-6.25' as '-6' and ignores '.25'. Use an integer expression that matches your intent."
+                    .to_string(),
+            ),
+            Diagnostic {
+                data: Some(json!({
+                    "kind": "decimal-policy",
+                    "hint": "Use an integer expression that matches your intent."
+                })),
+                ..Diagnostic::default()
+            },
+        );
+        assert_eq!(
+            diagnostic.message,
+            "Decimal values are not supported here. The game reads '-6.25' as '-6' and ignores '.25'."
+        );
+        assert_eq!(
+            diagnostic.data.as_ref().unwrap()["localizedGuidanceHeading"],
+            "What to do"
+        );
+        assert_eq!(
+            diagnostic.data.as_ref().unwrap()["localizedGuidance"],
+            "Use an integer expression that matches your intent."
+        );
     }
 
     #[test]
@@ -5039,6 +5441,133 @@ mod tests {
             diagnostic.data.as_ref().unwrap()["messageArgs"]["column"],
             "itemtype"
         );
+    }
+
+    #[test]
+    fn skilldesc_decimal_policy_localizes_values_and_correction_without_internal_metadata() {
+        let message_args = args([
+            ("code", json!("calc.skilldesc-decimal-prefix")),
+            ("identifier", json!("")),
+            ("expected", json!("")),
+            ("actual", json!("-6.25")),
+            ("insertText", json!("")),
+            (
+                "hint",
+                json!("Use an integer expression that matches your intent."),
+            ),
+            ("consumedPrefix", json!("-6")),
+            ("ignoredSuffix", json!(".25")),
+            ("alias", json!("")),
+            ("policyWarning", json!(true)),
+        ]);
+        for locale in Locale::ALL
+            .into_iter()
+            .filter(|locale| *locale != Locale::EnUs)
+        {
+            let diagnostic = localized_plugin_diagnostic(
+                locale,
+                "plugin.calc.skilldesc-decimal-prefix",
+                message_args.clone(),
+                None,
+                Diagnostic::default(),
+            );
+            assert!(diagnostic.message.contains("-6.25"), "{locale:?}");
+            assert!(diagnostic.message.contains("-6"), "{locale:?}");
+            assert!(diagnostic.message.contains(".25"), "{locale:?}");
+            assert!(!diagnostic.message.contains("calc.skilldesc"), "{locale:?}");
+            assert!(!diagnostic.message.contains("Use an integer"), "{locale:?}");
+            assert!(!diagnostic.message.contains("true"), "{locale:?}");
+            assert_eq!(diagnostic.data.as_ref().unwrap()["localizedMessage"], true);
+            assert!(
+                diagnostic.data.as_ref().unwrap()["localizedGuidanceHeading"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "{locale:?}"
+            );
+            assert!(
+                diagnostic.data.as_ref().unwrap()["localizedGuidance"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "{locale:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_structured_calc_guidance_is_localized_without_raw_hint_leakage() {
+        let keys = [
+            "plugin.calc.skill-param-alias",
+            "plugin.calc.unterminated-string",
+            "plugin.calc.unexpected-character",
+            "plugin.calc.unexpected-eof",
+            "plugin.calc.unexpected-token",
+            "plugin.calc.wrong-arity",
+            "plugin.calc.expected-quoted-argument",
+            "plugin.calc.expected-dot-identifier",
+            "plugin.calc.expected-rparen",
+            "plugin.calc.expected-rparen.eof",
+            "plugin.calc.expected-rbrack",
+            "plugin.calc.expected-rbrack.eof",
+            "plugin.calc.expected-colon",
+            "plugin.calc.expected-colon.eof",
+            "plugin.calc.expected-comma",
+            "plugin.calc.expected-comma.eof",
+            "plugin.calc.skilldesc-decimal-prefix",
+            "plugin.calc.decimal-policy",
+            "plugin.calc.prefix-stop",
+        ];
+        let message_args = args([
+            ("code", json!("INTERNAL_CALC_CODE")),
+            ("identifier", json!("par12")),
+            ("expected", json!("2")),
+            ("actual", json!("bad-token")),
+            ("insertText", json!(")")),
+            ("hint", json!("RAW_ENGLISH_GUIDANCE_SENTINEL")),
+            ("consumedPrefix", json!("-6")),
+            ("ignoredSuffix", json!(".25")),
+            ("alias", json!("par12")),
+            ("policyWarning", json!(true)),
+        ]);
+        let structured_data = json!({
+            "kind": "invalid-argument",
+            "expected": "2",
+            "actual": "bad-token",
+            "insertText": ")",
+            "hint": "RAW_ENGLISH_GUIDANCE_SENTINEL",
+            "suggestion": "pa12",
+            "parameter": "Param12"
+        });
+        for locale in Locale::ALL {
+            for key in keys {
+                let diagnostic = localized_plugin_diagnostic(
+                    locale,
+                    key,
+                    message_args.clone(),
+                    None,
+                    Diagnostic {
+                        data: Some(structured_data.clone()),
+                        ..Diagnostic::default()
+                    },
+                );
+                let data = diagnostic.data.as_ref().unwrap();
+                let heading = data["localizedGuidanceHeading"].as_str().unwrap();
+                let guidance = data["localizedGuidance"].as_str().unwrap();
+                assert!(!heading.is_empty(), "{locale:?} {key}");
+                assert!(!guidance.is_empty(), "{locale:?} {key}");
+                assert!(!guidance.contains('{'), "{locale:?} {key}: {guidance}");
+                assert!(!guidance.contains('}'), "{locale:?} {key}: {guidance}");
+                assert!(
+                    !diagnostic.message.contains("RAW_ENGLISH_GUIDANCE_SENTINEL"),
+                    "{locale:?} {key}: {}",
+                    diagnostic.message
+                );
+                assert!(
+                    !diagnostic.message.contains("INTERNAL_CALC_CODE"),
+                    "{locale:?} {key}: {}",
+                    diagnostic.message
+                );
+            }
+        }
     }
 
     #[test]
