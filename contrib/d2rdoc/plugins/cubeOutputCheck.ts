@@ -310,30 +310,6 @@ function resolveOutputBase(base: string, sets: OutputLookupSets): OutputBaseKind
     return null;
 }
 
-function resolvedOutputSourceStem(base: string, kind: OutputBaseKind | null): string | null {
-    if (kind === "item" && utf8Bytes(base).length <= 4) {
-        if (lookupKeyFixed4("weapons", "code", base)) return "weapons";
-        if (lookupKeyFixed4("armor", "code", base)) return "armor";
-        if (lookupKeyFixed4("misc", "code", base)) return "misc";
-    }
-    if (kind === "itemtype" && lookupKeyFixed4("itemtypes", "Code", base)) return "itemtypes";
-    if (kind === "unique" && lookupKey("uniqueitems", "index", base)) return "uniqueitems";
-    if (kind === "set" && lookupKey("setitems", "index", base)) return "setitems";
-    return null;
-}
-
-function sourceDescription(stem: string): string | null {
-    const source = getWorkspaceSource(stem);
-    if (!source) return null;
-    if (source.kind === "bundled") {
-        return "Built-in reference data (game version " + (source.version ?? "unknown") + ")";
-    }
-    const version = source.version ? " (game version " + source.version + ")" : "";
-    if (source.kind === "open") return "Open document" + version;
-    if (source.kind === "sibling") return "TXT file in the same folder" + version;
-    return "TXT file in the current workspace" + version;
-}
-
 function activeCubeRow(row: WorkspaceRow): boolean {
     const enabled = row["enabled"];
     if (enabled === undefined) return true;
@@ -356,7 +332,14 @@ function cubeOutputDiagnostic(
         col: start,
         endCol: (row.__colstarts[column] || 0) + Math.max(span.end, span.start + 1),
         severity,
-        message,
+        messageKey: "plugin." + code,
+        messageArgs: {
+            line: row.__line + 1,
+            column,
+            value: span.text,
+            recipe: String(row["description"] ?? ""),
+        },
+        legacyMessage: message,
         code,
         data: { rule: "cubeOutputCheck", kind },
     };
@@ -587,7 +570,11 @@ function hover(ctx: HoverContext): HoverResult | null {
 
     const parsed = parseOutput(ctx.value);
     if (!parsed.base.text) {
-        return { content: "**Base:** empty (invalid cube output base)" };
+        return {
+            contentKey: "plugin.cube-output.empty-base-hover",
+            contentArgs: { column: ctx.col },
+            legacyContent: "**Base:** empty (invalid cube output base)",
+        };
     }
     const sets = outputLookupSets();
     const canProveBaseInvalid = outputTargetsAvailable();
@@ -595,12 +582,6 @@ function hover(ctx: HoverContext): HoverResult | null {
     const parts: string[] = [
         outputBaseHover(parsed.base.text, kind, ctx.col, canProveBaseInvalid),
     ];
-    const resolvedStem = resolvedOutputSourceStem(parsed.base.text, kind);
-    if (resolvedStem) {
-        const source = sourceDescription(resolvedStem);
-        if (source) parts.push("", "Source: " + source);
-    }
-
     if (kind === null && canProveBaseInvalid) {
         if (parsed.ignored) {
             const text = parsed.ignored.text || "(empty modifier)";
@@ -609,7 +590,16 @@ function hover(ctx: HoverContext): HoverResult | null {
                 `**Ignored text:** \`${text}\` — the base is invalid, so the game does not create this output.`,
             );
         }
-        return { content: parts.join("\n") };
+        return {
+            contentKey: "plugin.cube-output.invalid-hover",
+            contentArgs: {
+                base: parsed.base.text,
+                column: ctx.col,
+                kind: kind || "",
+                ignoredSuffix: parsed.ignored?.text || "",
+            },
+            legacyContent: parts.join("\n"),
+        };
     }
 
     if (kind === "useitem" || kind === "usetype") {
@@ -662,5 +652,18 @@ function hover(ctx: HoverContext): HoverResult | null {
         }
     }
 
-    return { content: parts.join("\n") };
+    return {
+        contentKey: "plugin.cube-output.hover",
+        contentArgs: {
+            base: parsed.base.text,
+            column: ctx.col,
+            kind: kind || "",
+            input: (kind === "useitem" || kind === "usetype")
+                ? (ctx.row["input " + outputOrdinal(ctx.col)] || "")
+                : "",
+            modifiers: JSON.stringify(parsed.modifiers),
+            ignoredSuffix: parsed.ignored?.text || "",
+        },
+        legacyContent: parts.join("\n"),
+    };
 }

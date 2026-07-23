@@ -16,5 +16,9 @@ function hover(ctx: HoverContext): HoverResult | null {
     const code = ctx.row["code"];
     if (!code) return null;
 
-    return { content: ctx.value + "\n\n**Code**: " + code };
+    return {
+        contentKey: "plugin.item-name.hover",
+        contentArgs: { name: ctx.value, code },
+        legacyContent: ctx.value + "\n\n**Code**: " + code,
+    };
 }

@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url};
 
 use crate::document::DocumentData;
+use crate::i18n::{self, Locale};
 use crate::runtime::{ScriptRuntime, WorkspaceFileSnapshot, WorkspaceIndex, WorkspaceSourceInfo};
 use crate::schema::Schema;
 use crate::source_selection::{
@@ -29,7 +30,16 @@ struct RawDiag {
     /// "error" | "warning" | "info" | "hint" — defaults to "warning"
     #[serde(default)]
     severity: String,
-    message: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(rename = "messageKey", default)]
+    message_key: Option<String>,
+    #[serde(rename = "messageArgs", default)]
+    message_args: Option<serde_json::Map<String, Value>>,
+    /// Compatibility text supplied by bundled plugins for enUS only. It is
+    /// never analyzed or translated; keyed localization remains authoritative.
+    #[serde(rename = "legacyMessage", default)]
+    legacy_message: Option<String>,
     #[serde(default)]
     code: Option<NumberOrString>,
     #[serde(default)]
@@ -37,7 +47,7 @@ struct RawDiag {
 }
 
 impl RawDiag {
-    fn into_lsp(self) -> Diagnostic {
+    fn into_lsp(self, locale: Locale) -> Diagnostic {
         let severity = match self.severity.as_str() {
             "error" => DiagnosticSeverity::ERROR,
             "info" | "information" => DiagnosticSeverity::INFORMATION,
@@ -49,7 +59,7 @@ impl RawDiag {
         } else {
             self.col
         };
-        Diagnostic {
+        let diagnostic = Diagnostic {
             range: Range {
                 start: Position {
                     line: self.line,
@@ -63,9 +73,19 @@ impl RawDiag {
             severity: Some(severity),
             code: self.code,
             source: Some("vector-lsp/plugin".into()),
-            message: self.message,
+            message: self.message.clone().unwrap_or_default(),
             data: self.data,
             ..Default::default()
+        };
+        match self.message_key {
+            Some(key) => i18n::localized_plugin_diagnostic(
+                locale,
+                &key,
+                self.message_args.unwrap_or_default(),
+                self.legacy_message.or(self.message),
+                diagnostic,
+            ),
+            None => diagnostic,
         }
     }
 }
@@ -76,7 +96,14 @@ impl RawDiag {
 
 #[derive(Deserialize)]
 struct RawHover {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(rename = "contentKey", default)]
+    content_key: Option<String>,
+    #[serde(rename = "contentArgs", default)]
+    content_args: Option<serde_json::Map<String, Value>>,
+    #[serde(rename = "legacyContent", default)]
+    legacy_content: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,12 +222,14 @@ enum PluginRequest {
         ctx: String,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        locale: Locale,
         reply: oneshot::Sender<Vec<Diagnostic>>,
     },
     Hover {
         ctx: Value,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
+        locale: Locale,
         reply: oneshot::Sender<Option<String>>,
     },
     GotoDefinition {
@@ -361,6 +390,7 @@ impl PluginHost {
                         ctx,
                         index,
                         snapshot,
+                        locale,
                         reply,
                     } => {
                         install_workspace_view(&mut rt, &mut last_snapshot_ptr, index, snapshot);
@@ -370,6 +400,7 @@ impl PluginHost {
                             ctx,
                             operation_counts.validate,
                             execution_budget,
+                            locale,
                         );
                         let _ = reply.send(diags);
                     }
@@ -377,6 +408,7 @@ impl PluginHost {
                         ctx,
                         index,
                         snapshot,
+                        locale,
                         reply,
                     } => {
                         install_workspace_view(&mut rt, &mut last_snapshot_ptr, index, snapshot);
@@ -391,6 +423,7 @@ impl PluginHost {
                             ctx_json,
                             operation_counts.hover,
                             execution_budget,
+                            locale,
                         );
                         if debug {
                             eprintln!("[hover-debug] result={result:?}");
@@ -483,6 +516,19 @@ impl PluginHost {
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
     ) -> Vec<Diagnostic> {
+        self.run_localized(ctx, index, snapshot, Locale::EnUs).await
+    }
+
+    /// Run plugins and render their keyed product messages for one LSP
+    /// session.  The locale travels with the request rather than mutating the
+    /// dedicated runtime shared by cloned handles.
+    pub async fn run_localized(
+        &self,
+        ctx: String,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
+        locale: Locale,
+    ) -> Vec<Diagnostic> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
@@ -490,6 +536,7 @@ impl PluginHost {
                 ctx,
                 index,
                 snapshot,
+                locale,
                 reply: reply_tx,
             })
             .await
@@ -520,6 +567,17 @@ impl PluginHost {
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
     ) -> Option<String> {
+        self.hover_localized(ctx, index, snapshot, Locale::EnUs)
+            .await
+    }
+
+    pub async fn hover_localized(
+        &self,
+        ctx: Value,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
+        locale: Locale,
+    ) -> Option<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
@@ -527,6 +585,7 @@ impl PluginHost {
                 ctx,
                 index,
                 snapshot,
+                locale,
                 reply: reply_tx,
             })
             .await
@@ -676,6 +735,7 @@ fn run_validation_plugins(
     ctx_json: String,
     plugin_count: usize,
     budget: Duration,
+    locale: Locale,
 ) -> Vec<Diagnostic> {
     if !prepare_plugin_context(runtime, health, "validate", ctx_json, budget) {
         return vec![];
@@ -688,7 +748,7 @@ fn run_validation_plugins(
             report_plugin_timeout(runtime, health, "validate");
             continue;
         }
-        diagnostics.extend(validation_results(raw, health));
+        diagnostics.extend(validation_results(raw, health, locale));
     }
     clear_plugin_request_state(runtime);
     diagnostics
@@ -700,6 +760,7 @@ fn run_hover_plugins(
     ctx_json: String,
     plugin_count: usize,
     budget: Duration,
+    locale: Locale,
 ) -> Option<String> {
     if !prepare_plugin_context(runtime, health, "hover", ctx_json, budget) {
         return None;
@@ -718,7 +779,7 @@ fn run_hover_plugins(
         if value.is_null() {
             continue;
         }
-        if let Some(content) = hover_value(value, health) {
+        if let Some(content) = hover_value(value, health, locale) {
             result = Some(content);
             break;
         }
@@ -727,10 +788,22 @@ fn run_hover_plugins(
     result
 }
 
-fn hover_value(value: Value, health: &PluginHealth) -> Option<String> {
+fn hover_value(value: Value, health: &PluginHealth, locale: Locale) -> Option<String> {
     match value {
         value @ Value::Object(_) => match serde_json::from_value::<RawHover>(value) {
-            Ok(hover) => Some(hover.content),
+            Ok(hover) => match hover.content_key {
+                Some(key) => Some(
+                    i18n::localized_plugin_diagnostic(
+                        locale,
+                        &key,
+                        hover.content_args.unwrap_or_default(),
+                        hover.legacy_content.or(hover.content),
+                        Diagnostic::default(),
+                    )
+                    .message,
+                ),
+                None => hover.content,
+            },
             Err(error) => {
                 health.report_once(
                     "hover-shape",
@@ -881,7 +954,11 @@ fn report_plugin_timeout(runtime: &mut ScriptRuntime, health: &PluginHealth, ope
     let _ = runtime.exec("__plugin_timeout_cleanup__", "__activePluginName=null;");
 }
 
-fn validation_results(raw: anyhow::Result<Value>, health: &PluginHealth) -> Vec<Diagnostic> {
+fn validation_results(
+    raw: anyhow::Result<Value>,
+    health: &PluginHealth,
+    locale: Locale,
+) -> Vec<Diagnostic> {
     let runs = match raw.and_then(|value| {
         serde_json::from_value::<Vec<RawPluginValidation>>(value).map_err(Into::into)
     }) {
@@ -904,9 +981,11 @@ fn validation_results(raw: anyhow::Result<Value>, health: &PluginHealth) -> Vec<
             continue;
         }
         match serde_json::from_value::<Vec<RawDiag>>(run.diagnostics) {
-            Ok(raw_diagnostics) => {
-                diagnostics.extend(raw_diagnostics.into_iter().map(RawDiag::into_lsp))
-            }
+            Ok(raw_diagnostics) => diagnostics.extend(
+                raw_diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.into_lsp(locale)),
+            ),
             Err(error) => health.report_once(
                 format!("validate-shape:{}", run.plugin),
                 format!(
@@ -1684,6 +1763,7 @@ fn strip_ts_declarations(src: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::i18n::Locale;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2274,7 +2354,7 @@ function validate(ctx: PluginContext): string[] {
         }))
         .expect("raw diagnostic should deserialize");
 
-        let diag = raw.into_lsp();
+        let diag = raw.into_lsp(Locale::EnUs);
         assert_eq!(range(&diag), (3, 10, 10));
         assert_code(&diag, "calc.expected-rparen.eof");
         assert_eq!(
@@ -2300,7 +2380,7 @@ function validate(ctx: PluginContext): string[] {
         }))
         .expect("legacy raw diagnostic should deserialize");
 
-        let diag = raw.into_lsp();
+        let diag = raw.into_lsp(Locale::EnUs);
         assert_eq!(range(&diag), (1, 2, 2));
         assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(diag.code, None);
@@ -2986,7 +3066,7 @@ function validate(ctx: PluginContext): string[] {
     }
 
     #[tokio::test]
-    async fn cube_output_hover_reports_the_effective_reference_source() {
+    async fn cube_output_hover_omits_the_effective_reference_source() {
         let files =
             with_cube_output_files(("cubemain", "description\tenabled\toutput\nrow\t1\thpot\n"));
         let mut fx = fixture(&files);
@@ -3007,10 +3087,9 @@ function validate(ctx: PluginContext): string[] {
         let hover = host
             .hover(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
             .await
-            .expect("cube output source hover");
+            .expect("cube output hover");
         assert!(
-            hover.contains("four-character item code")
-                && hover.contains("Source: TXT file in the same folder (game version 3.2)"),
+            hover.contains("four-character item code") && !hover.contains("Source:"),
             "{hover}"
         );
     }
@@ -3313,8 +3392,8 @@ function validate(ctx: PluginContext): string[] {
             "hover should include modifier text: {hover}"
         );
         assert!(
-            hover.contains("Source: TXT file in the current workspace"),
-            "hover should expose the effective reference source: {hover}"
+            !hover.contains("Source:"),
+            "hover should omit reference provenance: {hover}"
         );
 
         let target = host
@@ -3367,10 +3446,9 @@ function validate(ctx: PluginContext): string[] {
         let hover = host
             .hover(ctx, Arc::clone(&fx.index), Arc::clone(&fx.snapshot))
             .await
-            .expect("property source hover");
+            .expect("property hover");
         assert!(
-            hover.contains("properties.txt code")
-                && hover.contains("Source: Built-in reference data (game version 3.2)"),
+            hover.contains("properties.txt code") && !hover.contains("Source:"),
             "{hover}"
         );
     }
@@ -3535,7 +3613,7 @@ function validate(ctx: PluginContext): string[] {
                 assert_eq!(
                     diag.message,
                     format!(
-                        "{identifier} is interpreted as {interpreted_as} because SkillCalc identifiers use only the first four characters. Use pa{parameter} to reference Param{parameter}."
+                        "{identifier} is interpreted as {interpreted_as} because SkillCalc identifiers use only the first four characters."
                     )
                 );
                 assert_eq!(range(diag), (1, 4, 4 + identifier.len() as u32));
@@ -3610,7 +3688,7 @@ function validate(ctx: PluginContext): string[] {
             assert_eq!(
                 diagnostic.message,
                 format!(
-                    "Decimal values are not supported here. The game reads '{formula}' as '{consumed}' and ignores '{ignored}'. Use an integer expression that matches your intent."
+                    "Decimal values are not supported here. The game reads '{formula}' as '{consumed}' and ignores '{ignored}'."
                 )
             );
             assert_eq!(data_str(diagnostic, "consumedPrefix"), consumed);
@@ -3840,8 +3918,7 @@ function validate(ctx: PluginContext): string[] {
             .await
             .expect("Rune hover");
         assert!(
-            hover.contains("Staff")
-                && hover.contains("Source: TXT file in the same folder (game version 3.2)"),
+            hover.contains("Staff") && !hover.contains("Source:"),
             "{hover}"
         );
         let target = host
@@ -4093,8 +4170,7 @@ function validate(ctx: PluginContext): string[] {
             .await
             .expect("TC hover");
         assert!(
-            hover.contains("Healing Potion")
-                && hover.contains("Source: TXT file in the current workspace"),
+            hover.contains("Healing Potion") && !hover.contains("Source:"),
             "{hover}"
         );
         assert!(
@@ -4119,8 +4195,8 @@ function validate(ctx: PluginContext): string[] {
             .expect("generated TC hover");
         assert!(
             generated_hover.contains("Generated Treasure Class")
-                && generated_hover.contains("Source: TXT file in the current workspace"),
-            "finite generated named-TC provenance: {generated_hover}"
+                && !generated_hover.contains("Source:"),
+            "generated named-TC hover: {generated_hover}"
         );
         let generated_target = host
             .goto_definition(
@@ -4147,7 +4223,7 @@ function validate(ctx: PluginContext): string[] {
             .expect("unresolved TC item still exposes probability context");
         assert!(
             !invalid_generated_hover.contains("Generated Treasure Class")
-                && !invalid_generated_hover.contains("Source: TXT file in the current workspace"),
+                && !invalid_generated_hover.contains("Source:"),
             "arbitrary suffix must not inherit ItemTypes provenance: {invalid_generated_hover}"
         );
         assert!(
@@ -4171,8 +4247,7 @@ function validate(ctx: PluginContext): string[] {
             .await
             .expect("forward TC hover keeps probability context");
         assert!(
-            !forward_hover.contains("Treasure Class")
-                && !forward_hover.contains("Source: TXT file in the current workspace"),
+            !forward_hover.contains("Treasure Class") && !forward_hover.contains("Source:"),
             "a later TC row must not resolve in hover: {forward_hover}"
         );
         assert!(
@@ -4192,8 +4267,7 @@ function validate(ctx: PluginContext): string[] {
             .await
             .expect("self TC hover");
         assert!(
-            self_hover.contains("Treasure Class")
-                && self_hover.contains("Source: TXT file in the current workspace"),
+            self_hover.contains("Treasure Class") && !self_hover.contains("Source:"),
             "the current row is already in the sequential TC map: {self_hover}"
         );
         assert_eq!(

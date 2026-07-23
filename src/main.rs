@@ -3,6 +3,11 @@ mod cli;
 mod contrib;
 mod diagnostics;
 mod document;
+mod i18n;
+mod i18n_operations_cjk;
+mod i18n_operations_europe_a;
+mod i18n_operations_pl_ru;
+mod i18n_operations_ptbr;
 mod json_diagnostics;
 #[cfg(test)]
 mod performance_measurement_tests;
@@ -11,6 +16,7 @@ mod reference_data;
 mod runtime;
 mod scan;
 mod schema;
+mod schema_i18n;
 mod settings;
 mod source_selection;
 mod workspace;
@@ -27,6 +33,7 @@ use tower_lsp::{LspService, Server};
 
 use cli::CliArgs;
 use document::DocumentData;
+use i18n::Locale;
 use runtime::build_workspace_index_with_fallback;
 use schema::find_loader;
 use settings::{IoType, VectorLspSettings};
@@ -109,10 +116,18 @@ fn count_diagnostic(diag: &Diagnostic, counts: &mut (usize, usize, usize, usize)
 /// Run a one-shot workspace check: scan all data files, validate them, print diagnostics, and
 /// return an exit code (0 = clean, 1 = errors found, 2 = configuration/IO error).
 async fn run_check(settings: &VectorLspSettings) -> i32 {
+    let locale = settings.configured_locale();
     let workspace_path = match &settings.workspace_path {
         Some(p) => p.clone(),
         None => {
-            eprintln!("error: single_shot mode requires `workspace_path` in config");
+            eprintln!(
+                "{}",
+                i18n::localize(
+                    locale,
+                    "cli.single_shot_workspace_required",
+                    &i18n::args([]),
+                )
+            );
             return 2;
         }
     };
@@ -124,7 +139,14 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
         match plugin::PluginHost::new(plugin_paths.clone()) {
             Ok(host) => Some(host),
             Err(error) => {
-                eprintln!("error: {error}");
+                eprintln!(
+                    "{}",
+                    i18n::localize(
+                        locale,
+                        "cli.plugin_runtime_startup_failed",
+                        &i18n::args([("error", serde_json::json!(error.to_string()))]),
+                    )
+                );
                 return 2;
             }
         }
@@ -139,22 +161,46 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
         ) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!(
+                    "{}",
+                    i18n::localize(
+                        locale,
+                        "log.schema_selection_failed",
+                        &i18n::args([("error", serde_json::json!(e.to_string()))]),
+                    )
+                );
                 return 2;
             }
         };
         let schema_path = settings.schema_path.clone();
         match tokio::task::spawn_blocking(move || loader.load(schema_path.as_deref())).await {
             Ok(Ok(s)) => {
-                eprintln!("Schema loaded.");
+                eprintln!(
+                    "{}",
+                    i18n::localize(locale, "log.schema_loaded", &i18n::args([]))
+                );
                 Some(Arc::new(s))
             }
             Ok(Err(e)) => {
-                eprintln!("error: schema load failed: {e:#}");
+                eprintln!(
+                    "{}",
+                    i18n::localize(
+                        locale,
+                        "log.schema_load_failed",
+                        &i18n::args([("error", serde_json::json!(format!("{e:#}")))]),
+                    )
+                );
                 return 2;
             }
             Err(e) => {
-                eprintln!("error: schema task panicked: {e}");
+                eprintln!(
+                    "{}",
+                    i18n::localize(
+                        locale,
+                        "cli.schema_task_panicked",
+                        &i18n::args([("error", serde_json::json!(e.to_string()))]),
+                    )
+                );
                 return 2;
             }
         }
@@ -165,24 +211,51 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
     if let (Some(ph), Some(schema)) = (&plugin_host, &schema_result) {
         ph.set_schema(Arc::clone(schema)).await;
     }
-    eprintln!("Loaded {} plugin file(s).", plugin_paths.len());
+    eprintln!(
+        "{}",
+        i18n::localize(
+            locale,
+            "cli.plugins_loaded",
+            &i18n::args([("count", serde_json::json!(plugin_paths.len()))]),
+        )
+    );
 
     let reference_dataset = match reference_data::load_selected_reference_dataset(settings) {
         Ok(dataset) => dataset,
         Err(error) => {
-            eprintln!("warning: bundled reference fallback disabled for this run: {error:#}");
+            eprintln!(
+                "{}",
+                i18n::localize(
+                    locale,
+                    "cli.reference_fallback_disabled",
+                    &i18n::args([("error", serde_json::json!(format!("{error:#}")))]),
+                )
+            );
             None
         }
     };
     if let Some(dataset) = &reference_dataset {
         eprintln!(
-            "Loaded {} hidden reference tables for game version {} ({}).",
-            dataset.documents.len(),
-            dataset.game_version,
-            dataset.canonical_sha256
+            "{}",
+            i18n::localize(
+                locale,
+                "cli.reference_tables_loaded",
+                &i18n::args([
+                    ("count", serde_json::json!(dataset.documents.len())),
+                    ("gameVersion", serde_json::json!(dataset.game_version)),
+                    ("checksum", serde_json::json!(dataset.canonical_sha256)),
+                ]),
+            )
         );
     } else {
-        eprintln!("Bundled reference fallback is disabled for this run.");
+        eprintln!(
+            "{}",
+            i18n::localize(
+                locale,
+                "cli.reference_fallback_disabled_for_run",
+                &i18n::args([]),
+            )
+        );
     }
 
     let ref_targets: HashSet<(String, String)> = schema_result
@@ -198,17 +271,36 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
             Ok(discovery) => discovery,
             Err(e) => {
                 eprintln!(
-                    "error: cannot read workspace directory '{}': {e}",
-                    workspace_path.display()
+                    "{}",
+                    i18n::localize(
+                        locale,
+                        "cli.workspace_read_failed",
+                        &i18n::args([
+                            (
+                                "path",
+                                serde_json::json!(workspace_path.display().to_string())
+                            ),
+                            ("error", serde_json::json!(e.to_string())),
+                        ]),
+                    )
                 );
                 return 2;
             }
         };
     for failure in &discovery.failures {
         eprintln!(
-            "warning: skipping '{}': {}",
-            failure.path.display(),
-            failure.reason
+            "{}",
+            i18n::localize(
+                locale,
+                "cli.path_skipped",
+                &i18n::args([
+                    (
+                        "path",
+                        serde_json::json!(failure.path.display().to_string())
+                    ),
+                    ("error", serde_json::json!(failure.reason)),
+                ]),
+            )
         );
     }
 
@@ -229,8 +321,28 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
             Ok(Ok(src)) => {
                 parsed.push((path, stem, Arc::new(DocumentData::parse(&src, delimiter))))
             }
-            Ok(Err(e)) => eprintln!("warning: skipping '{}': {e}", path.display()),
-            Err(e) => eprintln!("warning: skipping '{}': {e}", path.display()),
+            Ok(Err(e)) => eprintln!(
+                "{}",
+                i18n::localize(
+                    locale,
+                    "cli.path_skipped",
+                    &i18n::args([
+                        ("path", serde_json::json!(path.display().to_string())),
+                        ("error", serde_json::json!(e.to_string())),
+                    ]),
+                )
+            ),
+            Err(e) => eprintln!(
+                "{}",
+                i18n::localize(
+                    locale,
+                    "cli.path_skipped",
+                    &i18n::args([
+                        ("path", serde_json::json!(path.display().to_string())),
+                        ("error", serde_json::json!(e.to_string())),
+                    ]),
+                )
+            ),
         }
     }
     parsed.sort_by(|a, b| a.0.cmp(&b.0));
@@ -292,20 +404,26 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
         let Some(path) = &source.path else { continue };
         let stem = &source.stem;
         let doc = &source.document;
-        let mut diags = diagnostics::validate_document_for_version(
+        let mut diags = diagnostics::validate_document_for_locale(
             stem,
             doc,
             schema_result.as_deref(),
             &symbols,
             fallback_version,
+            locale,
         );
         if let Some(ph) = &plugin_host
             && ph.validates_file(stem)
         {
             let ctx = plugin::build_context(stem, doc);
             diags.extend(
-                ph.run(ctx, Arc::clone(&workspace_index), Arc::clone(&snapshot))
-                    .await,
+                ph.run_localized(
+                    ctx,
+                    Arc::clone(&workspace_index),
+                    Arc::clone(&snapshot),
+                    locale,
+                )
+                .await,
             );
         }
         if diags.is_empty() {
@@ -323,12 +441,19 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
     }
 
     eprintln!(
-        "{} error(s), {} warning(s), {} info, {} hint diagnostic(s) across {file_count} file(s); {} parsed file(s).",
-        counts.0,
-        counts.1,
-        counts.2,
-        counts.3,
-        parsed.len()
+        "{}",
+        i18n::localize(
+            locale,
+            "cli.check_summary",
+            &i18n::args([
+                ("errors", serde_json::json!(counts.0)),
+                ("warnings", serde_json::json!(counts.1)),
+                ("infos", serde_json::json!(counts.2)),
+                ("hints", serde_json::json!(counts.3)),
+                ("fileCount", serde_json::json!(file_count)),
+                ("parsedFileCount", serde_json::json!(parsed.len())),
+            ]),
+        )
     );
     if counts.0 > 0 { 1 } else { 0 }
 }
@@ -356,6 +481,9 @@ async fn main() -> anyhow::Result<()> {
         })?;
     if let Some(schema_path) = args.schema_path {
         settings.schema_path = Some(schema_path);
+    }
+    if let Some(locale) = args.locale {
+        settings.locale = Locale::normalize(Some(&locale)).as_str().to_string();
     }
     if args.editor_mode {
         settings.apply_editor_mode();
@@ -406,7 +534,15 @@ async fn main() -> anyhow::Result<()> {
                     match plugin::PluginHost::new(plugin_paths.as_ref().clone()) {
                         Ok(host) => Some(host),
                         Err(error) => {
-                            eprintln!("vector-lsp: TCP plugin runtime startup failed: {error}");
+                            let locale = settings.configured_locale();
+                            eprintln!(
+                                "{}",
+                                i18n::localize(
+                                    locale,
+                                    "cli.tcp_plugin_runtime_startup_failed",
+                                    &i18n::args([("error", serde_json::json!(error.to_string()))]),
+                                )
+                            );
                             continue;
                         }
                     }

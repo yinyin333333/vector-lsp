@@ -293,6 +293,7 @@ function pushWholeCell(
     raw: string,
     code: string,
     message: string,
+    extraArgs: Record<string, string | number | boolean> = {},
 ): void {
     const start = row.__colstarts[col] ?? 0;
     diags.push({
@@ -301,7 +302,15 @@ function pushWholeCell(
         endCol: start + raw.length,
         severity: "warning",
         code,
-        message,
+        messageKey: "plugin." + code,
+        messageArgs: {
+            line: row.__line + 1,
+            column: col,
+            value: raw,
+            treasureClass: rowGet(row as Record<string, string>, "Treasure Class"),
+            ...extraArgs,
+        },
+        legacyMessage: message,
     });
 }
 
@@ -415,6 +424,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                         diags, row, slot.prob, probRaw, "tc-prob.noncanonical",
                         `treasureclassex.txt, line ${row.__line + 1}: '${slot.probLabel}'`
                             + ` is not a whole number and may cause '${slot.itemLabel}' to be skipped.`,
+                        { itemColumn: slot.itemLabel },
                     );
                 } else if (Number(probability) <= 0) {
                     pushWholeCell(
@@ -434,6 +444,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                     `treasureclassex.txt, line ${row.__line + 1}: Modifier '${modifier.text}'`
                         + ` for '${slot.itemLabel}' in TC '${className}'`
                         + ` is outside 0..65535. The game converts it to ${stored}. Replace it with the number you actually want.`,
+                    { itemColumn: slot.itemLabel, modifier: modifier.text, stored },
                 );
             }
 
@@ -444,6 +455,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                     `treasureclassex.txt, line ${row.__line + 1}: The game stops at '${stoppedAt}'`
                         + ` for '${slot.itemLabel}' in TC '${className}'. The base and modifiers before it still work;`
                         + ` '${stoppedAt}' and everything after it are ignored.`,
+                    { itemColumn: slot.itemLabel, stoppedAt },
                 );
             }
 
@@ -452,6 +464,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                     diags, row, slot.item, raw, "tc-item.field-width",
                     `treasureclassex.txt, line ${row.__line + 1}: '${slot.itemLabel}'`
                         + ` in TC '${className}' is too long. Keep the value under 64 UTF-8 bytes.`,
+                    { itemColumn: slot.itemLabel, utf8ByteLength: utf8ByteLength(parsed.raw) },
                 );
             }
         }
@@ -512,28 +525,6 @@ function resolveItemName(base: string, rowLine: number): string | null {
     return null;
 }
 
-function resolvedSourceStem(base: string, rowLine: number): string | null {
-    const packedTarget = findPackedItemTarget(base);
-    if (packedTarget) return packedTarget[0];
-    if (generatedTcCode(base)) return "itemtypes";
-    if (lookupKey("uniqueitems", "index", base)) return "uniqueitems";
-    if (lookupKey("setitems", "index", base)) return "setitems";
-    if (resolvesSequentialTc(base, rowLine)) return "treasureclassex";
-    return null;
-}
-
-function sourceDescription(stem: string): string | null {
-    const source = getWorkspaceSource(stem);
-    if (!source) return null;
-    if (source.kind === "bundled") {
-        return "Built-in reference data (game version " + (source.version ?? "unknown") + ")";
-    }
-    const version = source.version ? " (game version " + source.version + ")" : "";
-    if (source.kind === "open") return "Open document" + version;
-    if (source.kind === "sibling") return "TXT file in the same folder" + version;
-    return "TXT file in the current workspace" + version;
-}
-
 // ─── hover ──────────────────────────────────────────────────────────────────
 // Handles both Item# and Prob# columns in TreasureClassEx.txt.
 //
@@ -571,7 +562,9 @@ function hover(ctx: HoverContext): HoverResult | null {
     for (let i = 1; i < Number(idx); i++) {
         if (!rowGet(ctx.row, "Item" + i)) {
             return {
-                content: nameContent + "\n\nThe game ignores this entry because Item" + i
+                contentKey: "plugin.treasure-class.hover-after-gap",
+                contentArgs: { base, slot: idx, firstEmptySlot: i },
+                legacyContent: nameContent + "\n\nThe game ignores this entry because Item" + i
                     + " is the first empty Item# slot.",
             };
         }
@@ -579,6 +572,8 @@ function hover(ctx: HoverContext): HoverResult | null {
 
     // ── Chance calculation ─────────────────────────────────────────────────
     let chanceContent: string | null = null;
+    let perRollChance = "—";
+    let atLeastOnceChance = "—";
 
     const picksRaw = rowGet(ctx.row, "Picks");
     const picks = picksRaw.trim() ? parseInt(picksRaw.trim(), 10) : 1;
@@ -617,9 +612,12 @@ function hover(ctx: HoverContext): HoverResult | null {
                 };
 
                 if (picks > 1) {
+                    perRollChance = fmt(perRoll);
+                    atLeastOnceChance = fmt(atLeastOnce);
                     chanceContent = "Per-roll chance: " + fmt(perRoll) + " (" + probVal + " / " + total + ")"
                         + "\nAt least once in " + picks + " picks: **" + fmt(atLeastOnce) + "**";
                 } else {
+                    perRollChance = fmt(perRoll);
                     chanceContent = "Chance: **" + fmt(perRoll) + "** (" + probVal + " / " + total + ")";
                 }
             }
@@ -627,9 +625,6 @@ function hover(ctx: HoverContext): HoverResult | null {
     }
 
     const parts: string[] = [nameContent];
-    const sourceStem = resolvedSourceStem(base, ctx.rowLine);
-    const source = sourceStem ? sourceDescription(sourceStem) : null;
-    if (source) parts.push("", "Source: " + source);
     if (parsedItem.modifiers.length > 0) {
         parts.push("", "*Modifiers the game will use:*");
         for (const modifier of parsedItem.modifiers) {
@@ -651,7 +646,29 @@ function hover(ctx: HoverContext): HoverResult | null {
         parts.push("", "Warning: this Item# value uses 64 or more UTF-8 bytes.");
     }
     if (chanceContent) { parts.push(""); parts.push(chanceContent); }
-    return { content: parts.join("\n") };
+    return {
+        contentKey: "plugin.treasure-class.hover",
+        contentArgs: {
+            base,
+            slot: idx,
+            name: resolveItemName(base, ctx.rowLine) || "",
+            modifiers: JSON.stringify(parsedItem.modifiers.map((modifier) => modifier.text)),
+            modifierStorage: JSON.stringify(parsedItem.modifiers.map((modifier) => {
+                const parameter = modifier.value?.text ?? "";
+                return isUnsigned16(parameter)
+                    ? modifier.text
+                    : modifier.text + " → " + storedUnsigned16(parameter);
+            })),
+            ignoredSuffix: parsedItem.ignoredSuffix?.text || "",
+            fieldTooLong: utf8ByteLength(parsedItem.raw) >= 64,
+            utf8ByteLength: utf8ByteLength(parsedItem.raw),
+            picks,
+            probability: probMatch ? (ctx.value || "").trim() : rowGet(ctx.row, "Prob" + idx).trim(),
+            perRollChance,
+            atLeastOnceChance,
+        },
+        legacyContent: parts.join("\n"),
+    };
 }
 
 // ─── gotoDefinition ───────────────────────────────────────────────────────────

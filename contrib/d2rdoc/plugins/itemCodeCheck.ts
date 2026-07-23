@@ -96,18 +96,6 @@ function findCiItemTarget(value: string): [string, string] | null {
     return null;
 }
 
-function sourceDescription(stem: string): string | null {
-    const source = getWorkspaceSource(stem);
-    if (!source) return null;
-    if (source.kind === "bundled") {
-        return "Built-in reference data (game version " + (source.version ?? "unknown") + ")";
-    }
-    const version = source.version ? " (game version " + source.version + ")" : "";
-    if (source.kind === "open") return "Open document" + version;
-    if (source.kind === "sibling") return "TXT file in the same folder" + version;
-    return "TXT file in the current workspace" + version;
-}
-
 type ItemCodeSemantics = "resolved-fixed4" | "raw-fixed4-policy" | "ci-policy";
 
 function itemCodeSemantics(file: string, col: string): ItemCodeSemantics {
@@ -138,8 +126,14 @@ function hover(ctx: HoverContext): HoverResult | null {
     const name = names[0];
     if (!name) return null;
 
-    const source = sourceDescription(target[0]);
-    return { content: ctx.value + "\n\n" + name + (source ? "\n\nSource: " + source : "") };
+    return {
+        contentKey: "plugin.item-code.hover",
+        contentArgs: {
+            code: ctx.value,
+            name,
+        },
+        legacyContent: ctx.value + "\n" + name,
+    };
 }
 
 function validate(ctx: PluginContext): PluginDiagnostic[] {
@@ -198,8 +192,14 @@ function checkItemCode(
             endCol:   c + val.length,
             severity: engineResolved ? "error" : "warning",
             code:     engineResolved ? "item-code.unresolved" : "item-code.unresolved-policy",
-            message: engineResolved
-                ? `Unknown item code '${val}'. Check the four-character code and letter case.`
+            messageKey: engineResolved
+                ? "plugin.item-code.unresolved"
+                : rawPacked
+                    ? "plugin.item-code.unresolved-packed-policy"
+                    : "plugin.item-code.unresolved-policy",
+            messageArgs: { value: val },
+            legacyMessage: engineResolved
+                ? `Unknown item code '${val}'. Check the item code and letter case.`
                 : rawPacked
                     ? `No matching item was found. This field may keep the text without resolving it to an item; check whether that is intentional.`
                     : `Item code '${val}' is not listed in weapons, armor, or misc. Verify that the code is intentional.`,

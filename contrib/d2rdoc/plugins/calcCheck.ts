@@ -1206,20 +1206,38 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                         || err.code === "calc.decimal-policy"
                         || err.code === "calc.skilldesc-decimal-prefix"
                     );
+                    const legacyMessage = paramAlias
+                        ? skillParamAliasMessage(paramAlias)
+                        : (missileUnknown
+                            ? `Unknown missile value '${unknownIdentifier}'. The game treats it as 0, so this part of the calculation has no effect.`
+                            : (err.code === "calc.skilldesc-decimal-prefix"
+                                ? err.message
+                                : (policyWarning && err.code === "calc.expected-rparen.eof"
+                                    ? `${err.message}. The game may still use the valid part before this point. Add the missing ')'.`
+                                    : (policyWarning ? err.message : `Invalid calculation: ${err.message}`))));
                     diags.push({
                         line:     row.__line,
                         col:      c + err.pos,
                         endCol:   c + err.pos + length,
                         severity: paramAlias || policyWarning ? "warning" : "error",
-                        message: paramAlias
-                            ? skillParamAliasMessage(paramAlias)
+                        messageKey: paramAlias
+                            ? "plugin.calc.skill-param-alias"
                             : (missileUnknown
-                            ? `Unknown missile value '${unknownIdentifier}'. The game treats it as 0, so this part of the calculation has no effect.`
-                            : (err.code === "calc.skilldesc-decimal-prefix"
-                                ? err.message
-                            : (policyWarning && err.code === "calc.expected-rparen.eof"
-                                ? `${err.message}. The game may still use the valid part before this point. Add the missing ')'.`
-                                : (policyWarning ? err.message : `Invalid calculation: ${err.message}`)))),
+                                ? "plugin.calc.unknown-missile-value"
+                                : "plugin." + err.code),
+                        messageArgs: {
+                            code: err.code,
+                            identifier: unknownIdentifier,
+                            expected: err.expected || "",
+                            actual: err.actual || "",
+                            insertText: err.insertText || "",
+                            hint: err.hint || "",
+                            consumedPrefix: err.consumedPrefix || "",
+                            ignoredSuffix: err.ignoredSuffix || "",
+                            alias: paramAlias || "",
+                            policyWarning,
+                        },
+                        legacyMessage,
                         code:     paramAlias ? "calc.skill-param-alias" : err.code,
                         data:     paramAlias
                             ? skillParamAliasDiagnosticData(err, paramAlias)

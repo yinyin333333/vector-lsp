@@ -8,16 +8,20 @@ use tower_lsp::{Client, LanguageServer, jsonrpc::Result as LspResult};
 
 use crate::diagnostics;
 use crate::document::{DocumentData, utf16_len, utf16_offset_to_byte_index};
+use crate::i18n::{self, Locale};
 use crate::json_diagnostics::{
     JsonAnalysisTrigger, JsonDiagnosticBatch, JsonDiagnosticReport, JsonEvidenceProfile,
-    PrimaryTxtDocument, analyze_with_rules_profile_and_open_json, data_root_from_excel_txt,
-    data_root_from_localization_json, local_path_identity as json_path_identity,
+    PrimaryTxtDocument, data_root_from_excel_txt, data_root_from_localization_json,
+    local_path_identity as json_path_identity,
 };
 use crate::plugin;
 use crate::scan::{ScanFailure, ScanPolicy};
-use crate::schema::{FieldTypeName, ReferenceResolver, find_loader, format_description};
+use crate::schema::{FieldTypeName, ReferenceResolver, find_loader};
+use crate::schema_i18n::localized_field_description;
 use crate::settings::VectorLspSettings;
-use crate::source_selection::{SourceKind, normalized_file_stem_from_uri};
+#[cfg(test)]
+use crate::source_selection::SourceKind;
+use crate::source_selection::normalized_file_stem_from_uri;
 use crate::workspace::{
     DocumentChangeError, ReferenceContextMode, ValidationTicket, Workspace, WorkspacePhase,
     fixed4_display, local_path_is_within, same_local_path,
@@ -28,6 +32,7 @@ enum VectorLspReady {}
 enum VectorLspFailed {}
 
 const SCAN_CONCURRENCY: usize = 4;
+const WORKSPACE_REVALIDATION_QUIET_WINDOW: Duration = Duration::from_millis(75);
 const WATCHED_FILES_QUIET_WINDOW: Duration = Duration::from_millis(250);
 const INITIAL_WATCH_REGISTRATION_GRACE: Duration = Duration::from_millis(50);
 type ParsedWorkspaceDocument = (Url, std::path::PathBuf, String, Arc<DocumentData>);
@@ -112,6 +117,19 @@ pub struct Backend {
 }
 
 impl Backend {
+    async fn locale(&self) -> Locale {
+        self.workspace.read().await.locale
+    }
+
+    fn configuration_locale(settings: &serde_json::Value) -> Option<Locale> {
+        settings
+            .get("locale")
+            .or_else(|| settings.pointer("/vectorLsp/locale"))
+            .or_else(|| settings.pointer("/vector-lsp/locale"))
+            .and_then(serde_json::Value::as_str)
+            .map(|value| Locale::normalize(Some(value)))
+    }
+
     fn json_diagnostics_enabled(&self) -> bool {
         self.settings.json_diagnostics && self.settings.json_diagnostic_rules().any_enabled()
     }
@@ -165,6 +183,12 @@ impl Backend {
         let key = normalized_file_stem_from_uri(uri)
             .map(|stem| format!("stem:{stem}"))
             .unwrap_or_else(|| format!("uri:{uri}"));
+        let mut gates = self.publish_gates.lock().await;
+        Arc::clone(gates.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+    }
+
+    async fn document_mutation_gate(&self, uri: &Url) -> Arc<Mutex<()>> {
+        let key = format!("mutation-uri:{uri}");
         let mut gates = self.publish_gates.lock().await;
         Arc::clone(gates.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
     }
@@ -500,14 +524,16 @@ impl Backend {
         };
 
         let evidence_profile = ticket.evidence_profile;
+        let locale = self.locale().await;
         let JsonDiagnosticReport { batches, warnings } =
             match tokio::task::spawn_blocking(move || {
-                analyze_with_rules_profile_and_open_json(
+                crate::json_diagnostics::analyze_with_rules_profile_and_open_json_localized(
                     documents,
                     rules,
                     trigger,
                     evidence_profile,
                     open_json_sources,
+                    locale,
                 )
             })
             .await
@@ -517,7 +543,11 @@ impl Backend {
                     self.client
                         .log_message(
                             MessageType::WARNING,
-                            format!("Localization JSON diagnostics stopped: {error}"),
+                            i18n::localize(
+                                locale,
+                                "log.json_stopped",
+                                &i18n::args([("error", serde_json::json!(error.to_string()))]),
+                            ),
                         )
                         .await;
                     let workspace = self.workspace.read().await;
@@ -544,7 +574,12 @@ impl Backend {
             return false;
         }
         for warning in warnings {
-            self.client.log_message(MessageType::WARNING, warning).await;
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    i18n::localize(locale, warning.message_key, &warning.message_args),
+                )
+                .await;
         }
 
         let observed = batches
@@ -814,6 +849,7 @@ impl Backend {
     }
 
     async fn register_watch_plan(&self, id: String, plan: WatchRegistrationPlan) -> bool {
+        let locale = self.locale().await;
         let watchers = plan
             .patterns
             .iter()
@@ -832,7 +868,11 @@ impl Backend {
                     self.client
                         .log_message(
                             MessageType::WARNING,
-                            format!("Could not prepare watched-files registration: {error}"),
+                            i18n::localize(
+                                locale,
+                                "log.watch_registration_prepare_failed",
+                                &i18n::args([("error", serde_json::json!(error.to_string()))]),
+                            ),
                         )
                         .await;
                     return false;
@@ -847,9 +887,13 @@ impl Backend {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    format!(
-                        "File watching is unavailable for '{}': {error}",
-                        plan.base_uri
+                    i18n::localize(
+                        locale,
+                        "log.file_watching_unavailable",
+                        &i18n::args([
+                            ("baseUri", serde_json::json!(plan.base_uri.as_str())),
+                            ("error", serde_json::json!(error.to_string())),
+                        ]),
                     ),
                 )
                 .await;
@@ -950,11 +994,14 @@ impl Backend {
                 })
                 .collect();
             if let Err(error) = self.client.unregister_capability(unregistrations).await {
+                let locale = self.locale().await;
                 self.client
                     .log_message(
                         MessageType::WARNING,
-                        format!(
-                            "Could not retire stale JSON file watchers; the next JSON scope sync will retry: {error}"
+                        i18n::localize(
+                            locale,
+                            "log.json_watch_retire_failed",
+                            &i18n::args([("error", serde_json::json!(error.to_string()))]),
                         ),
                     )
                     .await;
@@ -1089,6 +1136,70 @@ impl Backend {
                 })
     }
 
+    async fn watched_txt_path_requires_rescan(
+        &self,
+        session_generation: u64,
+        path: &std::path::Path,
+    ) -> bool {
+        {
+            let workspace = self.workspace.read().await;
+            if workspace.session_generation != session_generation
+                || !self.is_watched_txt_path(&workspace, path)
+            {
+                return false;
+            }
+        }
+
+        let disk_document = match self.read_file(path).await {
+            Ok(text) => Some(Arc::new(DocumentData::parse(
+                &text,
+                self.settings.delimiter_char(),
+            ))),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                None
+            }
+            Err(_) => return true,
+        };
+
+        let workspace = self.workspace.read().await;
+        if workspace.session_generation != session_generation
+            || !self.is_watched_txt_path(&workspace, path)
+        {
+            return false;
+        }
+        let cached = workspace.cached_disk_document(path);
+        let present = workspace.disk_path_present(path);
+        match disk_document {
+            Some(document) => {
+                !present
+                    || cached
+                        .as_deref()
+                        .is_none_or(|cached| cached != document.as_ref())
+            }
+            None => present || cached.is_some(),
+        }
+    }
+
+    async fn watched_txt_paths_require_rescan(
+        &self,
+        session_generation: u64,
+        paths: Vec<std::path::PathBuf>,
+    ) -> bool {
+        for path in paths {
+            if self
+                .watched_txt_path_requires_rescan(session_generation, &path)
+                .await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn watched_json_event(
         workspace: &Workspace,
         path: &std::path::Path,
@@ -1146,7 +1257,11 @@ impl Backend {
                 continue;
             };
 
-            if pending.txt {
+            let requires_scan = pending.force_txt_rescan
+                || self
+                    .watched_txt_paths_require_rescan(session_generation, pending.txt_paths)
+                    .await;
+            if requires_scan {
                 self.scan_and_index_workspace(Instant::now(), Duration::ZERO)
                     .await;
             }
@@ -1274,8 +1389,41 @@ impl Backend {
         }
     }
 
+    async fn validate_open_schema_ticket(
+        &self,
+        ticket: &ValidationTicket,
+    ) -> Option<Vec<Diagnostic>> {
+        let (stem, doc, schema, symbols, reference_version) = {
+            let ws = self.workspace.read().await;
+            if !ws.is_current(ticket) {
+                return None;
+            }
+            (
+                Self::file_stem(&ticket.uri),
+                Arc::clone(ws.open_documents.get(&ticket.uri)?),
+                ws.schema.clone(),
+                ws.symbols_for_uri(&ticket.uri),
+                ws.reference_version.clone(),
+            )
+        };
+        let locale = self.locale().await;
+        tokio::task::spawn_blocking(move || {
+            diagnostics::validate_document_for_locale(
+                &stem,
+                &doc,
+                schema.as_deref(),
+                &symbols,
+                reference_version.as_deref(),
+                locale,
+            )
+        })
+        .await
+        .ok()
+    }
+
     async fn validate_open_ticket(&self, ticket: &ValidationTicket) -> Option<Vec<Diagnostic>> {
-        let (schema_diags, plugin_data) = {
+        let locale = self.locale().await;
+        let (stem, doc, schema, symbols, reference_version, plugin_view) = {
             let ws = self.workspace.read().await;
             if !ws.is_current(ticket) {
                 return None;
@@ -1283,30 +1431,51 @@ impl Backend {
             let doc = ws.open_documents.get(&ticket.uri)?.clone();
             let stem = Self::file_stem(&ticket.uri);
             let symbols = ws.symbols_for_uri(&ticket.uri);
-            let schema_diags = diagnostics::validate_document_for_version(
-                &stem,
-                &doc,
-                ws.schema.as_deref(),
-                &symbols,
-                ws.reference_version.as_deref(),
-            );
-            let plugin_data = self
+            let plugin_view = self
                 .plugin_host
                 .as_ref()
                 .filter(|host| host.validates_file(&stem))
-                .map(|_| {
-                    let ctx = plugin::build_context(&stem, &doc);
-                    let view = ws.plugin_workspace_view_for_uri(&ticket.uri);
-                    (ctx, view.index, view.snapshot)
-                });
-            (schema_diags, plugin_data)
+                .map(|_| ws.plugin_workspace_view_for_uri(&ticket.uri));
+            (
+                stem,
+                doc,
+                ws.schema.clone(),
+                symbols,
+                ws.reference_version.clone(),
+                plugin_view,
+            )
         };
-        let plugin_diags = match (plugin_data, &self.plugin_host) {
-            (Some((ctx, idx, snap)), Some(host)) => host.run(ctx, idx, snap).await,
-            _ => vec![],
-        };
-        let mut diagnostics = schema_diags;
-        diagnostics.extend(plugin_diags);
+        let validation_stem = stem.clone();
+        let validation_doc = Arc::clone(&doc);
+        let mut diagnostics = tokio::task::spawn_blocking(move || {
+            diagnostics::validate_document_for_locale(
+                &validation_stem,
+                &validation_doc,
+                schema.as_deref(),
+                &symbols,
+                reference_version.as_deref(),
+                locale,
+            )
+        })
+        .await
+        .ok()?;
+        if !self.workspace.read().await.is_current(ticket) {
+            return None;
+        }
+        if let (Some(view), Some(host)) = (plugin_view, &self.plugin_host) {
+            diagnostics.extend(
+                host.run_localized(
+                    plugin::build_context(&stem, &doc),
+                    view.index,
+                    view.snapshot,
+                    locale,
+                )
+                .await,
+            );
+            if !self.workspace.read().await.is_current(ticket) {
+                return None;
+            }
+        }
         Some(diagnostics)
     }
 
@@ -1326,11 +1495,133 @@ impl Backend {
         self.workspace.write().await.mark_published(ticket)
     }
 
+    async fn publish_open_preview_if_current(
+        &self,
+        ticket: &ValidationTicket,
+        diagnostics: Vec<Diagnostic>,
+    ) -> bool {
+        let gate = self.publish_gate(&ticket.uri).await;
+        let _guard = gate.lock().await;
+        if !self.workspace.read().await.needs_publish(ticket) {
+            return false;
+        }
+        self.client
+            .publish_diagnostics(ticket.uri.clone(), diagnostics, Some(ticket.client_version))
+            .await;
+        true
+    }
+
     async fn validate_and_publish_open(&self, ticket: ValidationTicket) -> bool {
         let Some(diagnostics) = self.validate_open_ticket(&ticket).await else {
             return false;
         };
         self.publish_open_if_current(&ticket, diagnostics).await
+    }
+
+    async fn validate_and_publish_open_schema_preview(&self, ticket: &ValidationTicket) -> bool {
+        let Some(schema_diags) = self.validate_open_schema_ticket(&ticket).await else {
+            return false;
+        };
+        self.publish_open_preview_if_current(ticket, schema_diags)
+            .await
+    }
+
+    async fn run_workspace_revalidation_worker(self, session_generation: u64) {
+        loop {
+            let Some((scan_generation, workspace_revision)) = self
+                .wait_for_workspace_revalidation_quiet_window(session_generation)
+                .await
+            else {
+                return;
+            };
+            self.revalidate_workspace_revision(scan_generation, workspace_revision)
+                .await;
+            if !self
+                .workspace
+                .write()
+                .await
+                .workspace_revalidation_worker_should_continue(
+                    session_generation,
+                    scan_generation,
+                    workspace_revision,
+                )
+            {
+                return;
+            }
+        }
+    }
+
+    async fn wait_for_workspace_revalidation_quiet_window(
+        &self,
+        session_generation: u64,
+    ) -> Option<(u64, u64)> {
+        loop {
+            let before = {
+                let ws = self.workspace.read().await;
+                if ws.phase != WorkspacePhase::Ready || ws.session_generation != session_generation
+                {
+                    return None;
+                }
+                (ws.scan_generation, ws.workspace_revision)
+            };
+            tokio::time::sleep(WORKSPACE_REVALIDATION_QUIET_WINDOW).await;
+            let ws = self.workspace.read().await;
+            if ws.phase != WorkspacePhase::Ready || ws.session_generation != session_generation {
+                return None;
+            }
+            let after = (ws.scan_generation, ws.workspace_revision);
+            if after == before {
+                return Some(after);
+            }
+        }
+    }
+
+    async fn queue_workspace_revalidation(&self) {
+        if let Some(session_generation) = self
+            .workspace
+            .write()
+            .await
+            .start_workspace_revalidation_worker()
+        {
+            let backend = self.clone();
+            tokio::spawn(async move {
+                backend
+                    .run_workspace_revalidation_worker(session_generation)
+                    .await;
+            });
+        }
+    }
+
+    async fn run_schema_preview_worker(self, uri: Url, session_generation: u64) {
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let ticket = {
+                let workspace = self.workspace.read().await;
+                if workspace.session_generation != session_generation {
+                    return;
+                }
+                workspace
+                    .open_tickets()
+                    .into_iter()
+                    .find(|ticket| ticket.uri == uri)
+            };
+            let Some(ticket) = ticket else {
+                self.workspace
+                    .write()
+                    .await
+                    .finish_schema_preview_worker(&uri);
+                return;
+            };
+            self.validate_and_publish_open_schema_preview(&ticket).await;
+            if self
+                .workspace
+                .write()
+                .await
+                .finish_schema_preview_worker_if_current(&ticket)
+            {
+                return;
+            }
+        }
     }
 
     async fn publish_disk_if_current(
@@ -1342,18 +1633,25 @@ impl Backend {
     ) -> bool {
         let gate = self.publish_gate(&uri).await;
         let _guard = gate.lock().await;
-        let current = {
+        let (current, unchanged) = {
             let ws = self.workspace.read().await;
-            ws.scan_generation == scan_generation
+            let current = ws.scan_generation == scan_generation
                 && ws.workspace_revision == workspace_revision
                 && matches!(
                     ws.phase,
                     WorkspacePhase::Reconciling | WorkspacePhase::Ready
                 )
-                && ws.disk_diagnostics_allowed(&uri)
+                && ws.disk_diagnostics_allowed(&uri);
+            (
+                current,
+                current && ws.disk_diagnostics_match(&uri, &diagnostics),
+            )
         };
+        if unchanged {
+            return true;
+        }
         if current {
-            let has_diagnostics = !diagnostics.is_empty();
+            let published_diagnostics = diagnostics.clone();
             self.client
                 .publish_diagnostics(uri.clone(), diagnostics, None)
                 .await;
@@ -1366,7 +1664,7 @@ impl Backend {
                 )
                 && ws.disk_diagnostics_allowed(&uri);
             if still_current {
-                ws.record_disk_diagnostics(uri, has_diagnostics);
+                ws.record_disk_diagnostics(uri, published_diagnostics);
                 true
             } else {
                 ws.forget_disk_diagnostics(&uri);
@@ -1408,12 +1706,26 @@ impl Backend {
         self.clear_obsolete_disk_diagnostics_except(None).await;
     }
 
+    async fn validation_revision_is_current(
+        &self,
+        scan_generation: u64,
+        workspace_revision: u64,
+    ) -> bool {
+        let ws = self.workspace.read().await;
+        ws.scan_generation == scan_generation
+            && ws.workspace_revision == workspace_revision
+            && matches!(
+                ws.phase,
+                WorkspacePhase::Reconciling | WorkspacePhase::Ready
+            )
+    }
+
     async fn validate_disk_documents_for_revision(
         &self,
         scan_generation: u64,
         workspace_revision: u64,
     ) -> bool {
-        self.clear_obsolete_disk_diagnostics().await;
+        let locale = self.locale().await;
         let (schema, documents, reference_version) = {
             let ws = self.workspace.read().await;
             if ws.scan_generation != scan_generation
@@ -1446,12 +1758,13 @@ impl Backend {
             let schema = schema.clone();
             let reference_version = reference_version.clone();
             schema_tasks.spawn_blocking(move || {
-                let diagnostics = diagnostics::validate_document_for_version(
+                let diagnostics = diagnostics::validate_document_for_locale(
                     &stem,
                     &document,
                     schema.as_deref(),
                     &symbols,
                     reference_version.as_deref(),
+                    locale,
                 );
                 (uri, stem, document, plugin_view, diagnostics)
             });
@@ -1465,15 +1778,28 @@ impl Backend {
         results.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
 
         for (uri, stem, document, plugin_view, mut diagnostics) in results {
+            if !self
+                .validation_revision_is_current(scan_generation, workspace_revision)
+                .await
+            {
+                return false;
+            }
             if let (Some(view), Some(host)) = (plugin_view, &self.plugin_host) {
                 diagnostics.extend(
-                    host.run(
+                    host.run_localized(
                         plugin::build_context(&stem, &document),
                         view.index,
                         view.snapshot,
+                        locale,
                     )
                     .await,
                 );
+                if !self
+                    .validation_revision_is_current(scan_generation, workspace_revision)
+                    .await
+                {
+                    return false;
+                }
             }
             if !self
                 .publish_disk_if_current(scan_generation, workspace_revision, uri, diagnostics)
@@ -1491,34 +1817,39 @@ impl Backend {
             )
     }
 
-    async fn revalidate_workspace_after_change(&self) {
-        loop {
-            let (scan_generation, workspace_revision) = {
-                let ws = self.workspace.read().await;
-                if ws.phase != WorkspacePhase::Ready {
-                    return;
-                }
-                (ws.scan_generation, ws.workspace_revision)
-            };
+    async fn revalidate_workspace_revision(
+        &self,
+        scan_generation: u64,
+        workspace_revision: u64,
+    ) -> bool {
+        self.clear_obsolete_disk_diagnostics().await;
+        let pending = self.workspace.read().await.pending_open_tickets();
+        for ticket in pending {
             if !self
-                .validate_disk_documents_for_revision(scan_generation, workspace_revision)
+                .validation_revision_is_current(scan_generation, workspace_revision)
                 .await
             {
-                continue;
+                return false;
             }
-            let pending = self.workspace.read().await.pending_open_tickets();
-            for ticket in pending {
-                self.validate_and_publish_open(ticket).await;
-            }
-            let ws = self.workspace.read().await;
-            if ws.phase == WorkspacePhase::Ready
-                && ws.scan_generation == scan_generation
-                && ws.workspace_revision == workspace_revision
-                && ws.pending_open_tickets().is_empty()
+            self.validate_and_publish_open(ticket).await;
+            if !self
+                .validation_revision_is_current(scan_generation, workspace_revision)
+                .await
             {
-                return;
+                return false;
             }
         }
+        if !self
+            .validate_disk_documents_for_revision(scan_generation, workspace_revision)
+            .await
+        {
+            return false;
+        }
+        let ws = self.workspace.read().await;
+        ws.phase == WorkspacePhase::Ready
+            && ws.scan_generation == scan_generation
+            && ws.workspace_revision == workspace_revision
+            && ws.pending_open_tickets().is_empty()
     }
 
     async fn reconcile_open_documents_until_ready(&self, scan_generation: u64) {
@@ -1531,72 +1862,78 @@ impl Backend {
                 }
                 ws.workspace_revision
             };
+            let pending = self.workspace.read().await.pending_open_tickets();
+            if !pending.is_empty() {
+                for ticket in pending {
+                    self.validate_and_publish_open(ticket).await;
+                }
+                continue;
+            }
+            self.clear_obsolete_disk_diagnostics().await;
             if !self
                 .validate_disk_documents_for_revision(scan_generation, workspace_revision)
                 .await
             {
                 continue;
             }
-            let pending = self.workspace.read().await.pending_open_tickets();
-            if pending.is_empty() {
-                let ready = {
-                    let mut ws = self.workspace.write().await;
-                    if ws.workspace_revision != workspace_revision
-                        || !ws.mark_ready_if_reconciled(scan_generation)
-                    {
-                        None
-                    } else {
-                        let queue_startup_json = ws.claim_json_startup_analysis()
-                            && self.json_diagnostics_enabled()
-                            && !ws.primary_json_data_roots().is_empty();
-                        let queue_txt_registration_catch_up =
-                            ws.take_txt_watch_registration_catch_up();
-                        Some((
-                            VectorLspReadyParams {
-                                session_generation: ws.session_generation,
-                                scan_generation: ws.scan_generation,
-                                workspace_revision: ws.workspace_revision,
-                                root_uri: ws.root_uri.clone(),
-                            },
-                            queue_startup_json,
-                            queue_txt_registration_catch_up,
-                        ))
-                    }
-                };
-                if let Some((params, queue_startup_json, queue_txt_registration_catch_up)) = ready {
-                    self.client
-                        .send_notification::<VectorLspReady>(params)
+            let ready = {
+                let mut ws = self.workspace.write().await;
+                if ws.workspace_revision != workspace_revision
+                    || !ws.mark_ready_if_reconciled(scan_generation)
+                {
+                    None
+                } else {
+                    let queue_startup_json = ws.claim_json_startup_analysis()
+                        && self.json_diagnostics_enabled()
+                        && !ws.primary_json_data_roots().is_empty();
+                    let queue_txt_registration_catch_up = ws.take_txt_watch_registration_catch_up();
+                    Some((
+                        VectorLspReadyParams {
+                            session_generation: ws.session_generation,
+                            scan_generation: ws.scan_generation,
+                            workspace_revision: ws.workspace_revision,
+                            root_uri: ws.root_uri.clone(),
+                        },
+                        queue_startup_json,
+                        queue_txt_registration_catch_up,
+                    ))
+                }
+            };
+            if let Some((params, queue_startup_json, queue_txt_registration_catch_up)) = ready {
+                self.client
+                    .send_notification::<VectorLspReady>(params)
+                    .await;
+                if queue_startup_json {
+                    self.queue_json_analysis(JsonAnalysisTrigger::All, false)
                         .await;
-                    if queue_startup_json {
-                        self.queue_json_analysis(JsonAnalysisTrigger::All, false)
-                            .await;
-                    }
-                    if queue_txt_registration_catch_up {
-                        let (session_generation, start_worker) = {
-                            let mut workspace = self.workspace.write().await;
-                            let (_, start_worker) = workspace.queue_watched_changes(true);
-                            (workspace.session_generation, start_worker)
-                        };
-                        if start_worker {
-                            self.spawn_watched_change_worker(session_generation);
-                        }
+                }
+                if queue_txt_registration_catch_up {
+                    let (session_generation, start_worker) = {
+                        let mut workspace = self.workspace.write().await;
+                        let (_, start_worker) = workspace.queue_watched_changes(true);
+                        (workspace.session_generation, start_worker)
+                    };
+                    if start_worker {
+                        self.spawn_watched_change_worker(session_generation);
                     }
                 }
-                return;
             }
-            for ticket in pending {
-                self.validate_and_publish_open(ticket).await;
-            }
+            return;
         }
     }
 
     async fn report_rejected_change(&self, uri: &Url, error: DocumentChangeError) {
+        let locale = self.locale().await;
         let message = match error {
-            DocumentChangeError::NotOpen => {
-                format!("Ignored didChange for unopened document {uri}")
-            }
-            DocumentChangeError::StaleVersion { current, incoming } => format!(
-                "Ignored stale didChange for {uri}: incoming version {incoming}, current version {current}"
+            DocumentChangeError::NotOpen => i18n::localize(
+                locale,
+                "log.ignored_change",
+                &i18n::args([("uri", serde_json::json!(uri.as_str()))]),
+            ),
+            DocumentChangeError::StaleVersion { .. } => i18n::localize(
+                locale,
+                "log.ignored_change",
+                &i18n::args([("uri", serde_json::json!(uri.as_str()))]),
             ),
         };
         self.client.log_message(MessageType::WARNING, message).await;
@@ -1644,6 +1981,7 @@ impl Backend {
             include_subfolders,
             scan_generation,
             session_generation,
+            locale,
             json_was_initialized,
             json_scope_before_scan,
         ) = {
@@ -1659,6 +1997,7 @@ impl Backend {
                 ws.include_subfolders,
                 scan_generation,
                 ws.session_generation,
+                ws.locale,
                 ws.json_startup_analysis_queued(),
                 json_scope_before_scan,
             )
@@ -1668,7 +2007,7 @@ impl Backend {
             self.fail_workspace_if_current_scan(
                 session_generation,
                 scan_generation,
-                "Workspace scan failed: initialize did not provide a root URI",
+                i18n::localize(locale, "log.workspace_scan_root_missing", &i18n::args([])),
             )
             .await;
             return;
@@ -1677,7 +2016,11 @@ impl Backend {
             self.fail_workspace_if_current_scan(
                 session_generation,
                 scan_generation,
-                format!("Workspace scan failed: root URI is not a file path: {root_uri}"),
+                i18n::localize(
+                    locale,
+                    "log.workspace_scan_root_not_file",
+                    &i18n::args([("rootUri", serde_json::json!(root_uri.as_str()))]),
+                ),
             )
             .await;
             return;
@@ -1697,7 +2040,11 @@ impl Backend {
                 self.fail_workspace_if_current_scan(
                     session_generation,
                     scan_generation,
-                    format!("Workspace scan failed: {e}"),
+                    i18n::localize(
+                        locale,
+                        "log.workspace_scan_failed",
+                        &i18n::args([("error", serde_json::json!(e.to_string()))]),
+                    ),
                 )
                 .await;
                 return;
@@ -1714,7 +2061,11 @@ impl Backend {
                 Err(_) => {
                     failures.push(ScanFailure {
                         path,
-                        reason: "cannot convert path to a file URI".to_string(),
+                        reason: i18n::localize(
+                            locale,
+                            "log.scan_path_uri_conversion_failed",
+                            &i18n::args([]),
+                        ),
                     });
                     continue;
                 }
@@ -1750,28 +2101,38 @@ impl Backend {
                                     continue;
                                 }
                                 match Url::from_file_path(&path) {
-                                        Ok(uri) => {
-                                            let stem = Self::file_stem(&uri);
-                                            reference_entries.push((uri, path, stem));
-                                        }
-                                        Err(_) => failures.push(ScanFailure {
-                                            path,
-                                            reason: "cannot convert explicit reference-root path to a file URI".to_string(),
-                                        }),
+                                    Ok(uri) => {
+                                        let stem = Self::file_stem(&uri);
+                                        reference_entries.push((uri, path, stem));
                                     }
+                                    Err(_) => failures.push(ScanFailure {
+                                        path,
+                                        reason: i18n::localize(
+                                            locale,
+                                            "log.scan_reference_path_uri_conversion_failed",
+                                            &i18n::args([]),
+                                        ),
+                                    }),
+                                }
                             }
                         }
                         Err(error) => failures.push(ScanFailure {
                             path: reference_root_path,
-                            reason: format!("explicit reference-root scan failed: {error}"),
+                            reason: i18n::localize(
+                                locale,
+                                "log.scan_reference_root_failed",
+                                &i18n::args([("error", serde_json::json!(error.to_string()))]),
+                            ),
                         }),
                     }
                 }
                 Ok(_) => {}
                 Err(_) => failures.push(ScanFailure {
                     path: root_path.clone(),
-                    reason: format!(
-                        "explicit reference root is not a file path: {reference_root_uri}"
+                    reason: i18n::localize(
+                        locale,
+                        "log.scan_reference_root_not_file",
+                        &i18n::args([("rootUri", serde_json::json!(reference_root_uri.as_str()))]),
                     ),
                 }),
             }
@@ -1801,7 +2162,7 @@ impl Backend {
         let settings = Arc::clone(&self.settings);
         let mut parsed: Vec<ParsedWorkspaceDocument> = Vec::new();
         let load_results = run_bounded(entries, SCAN_CONCURRENCY, move |entry| {
-            load_workspace_document(Arc::clone(&settings), delimiter, entry)
+            load_workspace_document(Arc::clone(&settings), delimiter, locale, entry)
         })
         .await;
         for result in load_results {
@@ -1810,7 +2171,11 @@ impl Backend {
                 Ok(Err(failure)) => failures.push(failure),
                 Err(error) => failures.push(ScanFailure {
                     path: root_path.clone(),
-                    reason: format!("workspace scan task failed: {error}"),
+                    reason: i18n::localize(
+                        locale,
+                        "log.scan_task_failed",
+                        &i18n::args([("error", serde_json::json!(error.to_string()))]),
+                    ),
                 }),
             }
         }
@@ -1818,7 +2183,7 @@ impl Backend {
         let mut reference_parsed: Vec<ParsedWorkspaceDocument> = Vec::new();
         let reference_load_results =
             run_bounded(reference_entries, SCAN_CONCURRENCY, move |entry| {
-                load_workspace_document(Arc::clone(&reference_settings), delimiter, entry)
+                load_workspace_document(Arc::clone(&reference_settings), delimiter, locale, entry)
             })
             .await;
         for result in reference_load_results {
@@ -1827,7 +2192,11 @@ impl Backend {
                 Ok(Err(failure)) => failures.push(failure),
                 Err(error) => failures.push(ScanFailure {
                     path: root_path.clone(),
-                    reason: format!("explicit reference-root scan task failed: {error}"),
+                    reason: i18n::localize(
+                        locale,
+                        "log.scan_reference_root_failed",
+                        &i18n::args([("error", serde_json::json!(error.to_string()))]),
+                    ),
                 }),
             }
         }
@@ -1857,10 +2226,16 @@ impl Backend {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    format!(
-                        "Workspace scan skipped '{}': {}",
-                        failure.path.display(),
-                        failure.reason
+                    i18n::localize(
+                        locale,
+                        "log.workspace_scan_skipped",
+                        &i18n::args([
+                            (
+                                "path",
+                                serde_json::json!(failure.path.display().to_string()),
+                            ),
+                            ("reason", serde_json::json!(&failure.reason)),
+                        ]),
                     ),
                 )
                 .await;
@@ -1868,9 +2243,13 @@ impl Backend {
         self.client
             .log_message(
                 MessageType::INFO,
-                format!(
-                    "Indexed {count} workspace files; skipped {} path(s).",
-                    failures.len()
+                i18n::localize(
+                    locale,
+                    "log.workspace_indexed",
+                    &i18n::args([
+                        ("count", serde_json::json!(count)),
+                        ("skippedCount", serde_json::json!(failures.len())),
+                    ]),
                 ),
             )
             .await;
@@ -1891,6 +2270,8 @@ impl Backend {
         }
         let reconcile_duration = reconcile_started.elapsed();
 
+        // Allowlisted developer telemetry: this machine-oriented performance
+        // record is emitted at MessageType::LOG, not a user-facing status.
         self.client
             .log_message(
                 MessageType::LOG,
@@ -1917,6 +2298,7 @@ fn milliseconds(duration: Duration) -> f64 {
 async fn load_workspace_document(
     settings: Arc<VectorLspSettings>,
     delimiter: char,
+    locale: Locale,
     entry: (Url, std::path::PathBuf, String),
 ) -> WorkspaceLoadResult {
     let (uri, path, stem) = entry;
@@ -1936,7 +2318,11 @@ async fn load_workspace_document(
             .await
             .map_err(|error| ScanFailure {
                 path: path.clone(),
-                reason: format!("could not read this TXT file in the background: {error}"),
+                reason: i18n::localize(
+                    locale,
+                    "log.scan_background_parse_failed",
+                    &i18n::args([("error", serde_json::json!(error.to_string()))]),
+                ),
             })?;
     Ok((uri, path, stem, document))
 }
@@ -2047,6 +2433,15 @@ fn apply_change(lines: &mut Vec<String>, range: tower_lsp::lsp_types::Range, new
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
+        // Locale is negotiated for this service instance only.  Do not mutate
+        // `settings`: TCP clients share it and must not leak language choices.
+        let locale = Locale::normalize(
+            params
+                .initialization_options
+                .as_ref()
+                .and_then(|value| value.get("locale"))
+                .and_then(serde_json::Value::as_str),
+        );
         let watched_files_capabilities = params
             .capabilities
             .workspace
@@ -2099,6 +2494,7 @@ impl LanguageServer for Backend {
 
         {
             let mut ws = self.workspace.write().await;
+            ws.locale = locale;
             ws.root_uri = root_uri;
             ws.set_reference_context_mode(reference_context_mode);
             ws.set_editor_workspace_options(include_subfolders, workspace_directory_scopes);
@@ -2137,9 +2533,13 @@ impl LanguageServer for Backend {
             self.client
                 .log_message(
                     MessageType::INFO,
-                    format!(
-                        "Effective vector-lsp config: {}",
-                        self.settings.effective_summary()
+                    i18n::localize(
+                        self.locale().await,
+                        "log.effective_config",
+                        &i18n::args([(
+                            "summary",
+                            serde_json::json!(self.settings.effective_summary()),
+                        )]),
                     ),
                 )
                 .await;
@@ -2155,8 +2555,12 @@ impl LanguageServer for Backend {
             ) {
                 Ok(l) => l,
                 Err(e) => {
-                    self.fail_workspace(format!("Could not select the schema: {e}"))
-                        .await;
+                    self.fail_workspace(i18n::localize(
+                        self.locale().await,
+                        "log.schema_selection_failed",
+                        &i18n::args([("error", serde_json::json!(e.to_string()))]),
+                    ))
+                    .await;
                     return;
                 }
             };
@@ -2177,18 +2581,31 @@ impl LanguageServer for Backend {
                         ph.set_schema(schema).await;
                     }
                     self.client
-                        .log_message(MessageType::INFO, "Schema loaded successfully.")
+                        .log_message(
+                            MessageType::INFO,
+                            i18n::localize(
+                                self.locale().await,
+                                "log.schema_loaded",
+                                &i18n::args([]),
+                            ),
+                        )
                         .await;
                     schema_duration = schema_started.elapsed();
                 }
                 Ok(Err(e)) => {
-                    self.fail_workspace(format!("Could not load the schema: {e:#}"))
-                        .await;
+                    self.fail_workspace(i18n::localize(
+                        self.locale().await,
+                        "log.schema_load_failed",
+                        &i18n::args([("error", serde_json::json!(format!("{e:#}")))]),
+                    ))
+                    .await;
                     return;
                 }
                 Err(e) => {
-                    self.fail_workspace(format!(
-                        "Could not load the schema because its background task stopped: {e}"
+                    self.fail_workspace(i18n::localize(
+                        self.locale().await,
+                        "log.schema_task_stopped",
+                        &i18n::args([("error", serde_json::json!(e.to_string()))]),
                     ))
                     .await;
                     return;
@@ -2213,8 +2630,14 @@ impl LanguageServer for Backend {
                 self.client
                     .log_message(
                         MessageType::INFO,
-                        format!(
-                            "Loaded {count} hidden reference tables for game version {version} ({digest})."
+                        i18n::localize(
+                            self.locale().await,
+                            "log.reference_tables_loaded",
+                            &i18n::args([
+                                ("count", serde_json::json!(count)),
+                                ("version", serde_json::json!(version)),
+                                ("digest", serde_json::json!(digest)),
+                            ]),
                         ),
                     )
                     .await;
@@ -2224,7 +2647,11 @@ impl LanguageServer for Backend {
                 self.client
                     .log_message(
                         MessageType::INFO,
-                        "Bundled reference fallback disabled: no explicit or inferable game version.",
+                        i18n::localize(
+                            self.locale().await,
+                            "log.reference_fallback_no_version",
+                            &i18n::args([]),
+                        ),
                     )
                     .await;
             }
@@ -2233,7 +2660,11 @@ impl LanguageServer for Backend {
                 self.client
                     .log_message(
                         MessageType::WARNING,
-                        format!("Bundled reference fallback disabled for this session: {error:#}"),
+                        i18n::localize(
+                            self.locale().await,
+                            "log.reference_fallback_disabled",
+                            &i18n::args([("error", serde_json::json!(format!("{error:#}")))]),
+                        ),
                     )
                     .await;
             }
@@ -2242,7 +2673,11 @@ impl LanguageServer for Backend {
                 self.client
                     .log_message(
                         MessageType::WARNING,
-                        format!("Bundled reference data could not be loaded: {error}"),
+                        i18n::localize(
+                            self.locale().await,
+                            "log.reference_data_load_failed",
+                            &i18n::args([("error", serde_json::json!(error.to_string()))]),
+                        ),
                     )
                     .await;
             }
@@ -2266,6 +2701,22 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        let Some(locale) = Self::configuration_locale(&params.settings) else {
+            return;
+        };
+        let changed = self.workspace.write().await.set_locale(locale);
+        if !changed {
+            return;
+        }
+
+        // A locale switch is presentation-only, but the LSP carries rendered
+        // messages. Queue one coalesced refresh of all published diagnostics.
+        self.queue_workspace_revalidation().await;
+        self.queue_json_analysis(JsonAnalysisTrigger::All, false)
+            .await;
+    }
+
     async fn shutdown(&self) -> LspResult<()> {
         Ok(())
     }
@@ -2277,7 +2728,7 @@ impl LanguageServer for Backend {
         let mutation_gate = if is_json {
             self.json_publish_gate(&uri).await
         } else {
-            self.publish_gate(&uri).await
+            self.document_mutation_gate(&uri).await
         };
         let mutation_guard = mutation_gate.lock().await;
         let json_enabled = self.json_diagnostics_enabled();
@@ -2347,10 +2798,10 @@ impl LanguageServer for Backend {
                 self.clear_obsolete_disk_diagnostics_except(Some(&ticket.uri))
                     .await;
                 if !self.validate_and_publish_open(ticket).await {
-                    self.revalidate_workspace_after_change().await;
+                    self.queue_workspace_revalidation().await;
                 }
             } else {
-                self.revalidate_workspace_after_change().await;
+                self.queue_workspace_revalidation().await;
             }
         }
         if let Some(trigger) = json_trigger {
@@ -2365,7 +2816,7 @@ impl LanguageServer for Backend {
         let mutation_gate = if is_json {
             self.json_publish_gate(&uri).await
         } else {
-            self.publish_gate(&uri).await
+            self.document_mutation_gate(&uri).await
         };
         let mutation_guard = mutation_gate.lock().await;
         let json_enabled = self.json_diagnostics_enabled();
@@ -2421,7 +2872,7 @@ impl LanguageServer for Backend {
 
         // Reconstruct current text from the stored document, apply each incremental
         // change in order, then re-parse. Avoids receiving the full document over IPC.
-        let update_result: Result<(bool, bool), DocumentChangeError> = {
+        let update_result: Result<(bool, bool, ValidationTicket), DocumentChangeError> = {
             let mut ws = self.workspace.write().await;
 
             let existing_text = ws
@@ -2441,11 +2892,12 @@ impl LanguageServer for Backend {
             let full_text = lines.join("\n");
             let doc = Arc::new(DocumentData::parse(&full_text, delimiter));
             match ws.accept_change(&uri, params.text_document.version, Arc::clone(&doc)) {
-                Ok(_) => {
-                    ws.rebuild_effective_symbols();
+                Ok(ticket) => {
+                    ws.refresh_open_document_symbols(&uri);
                     Ok((
                         ws.phase == WorkspacePhase::Ready,
                         json_enabled && ws.primary_json_data_root_for_uri(&uri).is_some(),
+                        ticket,
                     ))
                 }
                 Err(error) => Err(error),
@@ -2454,10 +2906,29 @@ impl LanguageServer for Backend {
         drop(mutation_guard);
         let json_relevant = update_result
             .as_ref()
-            .is_ok_and(|(_, json_relevant)| *json_relevant);
+            .is_ok_and(|(_, json_relevant, _)| *json_relevant);
         match update_result {
-            Ok((true, _)) => self.revalidate_workspace_after_change().await,
-            Ok((false, _)) => {}
+            Ok((true, _, ticket)) => {
+                // Coalesce rapid edits per URI and validate on the blocking pool.
+                // Plugin diagnostics and dependent files follow in a separate
+                // session-wide worker, so didChange never waits for a full scan.
+                if let Some(preview_session_generation) = self
+                    .workspace
+                    .write()
+                    .await
+                    .reserve_schema_preview_worker(&ticket.uri)
+                {
+                    let backend = self.clone();
+                    let preview_uri = ticket.uri.clone();
+                    tokio::spawn(async move {
+                        backend
+                            .run_schema_preview_worker(preview_uri, preview_session_generation)
+                            .await;
+                    });
+                }
+                self.queue_workspace_revalidation().await;
+            }
+            Ok((false, _, _)) => {}
             Err(error) => self.report_rejected_change(&uri, error).await,
         }
         if json_relevant {
@@ -2472,7 +2943,7 @@ impl LanguageServer for Backend {
         let mutation_gate = if is_json {
             self.json_publish_gate(&uri).await
         } else {
-            self.publish_gate(&uri).await
+            self.document_mutation_gate(&uri).await
         };
         let mutation_guard = mutation_gate.lock().await;
         let json_enabled = self.json_diagnostics_enabled();
@@ -2559,20 +3030,30 @@ impl LanguageServer for Backend {
                 roots_after,
             )
         };
+        let publication_gate = self.publish_gate(&uri).await;
+        let publication_guard = publication_gate.lock().await;
         self.client
             .publish_diagnostics(uri.clone(), vec![], None)
             .await;
+        drop(publication_guard);
         drop(mutation_guard);
         if let Some(error) = reload_error {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    format!("didClose disk restore failed for {uri}: {error}"),
+                    i18n::localize(
+                        self.locale().await,
+                        "log.did_close_restore_failed",
+                        &i18n::args([
+                            ("uri", serde_json::json!(uri.as_str())),
+                            ("error", serde_json::json!(error)),
+                        ]),
+                    ),
                 )
                 .await;
         }
         if ready {
-            self.revalidate_workspace_after_change().await;
+            self.queue_workspace_revalidation().await;
         }
         if let Some(trigger) = json_trigger {
             self.register_json_watch_roots(json_roots).await;
@@ -2581,16 +3062,22 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let (txt, json_trigger, bootstrap, json_roots) = {
+        let (txt_paths, json_trigger, bootstrap, json_roots) = {
             let workspace = self.workspace.read().await;
-            let mut txt = false;
+            let mut txt_paths = Vec::<std::path::PathBuf>::new();
             let mut json_trigger = None;
             let mut bootstrap = false;
             for change in params.changes {
                 let Ok(path) = change.uri.to_file_path() else {
                     continue;
                 };
-                txt |= self.is_watched_txt_path(&workspace, &path);
+                if self.is_watched_txt_path(&workspace, &path)
+                    && !txt_paths
+                        .iter()
+                        .any(|existing| same_local_path(existing, &path))
+                {
+                    txt_paths.push(path.clone());
+                }
                 if self.json_diagnostics_enabled() {
                     let (event_trigger, event_bootstrap) =
                         Self::watched_json_event(&workspace, &path);
@@ -2603,7 +3090,7 @@ impl LanguageServer for Backend {
                 }
             }
             (
-                txt,
+                txt_paths,
                 json_trigger,
                 bootstrap,
                 workspace.primary_json_data_roots(),
@@ -2617,10 +3104,10 @@ impl LanguageServer for Backend {
         {
             self.queue_json_analysis(trigger, true).await;
         }
-        if txt {
+        if !txt_paths.is_empty() {
             let (session_generation, start_worker) = {
                 let mut workspace = self.workspace.write().await;
-                let (_, start_worker) = workspace.queue_watched_changes(true);
+                let (_, start_worker) = workspace.queue_watched_txt_paths(txt_paths);
                 (workspace.session_generation, start_worker)
             };
             if start_worker {
@@ -2745,6 +3232,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let file_stem = Self::file_stem(uri);
+        let locale = self.locale().await;
 
         if pos.line == 0 {
             // Header row hover: return the column's schema description.
@@ -2765,15 +3253,28 @@ impl LanguageServer for Backend {
                 return Ok(None);
             };
 
-            let description = ws
+            let field = ws
                 .schema
                 .as_ref()
-                .and_then(|s| s.find_field(&file_stem, col_name))
-                .and_then(|f| f.description.as_deref())
-                .map(format_description);
+                .and_then(|s| s.find_field(&file_stem, col_name));
+            let description = field.and_then(|field| {
+                localized_field_description(
+                    locale,
+                    &file_stem,
+                    field,
+                    self.settings.schema_path.is_none(),
+                )
+            });
 
             let text = match description {
-                Some(desc) => format!("**{col_name}**\n\n{desc}"),
+                Some(desc) => i18n::localize(
+                    locale,
+                    "hover.header",
+                    &i18n::args([
+                        ("column", serde_json::json!(col_name)),
+                        ("description", serde_json::json!(desc)),
+                    ]),
+                ),
                 None => return Ok(None),
             };
 
@@ -2856,9 +3357,10 @@ impl LanguageServer for Backend {
                         && symbols.has_file(reference_file)
                         && symbols.has_column(reference_file, reference_column)
                     {
-                        return Some(format!(
-                            "**Unknown stat name**\n\n`{}` is not a known stat. This Consume bonus is not applied; other Consume slots still work. Use the exact Stat name from `itemstatcost.txt`.",
-                            cell_value
+                        return Some(i18n::localize(
+                            locale,
+                            "hover.unknown_monpet_stat",
+                            &i18n::args([("value", serde_json::json!(cell_value))]),
                         ));
                     }
                     if resolved.is_none()
@@ -2867,14 +3369,16 @@ impl LanguageServer for Backend {
                         && symbols.has_column(reference_file, reference_column)
                     {
                         return Some(if properties_stat_func == Some(17) {
-                            format!(
-                                "**Unknown stat name**\n\n`{}` is not a known stat. This property has no effect. Use the exact Stat name from `itemstatcost.txt`.",
-                                cell_value
+                            i18n::localize(
+                                locale,
+                                "hover.unknown_property_stat_noeffect",
+                                &i18n::args([("value", serde_json::json!(cell_value))]),
                             )
                         } else {
-                            format!(
-                                "**Unknown stat name**\n\n`{}` is not a known stat. Use the exact Stat name from `itemstatcost.txt`.",
-                                cell_value
+                            i18n::localize(
+                                locale,
+                                "hover.unknown_property_stat",
+                                &i18n::args([("value", serde_json::json!(cell_value))]),
                             )
                         });
                     }
@@ -2883,42 +3387,20 @@ impl LanguageServer for Backend {
                         ReferenceResolver::AsciiCi => cell_value.clone(),
                         ReferenceResolver::Fixed4 => fixed4_display(&cell_value),
                     };
-                    let source = match resolved.source_kind {
-                        SourceKind::Open => match ws.reference_version.as_deref() {
-                            Some(version) => {
-                                format!("Open document (game version {version})")
-                            }
-                            None => "Open document".to_string(),
-                        },
-                        SourceKind::Workspace => match ws.reference_version.as_deref() {
-                            Some(version) => {
-                                format!("TXT file in the current workspace (game version {version})")
-                            }
-                            None => "TXT file in the current workspace".to_string(),
-                        },
-                        SourceKind::Sibling => match ws.reference_version.as_deref() {
-                            Some(version) => {
-                                format!("TXT file in the same folder (game version {version})")
-                            }
-                            None => "TXT file in the same folder".to_string(),
-                        },
-                        SourceKind::Bundled => format!(
-                            "Built-in reference data (game version {})",
-                            resolved
-                                .bundled_version
-                                .as_deref()
-                                .unwrap_or("unknown")
-                        ),
-                    };
                     if file_stem.eq_ignore_ascii_case("skills")
                         && col_name.eq_ignore_ascii_case("range")
                         && field_type.resolver == ReferenceResolver::Fixed4
                     {
-                        Some(format!(
-                            "**Range code**\n\n`{}` is valid. The game uses range code `{}`.\n\nSource: {}",
-                            mark_edge_whitespace(&cell_value),
-                            resolved.stored_value,
-                            source
+                        Some(i18n::localize(
+                            locale,
+                            "hover.range_valid",
+                            &i18n::args([
+                                (
+                                    "value",
+                                    serde_json::json!(mark_edge_whitespace(&cell_value)),
+                                ),
+                                ("stored", serde_json::json!(resolved.stored_value)),
+                            ]),
                         ))
                     } else {
                         let shown_cell = if field_type.resolver == ReferenceResolver::Fixed4 {
@@ -2926,17 +3408,24 @@ impl LanguageServer for Backend {
                         } else {
                             cell_value.clone()
                         };
-                        Some(format!(
-                            "**Reference resolved**\n\n`{}` → `{}` in `{}.{}`\n\nSource: {}",
-                            shown_cell,
-                            if field_type.resolver == ReferenceResolver::Fixed4 {
-                                lookup_value.as_str()
-                            } else {
-                                resolved.stored_value.as_str()
-                            },
-                            reference_file,
-                            reference_column,
-                            source
+                        Some(i18n::localize(
+                            locale,
+                            "hover.reference_resolved",
+                            &i18n::args([
+                                ("value", serde_json::json!(shown_cell)),
+                                (
+                                    "stored",
+                                    serde_json::json!(if field_type.resolver
+                                        == ReferenceResolver::Fixed4
+                                    {
+                                        lookup_value.as_str()
+                                    } else {
+                                        resolved.stored_value.as_str()
+                                    }),
+                                ),
+                                ("file", serde_json::json!(reference_file)),
+                                ("column", serde_json::json!(reference_column)),
+                            ]),
                         ))
                     }
                 });
@@ -2945,14 +3434,26 @@ impl LanguageServer for Backend {
             {
                 diagnostics::parse_type29_boolean(&cell_value).map(|value| {
                     let version = ws.reference_version.as_deref().map_or_else(
-                        || "Game version: not selected".to_string(),
-                        |version| format!("Game version: {version}"),
+                        || i18n::localize(locale, "hover.game_version_unselected", &i18n::args([])),
+                        |version| {
+                            i18n::localize(
+                                locale,
+                                "hover.game_version",
+                                &i18n::args([("version", serde_json::json!(version))]),
+                            )
+                        },
                     );
-                    format!(
-                        "**Boolean value**\n\n`{}` → **{}** (0 means false; any nonzero number means true)\n\n{}",
-                        cell_value,
-                        if value { "true" } else { "false" },
-                        version
+                    i18n::localize(
+                        locale,
+                        "hover.boolean_value",
+                        &i18n::args([
+                            ("value", serde_json::json!(cell_value)),
+                            (
+                                "result",
+                                serde_json::json!(if value { "true" } else { "false" }),
+                            ),
+                            ("version", serde_json::json!(version)),
+                        ]),
                     )
                 })
             } else {
@@ -2972,21 +3473,42 @@ impl LanguageServer for Backend {
                 .map(|_| {
                     let result = diagnostics::hit_summon_mode_result(&cell_value);
                     let current = if result.fallback_applied {
-                        format!("Current value: `{}` -> 1 (NU)", mark_edge_whitespace(&cell_value))
+                        i18n::localize(
+                            locale,
+                            "hover.hit_current_fallback",
+                            &i18n::args([(
+                                "value",
+                                serde_json::json!(mark_edge_whitespace(&cell_value)),
+                            )]),
+                        )
                     } else {
-                        format!(
-                            "Current value: `{}` -> {} ({})",
-                            if cell_value.is_empty() {
-                                "blank".to_string()
-                            } else {
-                                mark_edge_whitespace(&cell_value)
-                            },
-                            result.effective,
-                            diagnostics::HIT_SUMMON_MODE_CODES[result.effective as usize]
+                        i18n::localize(
+                            locale,
+                            "hover.hit_current",
+                            &i18n::args([
+                                (
+                                    "value",
+                                    serde_json::json!(if cell_value.is_empty() {
+                                        "blank".to_string()
+                                    } else {
+                                        mark_edge_whitespace(&cell_value)
+                                    }),
+                                ),
+                                ("effective", serde_json::json!(result.effective)),
+                                (
+                                    "mode",
+                                    serde_json::json!(
+                                        diagnostics::HIT_SUMMON_MODE_CODES
+                                            [result.effective as usize]
+                                    ),
+                                ),
+                            ]),
                         )
                     };
-                    format!(
-                        "**HitSummon monster mode**\n\nThe second server parameter uses a monster mode number from 0 through 15.\n\n0=DT, 1=NU, 2=WL, 3=GH, 4=A1, 5=A2, 6=BL, 7=SC, 8=S1, 9=S2, 10=S3, 11=S4, 12=DD, 13=KB, 14=xx, 15=RN.\n\nValues outside 0 through 15 use 1=NU.\n\n{current}"
+                    i18n::localize(
+                        locale,
+                        "hover.hit_summon",
+                        &i18n::args([("current", serde_json::json!(current))]),
                     )
                 });
 
@@ -3025,7 +3547,7 @@ impl LanguageServer for Backend {
 
         let plugin_content = match (plugin_hover_data, &self.plugin_host) {
             (Some((ctx, idx, snap, expected_identity)), Some(ph)) => {
-                let content = ph.hover(ctx, idx, snap).await;
+                let content = ph.hover_localized(ctx, idx, snap, locale).await;
                 let ws = self.workspace.read().await;
                 if !workspace_identity_matches(
                     expected_identity,
@@ -3121,6 +3643,55 @@ mod tests {
         })
         .await
         .expect("JSON analysis worker did not become idle");
+    }
+
+    #[tokio::test]
+    async fn initialize_locale_is_isolated_per_lsp_session_and_invalid_values_fall_back() {
+        async fn initialized_workspace(locale: &str) -> Arc<RwLock<Workspace>> {
+            let workspace = Arc::new(RwLock::new(Workspace::new()));
+            let settings = Arc::new(VectorLspSettings::default());
+            let gates = Arc::new(Mutex::new(HashMap::new()));
+            let backend_workspace = Arc::clone(&workspace);
+            let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+                client,
+                settings: Arc::clone(&settings),
+                workspace: Arc::clone(&backend_workspace),
+                plugin_host: None,
+                publish_gates: Arc::clone(&gates),
+            });
+            service
+                .inner()
+                .initialize(InitializeParams {
+                    initialization_options: Some(serde_json::json!({"locale": locale})),
+                    ..InitializeParams::default()
+                })
+                .await
+                .unwrap();
+            workspace
+        }
+
+        let korean = initialized_workspace("koKR").await;
+        let chinese = initialized_workspace("zhCN").await;
+        let invalid = initialized_workspace("not-a-locale").await;
+        assert_eq!(korean.read().await.locale, Locale::KoKr);
+        assert_eq!(chinese.read().await.locale, Locale::ZhCn);
+        assert_eq!(invalid.read().await.locale, Locale::EnUs);
+    }
+
+    #[test]
+    fn configuration_locale_reads_supported_shapes_and_ignores_unrelated_updates() {
+        assert_eq!(
+            Backend::configuration_locale(&serde_json::json!({"locale": "jaJP"})),
+            Some(Locale::JaJp)
+        );
+        assert_eq!(
+            Backend::configuration_locale(&serde_json::json!({"vectorLsp": {"locale": "pt-BR"}})),
+            Some(Locale::PtBr)
+        );
+        assert_eq!(
+            Backend::configuration_locale(&serde_json::json!({"editor": {"tabSize": 4}})),
+            None
+        );
     }
 
     #[test]
@@ -3906,6 +4477,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_stem_documents_share_publication_but_not_mutation_gates() {
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        let settings = Arc::new(VectorLspSettings::default());
+        let publish_gates = Arc::new(Mutex::new(HashMap::new()));
+        let workspace_for_service = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::clone(&settings),
+            workspace: Arc::clone(&workspace_for_service),
+            plugin_host: None,
+            publish_gates: Arc::clone(&publish_gates),
+        });
+        let root = Url::parse("file:///mod/states.txt").unwrap();
+        let base = Url::parse("file:///mod/base/states.txt").unwrap();
+
+        let root_mutation = service.inner().document_mutation_gate(&root).await;
+        let base_mutation = service.inner().document_mutation_gate(&base).await;
+        assert!(!Arc::ptr_eq(&root_mutation, &base_mutation));
+        let root_publication = service.inner().publish_gate(&root).await;
+        let base_publication = service.inner().publish_gate(&base).await;
+        assert!(Arc::ptr_eq(&root_publication, &base_publication));
+    }
+
+    #[tokio::test]
     async fn watched_file_burst_returns_immediately_and_runs_one_latest_scan() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3967,7 +4562,7 @@ mod tests {
 
         let ws = workspace.read().await;
         assert_eq!(ws.phase, WorkspacePhase::Ready);
-        assert_eq!(ws.scan_generation, 2 + BURST + 1);
+        assert_eq!(ws.scan_generation, 3);
         assert_eq!(ws.workspace_revision, 8);
         assert_eq!(
             ws.file_cache
@@ -4282,7 +4877,7 @@ mod tests {
                 text_document: TextDocumentIdentifier::new(txt_uri.clone()),
             })
             .await;
-        {
+        let scan_generation_after_close = {
             let ws = workspace.read().await;
             let disk = ws
                 .file_cache
@@ -4297,7 +4892,23 @@ mod tests {
                     .resolve("skills", "id", "DISK-SAVED", ReferenceResolver::AsciiCi)
                     .is_some()
             );
-        }
+            ws.scan_generation
+        };
+        service
+            .inner()
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![
+                    FileEvent::new(txt_uri.clone(), FileChangeType::DELETED),
+                    FileEvent::new(txt_uri.clone(), FileChangeType::CREATED),
+                    FileEvent::new(txt_uri, FileChangeType::CHANGED),
+                ],
+            })
+            .await;
+        wait_for_watched_change_worker(&workspace).await;
+        assert_eq!(
+            workspace.read().await.scan_generation,
+            scan_generation_after_close
+        );
         std::fs::remove_dir_all(base).unwrap();
         socket_task.abort();
     }
@@ -4833,17 +5444,11 @@ mod tests {
             "{}",
             markup.value
         );
-        assert!(
-            markup
-                .value
-                .contains("Built-in reference data (game version 3.2)"),
-            "{}",
-            markup.value
-        );
+        assert!(!markup.value.contains("Source:"), "{}", markup.value);
     }
 
     #[tokio::test]
-    async fn fixed4_reference_hover_reports_selected_bundled_version_and_open_shadow() {
+    async fn ordinary_reference_hover_hides_source_selection() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("contrib")
             .join("d2rdoc");
@@ -4914,13 +5519,7 @@ mod tests {
             "{}",
             markup.value
         );
-        assert!(
-            markup
-                .value
-                .contains("Built-in reference data (game version 3.2)"),
-            "{}",
-            markup.value
-        );
+        assert!(!markup.value.contains("Source:"), "{}", markup.value);
 
         {
             let mut ws = workspace.write().await;
@@ -4937,12 +5536,11 @@ mod tests {
             panic!("sibling hover must be Markdown");
         };
         assert!(
-            sibling_markup
-                .value
-                .contains("TXT file in the same folder (game version 3.2)"),
+            sibling_markup.value.contains("`staff` → `staf`"),
             "{}",
             sibling_markup.value
         );
+        assert!(!sibling_markup.value.contains("Source:"));
         assert!(
             service
                 .inner()
@@ -4985,7 +5583,7 @@ mod tests {
         let HoverContents::Markup(shadowed_markup) = shadowed.contents else {
             panic!("shadowed hover must be Markdown");
         };
-        assert!(!shadowed_markup.value.contains("Reference resolved"));
+        assert_eq!(shadowed_markup.value, "staff");
 
         {
             let mut ws = workspace.write().await;
@@ -4996,11 +5594,8 @@ mod tests {
         let HoverContents::Markup(restored_markup) = restored.contents else {
             panic!("restored hover must be Markdown");
         };
-        assert!(
-            restored_markup
-                .value
-                .contains("TXT file in the same folder")
-        );
+        assert!(restored_markup.value.contains("`staff` → `staf`"));
+        assert!(!restored_markup.value.contains("Source:"));
 
         {
             let mut ws = workspace.write().await;
@@ -5012,11 +5607,8 @@ mod tests {
         let HoverContents::Markup(deleted_markup) = deleted.contents else {
             panic!("bundled restore hover must be Markdown");
         };
-        assert!(
-            deleted_markup
-                .value
-                .contains("Built-in reference data (game version 3.2)")
-        );
+        assert!(deleted_markup.value.contains("`staff` → `staf`"));
+        assert!(!deleted_markup.value.contains("Source:"));
     }
 
     #[tokio::test]
@@ -5032,6 +5624,7 @@ mod tests {
         let result = load_workspace_document(
             Arc::new(settings),
             '\t',
+            Locale::EnUs,
             (uri, path.clone(), "odd-utf16".to_string()),
         )
         .await;

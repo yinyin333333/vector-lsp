@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::{DocumentData, utf16_len};
+use crate::i18n::{self, Locale};
 use crate::schema::{FieldTypeName, ReferenceResolver, ReferenceUnknownPolicy, Schema};
 use crate::workspace::SymbolIndex;
 
@@ -19,7 +20,14 @@ pub fn validate_document(
     schema: Option<&Schema>,
     symbols: &SymbolIndex,
 ) -> Vec<Diagnostic> {
-    validate_document_for_version(file_stem, doc, schema, symbols, None)
+    legacy_schema_diagnostics(validate_document_for_locale(
+        file_stem,
+        doc,
+        schema,
+        symbols,
+        None,
+        Locale::EnUs,
+    ))
 }
 
 pub fn validate_document_for_version(
@@ -28,6 +36,44 @@ pub fn validate_document_for_version(
     schema: Option<&Schema>,
     symbols: &SymbolIndex,
     game_version: Option<&str>,
+) -> Vec<Diagnostic> {
+    legacy_schema_diagnostics(validate_document_for_locale(
+        file_stem,
+        doc,
+        schema,
+        symbols,
+        game_version,
+        Locale::EnUs,
+    ))
+}
+
+fn legacy_schema_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    for diagnostic in &mut diagnostics {
+        if diagnostic
+            .data
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|data| {
+                data.len() == 2
+                    && data.contains_key("messageKey")
+                    && data.contains_key("messageArgs")
+            })
+        {
+            diagnostic.data = None;
+        }
+    }
+    diagnostics
+}
+
+/// Locale-aware schema validation.  The semantic validation logic, ranges,
+/// severity, codes and metadata do not depend on the selected language.
+pub fn validate_document_for_locale(
+    file_stem: &str,
+    doc: &DocumentData,
+    schema: Option<&Schema>,
+    symbols: &SymbolIndex,
+    game_version: Option<&str>,
+    locale: Locale,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
@@ -64,22 +110,31 @@ pub fn validate_document_for_version(
                 let key = cell.value.to_lowercase();
                 if let Some((_first_value, first_line, first_col)) = seen.get(&key) {
                     let cell_end = cell.col_start + utf16_len(&cell.value);
-                    diags.push(Diagnostic {
-                        range: Range {
-                            start: Position { line: row.line, character: cell.col_start },
-                            end: Position { line: row.line, character: cell_end },
+                    diags.push(i18n::localized_diagnostic(
+                        locale,
+                        "diag.duplicate_unique",
+                        i18n::args([
+                            ("value", serde_json::json!(cell.value)),
+                            ("column", serde_json::json!(col_name)),
+                            ("line", serde_json::json!(first_line + 1)),
+                            ("firstColumn", serde_json::json!(first_col + 1)),
+                        ]),
+                        Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line: row.line,
+                                    character: cell.col_start,
+                                },
+                                end: Position {
+                                    line: row.line,
+                                    character: cell_end,
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            source: Some("vector-lsp".into()),
+                            ..Default::default()
                         },
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        source: Some("vector-lsp".into()),
-                        message: format!(
-                            "Duplicate value '{}' in unique key column '{}' (first seen at line {}, column {})",
-                            cell.value,
-                            col_name,
-                            first_line + 1,
-                            first_col + 1
-                        ),
-                        ..Default::default()
-                    });
+                    ));
                 } else {
                     seen.insert(key, (cell.value.clone(), row.line, cell.col_start));
                 }
@@ -130,7 +185,9 @@ pub fn validate_document_for_version(
                                 continue;
                             }
                             let trimmed = cell.value.trim();
-                            let trim_note = if ft.resolver == ReferenceResolver::AsciiCi
+                            let (leading_whitespace, trailing_whitespace) =
+                                edge_whitespace_counts(&cell.value);
+                            let has_trimmed_match = ft.resolver == ReferenceResolver::AsciiCi
                                 && trimmed != cell.value
                                 && !trimmed.is_empty()
                                 && target_exists(
@@ -140,15 +197,7 @@ pub fn validate_document_for_version(
                                     ref_col,
                                     trimmed,
                                     ft.resolver,
-                                ) {
-                                format!(
-                                    "; {}. Remove it to match '{}'",
-                                    edge_whitespace_description(&cell.value),
-                                    trimmed
-                                )
-                            } else {
-                                String::new()
-                            };
+                                );
                             let monpet_consume_stat =
                                 is_monpet_consumestat_reference(file_stem, col_name);
                             let properties_stat = is_properties_stat_reference(file_stem, col_name);
@@ -156,34 +205,6 @@ pub fn validate_document_for_version(
                                 properties_stat_dispatch_func(file_stem, doc, row, col_name);
                             let skills_range =
                                 is_3_2_skills_range_reference(file_stem, col_name, ft.resolver);
-                            let message = if skills_range {
-                                "Unknown range code. Use one of: none, h2h, rng, both, loc."
-                                    .to_string()
-                            } else if monpet_consume_stat {
-                                format!(
-                                    "Unknown stat name '{}'. This Consume bonus is not applied; other Consume slots still work. Use the exact Stat name from itemstatcost.txt.",
-                                    cell.value
-                                )
-                            } else if properties_stat {
-                                if properties_stat_func == Some(17) {
-                                    format!(
-                                        "Unknown stat name '{}'. This property has no effect. Use the exact Stat name from itemstatcost.txt.",
-                                        cell.value
-                                    )
-                                } else {
-                                    format!(
-                                        "Unknown stat name '{}'. Use the exact Stat name from itemstatcost.txt.",
-                                        cell.value
-                                    )
-                                }
-                            } else if ft.resolver == ReferenceResolver::Fixed4 {
-                                fixed4_unknown_message(&cell.value)
-                            } else {
-                                format!(
-                                    "Reference value '{}' not found in {}.{}{}",
-                                    cell.value, ref_file, ref_col, trim_note
-                                )
-                            };
                             let data = if monpet_consume_stat {
                                 Some(serde_json::json!({
                                     "rule": "reference",
@@ -227,18 +248,101 @@ pub fn validate_document_for_version(
                             } else {
                                 None
                             };
-                            diags.push(Diagnostic {
-                                range: cell_range,
-                                severity: Some(match ft.unknown_policy {
-                                    ReferenceUnknownPolicy::Error => DiagnosticSeverity::ERROR,
-                                    ReferenceUnknownPolicy::Warning => DiagnosticSeverity::WARNING,
-                                    ReferenceUnknownPolicy::Ignore => unreachable!(),
-                                }),
-                                source: Some("vector-lsp".into()),
-                                message,
-                                data,
-                                ..Default::default()
-                            });
+                            let (message_key, message_args) = if skills_range {
+                                ("diag.reference.range", i18n::args([]))
+                            } else if monpet_consume_stat {
+                                (
+                                    "diag.reference.monpet_consumestat",
+                                    i18n::args([("value", serde_json::json!(cell.value))]),
+                                )
+                            } else if properties_stat {
+                                if properties_stat_func == Some(17) {
+                                    (
+                                        "diag.reference.properties_stat_noeffect",
+                                        i18n::args([("value", serde_json::json!(cell.value))]),
+                                    )
+                                } else {
+                                    (
+                                        "diag.reference.properties_stat",
+                                        i18n::args([("value", serde_json::json!(cell.value))]),
+                                    )
+                                }
+                            } else if ft.resolver == ReferenceResolver::Fixed4 {
+                                let effective = crate::workspace::fixed4_display(&cell.value);
+                                let shown_value = mark_whitespace(&cell.value);
+                                let shown_effective = mark_whitespace(&effective);
+                                (
+                                    "diag.fixed4_unknown",
+                                    i18n::args([
+                                        ("value", serde_json::json!(shown_value)),
+                                        ("effective", serde_json::json!(shown_effective)),
+                                        (
+                                            "hasSpaceMarker",
+                                            serde_json::json!(
+                                                cell.value.contains(' ') || effective.contains(' ')
+                                            ),
+                                        ),
+                                        (
+                                            "hasTabMarker",
+                                            serde_json::json!(
+                                                cell.value.contains('\t')
+                                                    || effective.contains('\t')
+                                            ),
+                                        ),
+                                    ]),
+                                )
+                            } else {
+                                (
+                                    "diag.reference.unresolved",
+                                    i18n::args([
+                                        ("value", serde_json::json!(cell.value)),
+                                        ("file", serde_json::json!(ref_file)),
+                                        ("column", serde_json::json!(ref_col)),
+                                        (
+                                            "trimmedValue",
+                                            serde_json::json!(if has_trimmed_match {
+                                                trimmed
+                                            } else {
+                                                ""
+                                            }),
+                                        ),
+                                        (
+                                            "leadingWhitespace",
+                                            serde_json::json!(if has_trimmed_match {
+                                                leading_whitespace
+                                            } else {
+                                                0
+                                            }),
+                                        ),
+                                        (
+                                            "trailingWhitespace",
+                                            serde_json::json!(if has_trimmed_match {
+                                                trailing_whitespace
+                                            } else {
+                                                0
+                                            }),
+                                        ),
+                                    ]),
+                                )
+                            };
+                            diags.push(i18n::localized_diagnostic(
+                                locale,
+                                message_key,
+                                message_args,
+                                Diagnostic {
+                                    range: cell_range,
+                                    severity: Some(match ft.unknown_policy {
+                                        ReferenceUnknownPolicy::Error => DiagnosticSeverity::ERROR,
+                                        ReferenceUnknownPolicy::Warning => {
+                                            DiagnosticSeverity::WARNING
+                                        }
+                                        ReferenceUnknownPolicy::Ignore => unreachable!(),
+                                    }),
+                                    source: Some("vector-lsp".into()),
+                                    data,
+                                    ..Default::default()
+                                },
+                            ));
                         }
                     }
                 }
@@ -248,12 +352,13 @@ pub fn validate_document_for_version(
                     }
                     if is_hit_summon_mode_cell(file_stem, doc, row, col_name, game_version) {
                         let result = hit_summon_mode_result(&cell.value);
-                        if let Some(message) = result.message {
-                            diags.push(Diagnostic {
+                        if result.message.is_some() {
+                            let (message_key, message_args) =
+                                hit_summon_message_key_args(&cell.value, &result);
+                            diags.push(i18n::localized_diagnostic(locale, message_key, message_args, Diagnostic {
                                 range: cell_range,
                                 severity: Some(DiagnosticSeverity::WARNING),
                                 source: Some("vector-lsp".into()),
-                                message,
                                 data: Some(serde_json::json!({
                                     "rule": "hit-summon-mode",
                                     "scope": "missiles.pSrvHitFunc6.sHitPar2",
@@ -263,32 +368,51 @@ pub fn validate_document_for_version(
                                     "fallbackApplied": result.fallback_applied
                                 })),
                                 ..Default::default()
-                            });
+                            }));
                         }
                         continue;
                     }
                     if cell.value.parse::<i64>().is_err() {
-                        diags.push(Diagnostic {
-                            range: cell_range,
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            source: Some("vector-lsp".into()),
-                            message: integer_policy_message(file_stem, col_name, &cell.value),
-                            ..Default::default()
-                        });
+                        let message_key = if file_stem.eq_ignore_ascii_case("missiles")
+                            && col_name.eq_ignore_ascii_case("CltParam5")
+                            && cell.value == "`"
+                        {
+                            "diag.integer.backtick"
+                        } else {
+                            "diag.integer.invalid"
+                        };
+                        diags.push(i18n::localized_diagnostic(
+                            locale,
+                            message_key,
+                            i18n::args([
+                                ("value", serde_json::json!(cell.value)),
+                                ("column", serde_json::json!(col_name)),
+                            ]),
+                            Diagnostic {
+                                range: cell_range,
+                                severity: Some(DiagnosticSeverity::WARNING),
+                                source: Some("vector-lsp".into()),
+                                ..Default::default()
+                            },
+                        ));
                     }
                 }
                 FieldTypeName::Float => {
                     if cell.value.parse::<f64>().is_err() {
-                        diags.push(Diagnostic {
-                            range: cell_range,
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            source: Some("vector-lsp".into()),
-                            message: format!(
-                                "'{}' is not a valid number for column '{col_name}'",
-                                cell.value
-                            ),
-                            ..Default::default()
-                        });
+                        diags.push(i18n::localized_diagnostic(
+                            locale,
+                            "diag.float.invalid",
+                            i18n::args([
+                                ("value", serde_json::json!(cell.value)),
+                                ("column", serde_json::json!(col_name)),
+                            ]),
+                            Diagnostic {
+                                range: cell_range,
+                                severity: Some(DiagnosticSeverity::WARNING),
+                                source: Some("vector-lsp".into()),
+                                ..Default::default()
+                            },
+                        ));
                     }
                 }
                 FieldTypeName::Boolean => {
@@ -297,27 +421,38 @@ pub fn validate_document_for_version(
                     }
                     if is_confirmed_type29_boolean(file_stem, col_name) {
                         if parse_type29_boolean(&cell.value).is_none() {
-                            diags.push(Diagnostic {
-                                range: cell_range,
-                                severity: Some(DiagnosticSeverity::WARNING),
-                                source: Some("vector-lsp".into()),
-                                message: format!(
-                                    "'{}' is not a number for '{col_name}'. Use 0 for false or any nonzero integer for true.",
-                                    cell.value
-                                ),
-                                ..Default::default()
-                            });
+                            diags.push(i18n::localized_diagnostic(
+                                locale,
+                                "diag.boolean.type29_invalid",
+                                i18n::args([
+                                    ("value", serde_json::json!(cell.value)),
+                                    ("column", serde_json::json!(col_name)),
+                                ]),
+                                Diagnostic {
+                                    range: cell_range,
+                                    severity: Some(DiagnosticSeverity::WARNING),
+                                    source: Some("vector-lsp".into()),
+                                    ..Default::default()
+                                },
+                            ));
                         }
                         continue;
                     }
                     if cell.value != "0" && cell.value != "1" {
-                        diags.push(Diagnostic {
-                            range: cell_range,
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            source: Some("vector-lsp".into()),
-                            message: boolean_policy_message(file_stem, col_name, &cell.value),
-                            ..Default::default()
-                        });
+                        diags.push(i18n::localized_diagnostic(
+                            locale,
+                            "diag.boolean.invalid",
+                            i18n::args([
+                                ("value", serde_json::json!(cell.value)),
+                                ("column", serde_json::json!(col_name)),
+                            ]),
+                            Diagnostic {
+                                range: cell_range,
+                                severity: Some(DiagnosticSeverity::WARNING),
+                                source: Some("vector-lsp".into()),
+                                ..Default::default()
+                            },
+                        ));
                     }
                 }
                 _ => {}
@@ -448,6 +583,39 @@ pub(crate) fn hit_summon_mode_result(value: &str) -> HitSummonModeResult {
     }
 }
 
+fn hit_summon_message_key_args(
+    value: &str,
+    result: &HitSummonModeResult,
+) -> (&'static str, serde_json::Map<String, serde_json::Value>) {
+    let shown_value = mark_whitespace(value);
+    let numeric = value.bytes().all(|byte| byte.is_ascii_digit())
+        || value.strip_prefix('-').is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    let key = if numeric && result.fallback_applied {
+        "diag.hit.out_of_range"
+    } else if numeric {
+        "diag.hit.noncanonical"
+    } else if value == "NU" {
+        "diag.hit.nu_literal"
+    } else if result.fallback_applied {
+        "diag.hit.non_numeric_outside"
+    } else {
+        "diag.hit.non_numeric"
+    };
+    (
+        key,
+        i18n::args([
+            ("value", serde_json::json!(shown_value)),
+            ("effective", serde_json::json!(result.effective)),
+            (
+                "mode",
+                serde_json::json!(HIT_SUMMON_MODE_CODES[result.effective as usize]),
+            ),
+        ]),
+    )
+}
+
 /// Properties `val#` fields are dispatcher inputs rather than unconditional
 /// integers. Binary revalidation established that a null/unknown function
 /// stops the slot walk and that only functions 21 and 36 consume the matching
@@ -528,19 +696,6 @@ fn property_slot(column: &str, prefix: &str) -> Option<u8> {
     (1..=7).contains(&slot).then_some(slot)
 }
 
-fn integer_policy_message(file_stem: &str, column: &str, value: &str) -> String {
-    if file_stem.eq_ignore_ascii_case("missiles")
-        && column.eq_ignore_ascii_case("CltParam5")
-        && value == "`"
-    {
-        return "'`' is not written as a normal integer. The game converts it to 48. Replace it with the number you actually want."
-            .to_string();
-    }
-    format!(
-        "'{value}' is not a standard integer for '{column}'. Use a plain whole number; the game may read a different value."
-    )
-}
-
 pub(crate) fn is_confirmed_type29_boolean(file_stem: &str, column: &str) -> bool {
     file_stem.eq_ignore_ascii_case("missiles")
         && (column.eq_ignore_ascii_case("Explosion") || column.eq_ignore_ascii_case("NoMultiShot"))
@@ -573,41 +728,14 @@ fn is_3_2_skills_range_reference(
         && resolver == ReferenceResolver::Fixed4
 }
 
-fn edge_whitespace_description(value: &str) -> String {
+fn edge_whitespace_counts(value: &str) -> (usize, usize) {
     let leading = value.chars().take_while(|ch| ch.is_whitespace()).count();
     let trailing = value
         .chars()
         .rev()
         .take_while(|ch| ch.is_whitespace())
         .count();
-    match (leading, trailing) {
-        (0, trailing) => format!("this value has {trailing} trailing whitespace character(s)"),
-        (leading, 0) => format!("this value has {leading} leading whitespace character(s)"),
-        (leading, trailing) => format!(
-            "this value has {leading} leading and {trailing} trailing whitespace character(s)"
-        ),
-    }
-}
-
-fn fixed4_unknown_message(value: &str) -> String {
-    let effective = crate::workspace::fixed4_display(value);
-    let shown_value = mark_whitespace(value);
-    let shown_effective = mark_whitespace(&effective);
-    let mut markers = Vec::new();
-    if value.contains(' ') || effective.contains(' ') {
-        markers.push("␠ = space");
-    }
-    if value.contains('\t') || effective.contains('\t') {
-        markers.push("⇥ = tab");
-    }
-    let legend = if markers.is_empty() {
-        String::new()
-    } else {
-        format!(" {}.", markers.join(", "))
-    };
-    format!(
-        "Unknown code '{shown_value}'. The game reads this code as '{shown_effective}'.{legend} Check the four-character code and letter case."
-    )
+    (leading, trailing)
 }
 
 fn mark_whitespace(value: &str) -> String {
@@ -623,12 +751,6 @@ pub(crate) fn parse_type29_boolean(value: &str) -> Option<bool> {
         return None;
     }
     Some(digits.bytes().any(|byte| byte != b'0'))
-}
-
-fn boolean_policy_message(_file_stem: &str, column: &str, value: &str) -> String {
-    format!(
-        "'{value}' is not a standard boolean value for '{column}'. Use 0 for false or 1 for true."
-    )
 }
 
 fn target_exists(
@@ -1192,11 +1314,14 @@ mod tests {
             &SymbolIndex::new(),
             Some("3.1"),
         );
-        assert!(
-            diagnostics_3_1
-                .iter()
-                .all(|diagnostic| diagnostic.data.is_none())
-        );
+        assert!(diagnostics_3_1.iter().all(|diagnostic| {
+            diagnostic
+                .data
+                .as_ref()
+                .and_then(|data| data.get("rule"))
+                .and_then(|value| value.as_str())
+                != Some("hit-summon-mode")
+        }));
     }
 
     #[test]
@@ -1294,7 +1419,7 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(
             diagnostics[0].message,
-            "Unknown code '␠Staff'. The game reads this code as '␠Sta'. ␠ = space. Check the four-character code and letter case."
+            "Unknown code '␠Staff'. The game reads this code as '␠Sta'. Check the four-character code and letter case. ␠ = space."
         );
     }
 
