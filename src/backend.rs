@@ -1505,14 +1505,16 @@ impl Backend {
         };
         let locale = self.locale().await;
         tokio::task::spawn_blocking(move || {
-            diagnostics::validate_document_for_locale(
+            let mut diagnostics = diagnostics::validate_document_for_locale(
                 &stem,
                 &doc,
                 schema.as_deref(),
                 &symbols,
                 reference_version.as_deref(),
                 locale,
-            )
+            );
+            diagnostics::attach_display_context(&doc, &mut diagnostics);
+            diagnostics
         })
         .await
         .ok()
@@ -1573,6 +1575,7 @@ impl Backend {
                 return None;
             }
         }
+        diagnostics::attach_display_context(&doc, &mut diagnostics);
         Some(diagnostics)
     }
 
@@ -1898,6 +1901,7 @@ impl Backend {
                     return false;
                 }
             }
+            diagnostics::attach_display_context(&document, &mut diagnostics);
             if !self
                 .publish_disk_if_current(scan_generation, workspace_revision, uri, diagnostics)
                 .await

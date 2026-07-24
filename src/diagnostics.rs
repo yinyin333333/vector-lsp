@@ -463,6 +463,43 @@ pub fn validate_document_for_locale(
     diags
 }
 
+pub fn attach_display_context(doc: &DocumentData, diagnostics: &mut [Diagnostic]) {
+    for diagnostic in diagnostics {
+        let line = diagnostic.range.start.line;
+        let character = diagnostic.range.start.character;
+        let Some((column_index, _)) = doc.cell_at(line, character) else {
+            continue;
+        };
+        let Some(row) = doc.rows.iter().find(|row| row.line == line) else {
+            continue;
+        };
+        let Some(column_name) = doc
+            .headers
+            .get(column_index)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(row_id) = row
+            .cells
+            .iter()
+            .map(|cell| cell.value.trim())
+            .find(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let data = diagnostic.data.get_or_insert_with(|| serde_json::json!({}));
+        let Some(data) = data.as_object_mut() else {
+            continue;
+        };
+        data.insert(
+            "displayColumnName".to_string(),
+            serde_json::json!(column_name),
+        );
+        data.insert("displayRowId".to_string(), serde_json::json!(row_id));
+    }
+}
+
 pub(crate) const HIT_SUMMON_MODE_CODES: [&str; 16] = [
     "DT", "NU", "WL", "GH", "A1", "A2", "BL", "SC", "S1", "S2", "S3", "S4", "DD", "KB", "xx", "RN",
 ];
@@ -809,6 +846,32 @@ mod tests {
     use super::*;
     use crate::schema::{FieldType, SchemaField, SchemaFile, find_loader};
     use crate::source_selection::SourceKind;
+
+    #[test]
+    fn display_context_identifies_the_row_and_column_without_an_open_editor_document() {
+        let document = DocumentData::parse("Id\tEDmgSymPerCalc\nBone Prison\tpar10", '\t');
+        let mut diagnostics = vec![Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 1,
+                    character: 12,
+                },
+                end: Position {
+                    line: 1,
+                    character: 17,
+                },
+            },
+            data: Some(serde_json::json!({ "kind": "reference" })),
+            ..Default::default()
+        }];
+
+        attach_display_context(&document, &mut diagnostics);
+
+        let data = diagnostics[0].data.as_ref().unwrap();
+        assert_eq!(data["displayRowId"], "Bone Prison");
+        assert_eq!(data["displayColumnName"], "EDmgSymPerCalc");
+        assert_eq!(data["kind"], "reference");
+    }
 
     #[test]
     fn diagnostic_ranges_use_utf16_code_units() {
