@@ -3435,7 +3435,7 @@ impl LanguageServer for Backend {
             _col_name,
             cell_value,
             reference_content,
-            type29_content,
+            boolean_content,
             hit_summon_mode_content,
             calculation_limit,
             plugin_hover_data,
@@ -3571,35 +3571,18 @@ impl LanguageServer for Backend {
                     }
                 });
 
-            let type29_content = if diagnostics::is_confirmed_type29_boolean(&file_stem, &col_name)
-            {
-                diagnostics::parse_type29_boolean(&cell_value).map(|value| {
-                    let version = ws.reference_version.as_deref().map_or_else(
-                        || i18n::localize(locale, "hover.game_version_unselected", &i18n::args([])),
-                        |version| {
-                            i18n::localize(
-                                locale,
-                                "hover.game_version",
-                                &i18n::args([("version", serde_json::json!(version))]),
-                            )
-                        },
-                    );
-                    i18n::localize(
-                        locale,
-                        "hover.boolean_value",
-                        &i18n::args([
-                            ("value", serde_json::json!(cell_value)),
-                            (
-                                "result",
-                                serde_json::json!(if value { "true" } else { "false" }),
-                            ),
-                            ("version", serde_json::json!(version)),
-                        ]),
-                    )
-                })
-            } else {
-                None
-            };
+            let boolean_content = diagnostics::confirmed_boolean_kind(&file_stem, &col_name)
+                .and_then(|kind| diagnostics::parse_confirmed_boolean(&cell_value, kind))
+                .map(|value| {
+                    let key = if value.enabled {
+                        "hover.boolean_on"
+                    } else if value.input_nonzero {
+                        "hover.boolean_off_recommendation"
+                    } else {
+                        "hover.boolean_off"
+                    };
+                    i18n::localize(locale, key, &i18n::args([]))
+                });
 
             let hit_summon_mode_content = current_row
                 .filter(|row| {
@@ -3680,7 +3663,7 @@ impl LanguageServer for Backend {
                 col_name,
                 cell_value,
                 reference_content,
-                type29_content,
+                boolean_content,
                 hit_summon_mode_content,
                 calculation_limit,
                 plugin_hover_data,
@@ -3705,21 +3688,21 @@ impl LanguageServer for Backend {
         let contextual = match (
             plugin_content,
             reference_content,
-            type29_content,
+            boolean_content,
             hit_summon_mode_content,
         ) {
             (Some(plugin), Some(reference), _, _) if !plugin.is_empty() => {
                 Some(format!("{plugin}\n\n---\n\n{reference}"))
             }
-            (Some(plugin), _, Some(type29), _) if !plugin.is_empty() => {
-                Some(format!("{plugin}\n\n---\n\n{type29}"))
+            (Some(plugin), _, Some(boolean), _) if !plugin.is_empty() => {
+                Some(format!("{plugin}\n\n---\n\n{boolean}"))
             }
             (Some(plugin), _, _, Some(hit_summon)) if !plugin.is_empty() => {
                 Some(format!("{plugin}\n\n---\n\n{hit_summon}"))
             }
             (Some(plugin), _, _, _) if !plugin.is_empty() => Some(plugin),
             (_, Some(reference), _, _) => Some(reference),
-            (_, _, Some(type29), _) => Some(type29),
+            (_, _, Some(boolean), _) => Some(boolean),
             (_, _, _, Some(hit_summon)) => Some(hit_summon),
             _ => None,
         };
@@ -5175,7 +5158,11 @@ mod tests {
             ),
             (
                 Url::parse("file:///workspace/missiles.txt").unwrap(),
-                "Explosion\tNoMultiShot\n2\t-1\n",
+                "Explosion\tNoMultiShot\n0\t2\n-1\t4294967296\n",
+            ),
+            (
+                Url::parse("file:///workspace/misc.txt").unwrap(),
+                "AutoBelt\tMultiBuy\n0\t1\n255\t256\n-256\t257\n",
             ),
         ];
 
@@ -5253,12 +5240,7 @@ mod tests {
             (
                 "file:///workspace/missiles.txt",
                 1,
-                "Numeric 0 means false. Any numeric nonzero value means true",
-            ),
-            (
-                "file:///workspace/missiles.txt",
-                12,
-                "including negative values",
+                "Use 0 to turn this off or 1 to turn it on. Other integers are accepted; hover over a value to see how the game treats it.",
             ),
         ];
 
@@ -5285,35 +5267,95 @@ mod tests {
                 "header hover at {uri}:{character} did not contain {expected:?}: {}",
                 markup.value
             );
+            assert!(
+                !markup
+                    .value
+                    .contains("Any numeric nonzero value means true"),
+                "{}",
+                markup.value
+            );
         }
 
-        for (character, expected_value, expected_truth) in
-            [(0, "`2`", "**true**"), (3, "`-1`", "**true**")]
-        {
+        for (uri, line, character, expected) in [
+            (
+                "file:///workspace/missiles.txt",
+                1,
+                0,
+                "The current value is treated as off by the game.",
+            ),
+            (
+                "file:///workspace/missiles.txt",
+                1,
+                2,
+                "The current value is treated as on by the game.",
+            ),
+            (
+                "file:///workspace/missiles.txt",
+                2,
+                0,
+                "The current value is treated as on by the game.",
+            ),
+            (
+                "file:///workspace/missiles.txt",
+                2,
+                3,
+                "The current value is treated as off by the game. Enter 1 to turn it on.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                1,
+                0,
+                "The current value is treated as off by the game.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                1,
+                2,
+                "The current value is treated as on by the game.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                2,
+                0,
+                "The current value is treated as on by the game.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                2,
+                4,
+                "The current value is treated as off by the game. Enter 1 to turn it on.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                3,
+                0,
+                "The current value is treated as off by the game. Enter 1 to turn it on.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                3,
+                5,
+                "The current value is treated as on by the game.",
+            ),
+        ] {
             let hover = service
                 .inner()
                 .hover(HoverParams {
                     text_document_position_params: TextDocumentPositionParams {
                         text_document: TextDocumentIdentifier {
-                            uri: Url::parse("file:///workspace/missiles.txt").unwrap(),
+                            uri: Url::parse(uri).unwrap(),
                         },
-                        position: Position::new(1, character),
+                        position: Position::new(line, character),
                     },
                     work_done_progress_params: WorkDoneProgressParams::default(),
                 })
                 .await
                 .unwrap()
-                .expect("type-29 value hover");
+                .expect("verified Boolean value hover");
             let HoverContents::Markup(markup) = hover.contents else {
-                panic!("type-29 hover should be Markdown markup");
+                panic!("Boolean hover should be Markdown markup");
             };
-            assert!(markup.value.contains(expected_value), "{}", markup.value);
-            assert!(markup.value.contains(expected_truth), "{}", markup.value);
-            assert!(
-                markup.value.contains("Game version: 3.2"),
-                "{}",
-                markup.value
-            );
+            assert_eq!(markup.value, expected);
         }
     }
 

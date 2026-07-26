@@ -158,6 +158,33 @@ pub fn validate_document_for_locale(
                 },
             };
 
+            if let Some(kind) = confirmed_boolean_kind(file_stem, col_name) {
+                if cell.value.trim().is_empty() {
+                    continue;
+                }
+                if parse_confirmed_boolean(&cell.value, kind).is_none() {
+                    diags.push(i18n::localized_diagnostic(
+                        locale,
+                        "diag.boolean.type29_invalid",
+                        i18n::args([
+                            ("value", serde_json::json!(cell.value)),
+                            ("column", serde_json::json!(col_name)),
+                        ]),
+                        Diagnostic {
+                            range: cell_range,
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            source: Some("vector-lsp".into()),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                continue;
+            }
+
+            if is_excluded_boolean(file_stem, col_name) {
+                continue;
+            }
+
             match ft.type_name {
                 FieldTypeName::Reference => {
                     if cell.value.trim().is_empty() {
@@ -417,25 +444,6 @@ pub fn validate_document_for_locale(
                 }
                 FieldTypeName::Boolean => {
                     if cell.value.trim().is_empty() {
-                        continue;
-                    }
-                    if is_confirmed_type29_boolean(file_stem, col_name) {
-                        if parse_type29_boolean(&cell.value).is_none() {
-                            diags.push(i18n::localized_diagnostic(
-                                locale,
-                                "diag.boolean.type29_invalid",
-                                i18n::args([
-                                    ("value", serde_json::json!(cell.value)),
-                                    ("column", serde_json::json!(col_name)),
-                                ]),
-                                Diagnostic {
-                                    range: cell_range,
-                                    severity: Some(DiagnosticSeverity::WARNING),
-                                    source: Some("vector-lsp".into()),
-                                    ..Default::default()
-                                },
-                            ));
-                        }
                         continue;
                     }
                     if cell.value != "0" && cell.value != "1" {
@@ -733,9 +741,73 @@ fn property_slot(column: &str, prefix: &str) -> Option<u8> {
     (1..=7).contains(&slot).then_some(slot)
 }
 
-pub(crate) fn is_confirmed_type29_boolean(file_stem: &str, column: &str) -> bool {
-    file_stem.eq_ignore_ascii_case("missiles")
-        && (column.eq_ignore_ascii_case("Explosion") || column.eq_ignore_ascii_case("NoMultiShot"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConfirmedBooleanKind {
+    General,
+    Stored,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConfirmedBooleanValue {
+    pub enabled: bool,
+    pub input_nonzero: bool,
+}
+
+pub(crate) fn confirmed_boolean_kind(
+    file_stem: &str,
+    column: &str,
+) -> Option<ConfirmedBooleanKind> {
+    let matches = |file: &str, columns: &[&str]| {
+        file_stem.eq_ignore_ascii_case(file)
+            && columns
+                .iter()
+                .any(|candidate| column.eq_ignore_ascii_case(candidate))
+    };
+    if matches("missiles", &["explosion", "nomultishot"])
+        || matches(
+            "monstats",
+            &[
+                "enabled",
+                "rangedtype",
+                "placespawn",
+                "setboss",
+                "bossxfer",
+                "isspawn",
+                "ismelee",
+                "npc",
+                "zoo",
+                "cannotdesecrate",
+            ],
+        )
+        || matches(
+            "states",
+            &[
+                "remhit",
+                "nosend",
+                "transform",
+                "aura",
+                "curable",
+                "curse",
+                "active",
+                "restrict",
+                "notondead",
+            ],
+        )
+    {
+        Some(ConfirmedBooleanKind::General)
+    } else if matches("misc", &["autobelt", "multibuy"])
+        || matches("states", &["canstack"])
+        || matches("superuniques", &["autopos", "stacks"])
+        || matches("weapons", &["1or2handed", "2handed"])
+    {
+        Some(ConfirmedBooleanKind::Stored)
+    } else {
+        None
+    }
+}
+
+fn is_excluded_boolean(file_stem: &str, column: &str) -> bool {
+    file_stem.eq_ignore_ascii_case("superuniques") && column.eq_ignore_ascii_case("replaceable")
 }
 
 pub(crate) fn is_monpet_consumestat_reference(file_stem: &str, column: &str) -> bool {
@@ -779,15 +851,35 @@ fn mark_whitespace(value: &str) -> String {
     value.replace(' ', "␠").replace('\t', "⇥")
 }
 
-/// Parse the binary-revalidated type-29 meaning without imposing an
-/// unverified host-language integer limit. The binary evidence establishes
-/// signed decimal zero vs nonzero, but not an i64 storage boundary.
-pub(crate) fn parse_type29_boolean(value: &str) -> Option<bool> {
+/// Parse the verified Boolean fields without imposing a host-language integer
+/// limit, then reproduce the game's wrapping conversion for hover output.
+pub(crate) fn parse_confirmed_boolean(
+    value: &str,
+    kind: ConfirmedBooleanKind,
+) -> Option<ConfirmedBooleanValue> {
+    let negative = value.starts_with('-');
     let digits = value.strip_prefix('-').unwrap_or(value);
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    Some(digits.bytes().any(|byte| byte != b'0'))
+    let input_nonzero = digits.bytes().any(|byte| byte != b'0');
+    let mut converted = 0_u32;
+    for digit in digits.bytes() {
+        converted = converted
+            .wrapping_mul(10)
+            .wrapping_add(u32::from(digit - b'0'));
+    }
+    if negative {
+        converted = converted.wrapping_neg();
+    }
+    let enabled = match kind {
+        ConfirmedBooleanKind::General => converted != 0,
+        ConfirmedBooleanKind::Stored => converted & 0xff != 0,
+    };
+    Some(ConfirmedBooleanValue {
+        enabled,
+        input_nonzero,
+    })
 }
 
 fn target_exists(
@@ -1176,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    fn type29_boolean_accepts_zero_and_every_signed_decimal_nonzero() {
+    fn verified_boolean_parser_accepts_arbitrary_signed_decimals_and_wraps_like_the_game() {
         for (value, expected) in [
             ("0", false),
             ("-0", false),
@@ -1185,14 +1277,40 @@ mod tests {
             ("2", true),
             ("3", true),
             ("999999", true),
-            ("184467440737095516160000", true),
+            ("4294967296", false),
+            ("184467440737095516160000", false),
             ("-1", true),
             ("-987654321", true),
         ] {
-            assert_eq!(parse_type29_boolean(value), Some(expected), "{value}");
+            assert_eq!(
+                parse_confirmed_boolean(value, ConfirmedBooleanKind::General)
+                    .map(|parsed| parsed.enabled),
+                Some(expected),
+                "{value}"
+            );
         }
         for value in ["", "+1", "1.0", "1x", "true", " 1"] {
-            assert_eq!(parse_type29_boolean(value), None, "{value}");
+            assert_eq!(
+                parse_confirmed_boolean(value, ConfirmedBooleanKind::General),
+                None,
+                "{value}"
+            );
+        }
+
+        for (value, expected) in [
+            ("0", false),
+            ("1", true),
+            ("255", true),
+            ("256", false),
+            ("-256", false),
+            ("257", true),
+        ] {
+            assert_eq!(
+                parse_confirmed_boolean(value, ConfirmedBooleanKind::Stored)
+                    .map(|parsed| parsed.enabled),
+                Some(expected),
+                "{value}"
+            );
         }
 
         let document = DocumentData::parse(
@@ -1236,6 +1354,170 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("'+1'"))
+        );
+    }
+
+    #[test]
+    fn verified_boolean_field_classification_covers_both_families_and_excludes_replaceable() {
+        for (file, columns, kind) in [
+            (
+                "missiles",
+                &["explosion", "nomultishot"][..],
+                ConfirmedBooleanKind::General,
+            ),
+            (
+                "monstats",
+                &[
+                    "enabled",
+                    "rangedtype",
+                    "placespawn",
+                    "setboss",
+                    "bossxfer",
+                    "isspawn",
+                    "ismelee",
+                    "npc",
+                    "zoo",
+                    "cannotdesecrate",
+                ][..],
+                ConfirmedBooleanKind::General,
+            ),
+            (
+                "states",
+                &[
+                    "remhit",
+                    "nosend",
+                    "transform",
+                    "aura",
+                    "curable",
+                    "curse",
+                    "active",
+                    "restrict",
+                    "notondead",
+                ][..],
+                ConfirmedBooleanKind::General,
+            ),
+            (
+                "misc",
+                &["autobelt", "multibuy"][..],
+                ConfirmedBooleanKind::Stored,
+            ),
+            ("states", &["canstack"][..], ConfirmedBooleanKind::Stored),
+            (
+                "superuniques",
+                &["autopos", "stacks"][..],
+                ConfirmedBooleanKind::Stored,
+            ),
+            (
+                "weapons",
+                &["1or2handed", "2handed"][..],
+                ConfirmedBooleanKind::Stored,
+            ),
+        ] {
+            for column in columns {
+                assert_eq!(
+                    confirmed_boolean_kind(file, column),
+                    Some(kind),
+                    "{file}.{column}"
+                );
+            }
+        }
+        assert_eq!(confirmed_boolean_kind("superuniques", "replaceable"), None);
+    }
+
+    #[test]
+    fn verified_boolean_diagnostics_bypass_i64_limits_and_replaceable_is_ignored() {
+        let field = |name: &str, type_name| SchemaField {
+            name: name.to_string(),
+            description: None,
+            field_type: Some(FieldType {
+                type_name,
+                data_length: 0,
+                mem_size: 0,
+                file: None,
+                field: None,
+                resolver: ReferenceResolver::default(),
+                unknown_policy: ReferenceUnknownPolicy::default(),
+            }),
+            alt_names: vec![],
+            append_field: None,
+            table: None,
+            unique: false,
+        };
+        let values = [
+            "0",
+            "1",
+            "2",
+            "3",
+            "255",
+            "256",
+            "-1",
+            "-256",
+            "4294967296",
+            "184467440737095516160000000000000000000000000000000000000000",
+            "true",
+            "false",
+            "+1",
+            " 1",
+            "1 ",
+        ];
+        let mut schema = Schema::default();
+        schema.files.insert(
+            "monstats".to_string(),
+            SchemaFile {
+                fields: vec![field("enabled", FieldTypeName::Int)],
+                ..Default::default()
+            },
+        );
+        schema.files.insert(
+            "misc".to_string(),
+            SchemaFile {
+                fields: vec![field("autobelt", FieldTypeName::Int)],
+                ..Default::default()
+            },
+        );
+        schema.files.insert(
+            "superuniques".to_string(),
+            SchemaFile {
+                fields: vec![field("replaceable", FieldTypeName::Boolean)],
+                ..Default::default()
+            },
+        );
+
+        for file in ["monstats", "misc"] {
+            let header = if file == "monstats" {
+                "enabled"
+            } else {
+                "autobelt"
+            };
+            let document = DocumentData::parse(&format!("{header}\n{}", values.join("\n")), '\t');
+            let diagnostics =
+                validate_document(file, &document, Some(&schema), &SymbolIndex::new());
+            assert_eq!(diagnostics.len(), 5, "{file}: {diagnostics:#?}");
+            for value in ["true", "false", "+1", " 1", "1 "] {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.message.contains(value)),
+                    "{file}:{value}: {diagnostics:#?}"
+                );
+            }
+            assert!(diagnostics.iter().all(|diagnostic| {
+                diagnostic.message.contains("number format accepted")
+                    && diagnostic
+                        .message
+                        .contains("0 to turn it off or 1 to turn it on")
+            }));
+        }
+
+        let replaceable = DocumentData::parse("replaceable\n2\ntrue\n-1", '\t');
+        assert!(
+            validate_document(
+                "superuniques",
+                &replaceable,
+                Some(&schema),
+                &SymbolIndex::new()
+            )
+            .is_empty()
         );
     }
 

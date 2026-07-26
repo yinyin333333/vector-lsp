@@ -116,7 +116,7 @@
         setDescription(
             "missiles",
             name,
-            "Numeric 0 means false. Any numeric nonzero value means true, including negative values."
+            "Use 0 to turn this off or 1 to turn it on. Other integers are accepted; hover over a value to see how the game treats it."
         );
     });
     setDescription(

@@ -123,7 +123,9 @@ pub const CATALOG_KEYS: &[&str] = &[
     "hover.unknown_property_stat_noeffect",
     "hover.range_valid",
     "hover.reference_resolved",
-    "hover.boolean_value",
+    "hover.boolean_on",
+    "hover.boolean_off",
+    "hover.boolean_off_recommendation",
     "hover.game_version",
     "hover.game_version_unselected",
     "hover.hit_summon",
@@ -642,6 +644,9 @@ fn catalog_template(locale: Locale, key: &str) -> String {
     if let Some(template) = operational_log_template(locale, key) {
         return template;
     }
+    if let Some(template) = boolean_template(locale, key) {
+        return template.to_string();
+    }
     match locale {
         Locale::EnUs => english(key).to_string(),
         Locale::KoKr => korean(key).to_string(),
@@ -657,6 +662,134 @@ fn catalog_template(locale: Locale, key: &str) -> String {
         Locale::PtBr => brazilian_portuguese(key).to_string(),
         Locale::RuRu => russian(key).to_string(),
     }
+}
+
+fn boolean_template(locale: Locale, key: &str) -> Option<&'static str> {
+    Some(match (locale, key) {
+        (Locale::EnUs, "diag.boolean.type29_invalid") => {
+            "'{value}' is not a number format accepted in this field. Enter 0 to turn it off or 1 to turn it on."
+        }
+        (Locale::EnUs, "hover.boolean_on") => "The current value is treated as on by the game.",
+        (Locale::EnUs, "hover.boolean_off") => "The current value is treated as off by the game.",
+        (Locale::EnUs, "hover.boolean_off_recommendation") => {
+            "The current value is treated as off by the game. Enter 1 to turn it on."
+        }
+
+        (Locale::KoKr, "diag.boolean.type29_invalid") => {
+            "'{value}'는 이 칸에서 사용할 수 있는 숫자 형식이 아닙니다. 끄려면 0, 켜려면 1을 입력하세요."
+        }
+        (Locale::KoKr, "hover.boolean_on") => "현재 값은 게임에서 켜짐으로 처리됩니다.",
+        (Locale::KoKr, "hover.boolean_off") => "현재 값은 게임에서 꺼짐으로 처리됩니다.",
+        (Locale::KoKr, "hover.boolean_off_recommendation") => {
+            "현재 값은 게임에서 꺼짐으로 처리됩니다. 켜려면 1을 입력하세요."
+        }
+
+        (Locale::ZhCn, "diag.boolean.type29_invalid") => {
+            "“{value}”不是此字段可接受的数字格式。要关闭请输入 0，要开启请输入 1。"
+        }
+        (Locale::ZhCn, "hover.boolean_on") => "当前值在游戏中会被视为开启。",
+        (Locale::ZhCn, "hover.boolean_off") => "当前值在游戏中会被视为关闭。",
+        (Locale::ZhCn, "hover.boolean_off_recommendation") => {
+            "当前值在游戏中会被视为关闭。要开启请输入 1。"
+        }
+
+        (Locale::ZhTw, "diag.boolean.type29_invalid") => {
+            "「{value}」不是此欄位可接受的數字格式。若要關閉請輸入 0，若要開啟請輸入 1。"
+        }
+        (Locale::ZhTw, "hover.boolean_on") => "目前值在遊戲中會被視為開啟。",
+        (Locale::ZhTw, "hover.boolean_off") => "目前值在遊戲中會被視為關閉。",
+        (Locale::ZhTw, "hover.boolean_off_recommendation") => {
+            "目前值在遊戲中會被視為關閉。若要開啟請輸入 1。"
+        }
+
+        (Locale::DeDe, "diag.boolean.type29_invalid") => {
+            "„{value}“ ist kein Zahlenformat, das in diesem Feld akzeptiert wird. Geben Sie 0 zum Ausschalten oder 1 zum Einschalten ein."
+        }
+        (Locale::DeDe, "hover.boolean_on") => {
+            "Der aktuelle Wert wird vom Spiel als eingeschaltet behandelt."
+        }
+        (Locale::DeDe, "hover.boolean_off") => {
+            "Der aktuelle Wert wird vom Spiel als ausgeschaltet behandelt."
+        }
+        (Locale::DeDe, "hover.boolean_off_recommendation") => {
+            "Der aktuelle Wert wird vom Spiel als ausgeschaltet behandelt. Geben Sie zum Einschalten 1 ein."
+        }
+
+        (Locale::EsEs, "diag.boolean.type29_invalid") => {
+            "'{value}' no tiene un formato numérico aceptado en este campo. Introduce 0 para desactivarlo o 1 para activarlo."
+        }
+        (Locale::EsEs, "hover.boolean_on") => "El juego trata el valor actual como activado.",
+        (Locale::EsEs, "hover.boolean_off") => "El juego trata el valor actual como desactivado.",
+        (Locale::EsEs, "hover.boolean_off_recommendation") => {
+            "El juego trata el valor actual como desactivado. Introduce 1 para activarlo."
+        }
+
+        (Locale::FrFr, "diag.boolean.type29_invalid") => {
+            "« {value} » n’est pas un format numérique accepté dans ce champ. Saisissez 0 pour désactiver ou 1 pour activer."
+        }
+        (Locale::FrFr, "hover.boolean_on") => "Le jeu traite la valeur actuelle comme activée.",
+        (Locale::FrFr, "hover.boolean_off") => "Le jeu traite la valeur actuelle comme désactivée.",
+        (Locale::FrFr, "hover.boolean_off_recommendation") => {
+            "Le jeu traite la valeur actuelle comme désactivée. Saisissez 1 pour l’activer."
+        }
+
+        (Locale::ItIt, "diag.boolean.type29_invalid") => {
+            "'{value}' non è un formato numerico accettato in questo campo. Inserisci 0 per disattivare o 1 per attivarlo."
+        }
+        (Locale::ItIt, "hover.boolean_on") => "Il gioco considera attivato il valore corrente.",
+        (Locale::ItIt, "hover.boolean_off") => "Il gioco considera disattivato il valore corrente.",
+        (Locale::ItIt, "hover.boolean_off_recommendation") => {
+            "Il gioco considera disattivato il valore corrente. Inserisci 1 per attivarlo."
+        }
+
+        (Locale::PlPl, "diag.boolean.type29_invalid") => {
+            "„{value}” nie ma formatu liczbowego akceptowanego w tym polu. Wpisz 0, aby wyłączyć, lub 1, aby włączyć."
+        }
+        (Locale::PlPl, "hover.boolean_on") => "Gra traktuje bieżącą wartość jako włączoną.",
+        (Locale::PlPl, "hover.boolean_off") => "Gra traktuje bieżącą wartość jako wyłączoną.",
+        (Locale::PlPl, "hover.boolean_off_recommendation") => {
+            "Gra traktuje bieżącą wartość jako wyłączoną. Wpisz 1, aby włączyć."
+        }
+
+        (Locale::EsMx, "diag.boolean.type29_invalid") => {
+            "'{value}' no tiene un formato numérico aceptado en este campo. Ingresa 0 para desactivarlo o 1 para activarlo."
+        }
+        (Locale::EsMx, "hover.boolean_on") => "El juego trata el valor actual como activado.",
+        (Locale::EsMx, "hover.boolean_off") => "El juego trata el valor actual como desactivado.",
+        (Locale::EsMx, "hover.boolean_off_recommendation") => {
+            "El juego trata el valor actual como desactivado. Ingresa 1 para activarlo."
+        }
+
+        (Locale::JaJp, "diag.boolean.type29_invalid") => {
+            "「{value}」は、このフィールドで使用できる数値形式ではありません。オフにするには 0、オンにするには 1 を入力してください。"
+        }
+        (Locale::JaJp, "hover.boolean_on") => "現在の値はゲームでオンとして扱われます。",
+        (Locale::JaJp, "hover.boolean_off") => "現在の値はゲームでオフとして扱われます。",
+        (Locale::JaJp, "hover.boolean_off_recommendation") => {
+            "現在の値はゲームでオフとして扱われます。オンにするには 1 を入力してください。"
+        }
+
+        (Locale::PtBr, "diag.boolean.type29_invalid") => {
+            "'{value}' não está em um formato numérico aceito neste campo. Digite 0 para desativar ou 1 para ativar."
+        }
+        (Locale::PtBr, "hover.boolean_on") => "O jogo trata o valor atual como ativado.",
+        (Locale::PtBr, "hover.boolean_off") => "O jogo trata o valor atual como desativado.",
+        (Locale::PtBr, "hover.boolean_off_recommendation") => {
+            "O jogo trata o valor atual como desativado. Digite 1 para ativar."
+        }
+
+        (Locale::RuRu, "diag.boolean.type29_invalid") => {
+            "«{value}» имеет формат числа, который не принимается в этом поле. Введите 0, чтобы выключить, или 1, чтобы включить."
+        }
+        (Locale::RuRu, "hover.boolean_on") => "Игра обрабатывает текущее значение как включённое.",
+        (Locale::RuRu, "hover.boolean_off") => {
+            "Игра обрабатывает текущее значение как выключенное."
+        }
+        (Locale::RuRu, "hover.boolean_off_recommendation") => {
+            "Игра обрабатывает текущее значение как выключенное. Введите 1, чтобы включить."
+        }
+        _ => return None,
+    })
 }
 
 /// Operational logs are keyed just like diagnostics, but share a compact
@@ -5422,6 +5555,69 @@ mod tests {
         let values = args([("value", json!("Save Bits")), ("column", json!("itemtype"))]);
         assert!(localize(Locale::KoKr, "diag.float.invalid", &values).contains("Save Bits"));
         assert!(localize(Locale::ZhCn, "diag.float.invalid", &values).contains("itemtype"));
+    }
+
+    #[test]
+    fn boolean_messages_are_localized_friendly_and_hide_implementation_details() {
+        let forbidden = [
+            "type-29",
+            "raw byte",
+            "raw-byte",
+            "low byte",
+            "least-significant byte",
+            "u32",
+            "bitfield",
+            "serialization",
+            "storage layout",
+            "signed decimal integer",
+        ];
+        let english = localize(
+            Locale::EnUs,
+            "diag.boolean.type29_invalid",
+            &args([("value", json!("true")), ("column", json!("enabled"))]),
+        );
+        for locale in Locale::ALL {
+            let diagnostic = localize(
+                locale,
+                "diag.boolean.type29_invalid",
+                &args([("value", json!("true")), ("column", json!("enabled"))]),
+            );
+            let on = localize(locale, "hover.boolean_on", &args([]));
+            let off = localize(locale, "hover.boolean_off", &args([]));
+            let recommendation = localize(locale, "hover.boolean_off_recommendation", &args([]));
+            let number_format = match locale {
+                Locale::EnUs => "number format",
+                Locale::KoKr => "숫자 형식",
+                Locale::ZhCn => "数字格式",
+                Locale::ZhTw => "數字格式",
+                Locale::DeDe => "Zahlenformat",
+                Locale::EsEs | Locale::EsMx | Locale::PtBr => "formato numérico",
+                Locale::FrFr => "format numérique",
+                Locale::ItIt => "formato numerico",
+                Locale::PlPl => "formatu liczbowego",
+                Locale::JaJp => "数値形式",
+                Locale::RuRu => "формат числа",
+            };
+            assert!(diagnostic.contains("true"), "{locale:?}: {diagnostic}");
+            assert!(
+                diagnostic.contains(number_format),
+                "{locale:?}: {diagnostic}"
+            );
+            assert!(diagnostic.contains('0') && diagnostic.contains('1'));
+            assert_ne!(on, off, "{locale:?}");
+            assert!(recommendation.contains('1'), "{locale:?}: {recommendation}");
+            let visible = format!("{diagnostic}\n{on}\n{off}\n{recommendation}").to_lowercase();
+            for term in forbidden {
+                assert!(!visible.contains(term), "{locale:?}:{term}: {visible}");
+            }
+            if locale != Locale::EnUs {
+                assert_ne!(diagnostic, english, "{locale:?}");
+                assert_ne!(
+                    on, "The current value is treated as on by the game.",
+                    "{locale:?}"
+                );
+            }
+        }
     }
 
     #[test]
