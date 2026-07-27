@@ -1921,6 +1921,39 @@ mod tests {
     }
 
     #[test]
+    fn loaded_1_13_monequip_byte_fields_accept_signed_decimals_without_boolean_warnings() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("1.13").join("schema");
+        let schema = find_loader("d2rdoc", "1.13".to_string(), Some(contrib))
+            .unwrap()
+            .load(Some(&schema_dir))
+            .unwrap();
+
+        for (field, mem_size) in [("oninit", 8), ("level", 16), ("mod1", 8)] {
+            let field_type = schema
+                .find_field("monequip", field)
+                .and_then(|field| field.field_type.as_ref())
+                .expect("loaded 1.13 monequip field type");
+            assert_eq!(field_type.type_name, FieldTypeName::Int, "{field}");
+            assert_eq!(field_type.mem_size, mem_size, "{field}");
+        }
+
+        let source = DocumentData::parse("oninit\n0\n1\n2\n255\n-1\n256\n", '\t');
+        assert!(
+            validate_document("monequip", &source, Some(&schema), &SymbolIndex::new()).is_empty(),
+            "1.13 oninit is a byte consumed as zero/nonzero, not a canonical Boolean"
+        );
+
+        let invalid = DocumentData::parse("oninit\nnot-a-number\n", '\t');
+        let diagnostics =
+            validate_document("monequip", &invalid, Some(&schema), &SymbolIndex::new());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.contains("standard integer"));
+    }
+
+    #[test]
     fn loaded_2_4_schema_uses_text_keys_and_monprop_id_reference() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("contrib")
@@ -2022,6 +2055,42 @@ mod tests {
                     .map(|field| field.type_name.clone()),
                 Some(expected),
                 "{version} MonSeq.sequence must retain its existing declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn monequip_oninit_patch_is_limited_to_1_13() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+
+        for (version, expected_type, expected_mem_size, accepts_two) in [
+            // The ignored upstream 2.4 asset still spells this `bool`, which
+            // the schema model preserves as Unknown.  This test pins that
+            // existing declaration and its absence of a type diagnostic.
+            ("2.4", FieldTypeName::Unknown, 0, true),
+            ("3.1", FieldTypeName::Int, 8, true),
+            ("3.2", FieldTypeName::Int, 8, true),
+        ] {
+            let schema_dir = contrib.join(version).join("schema");
+            let schema = find_loader("d2rdoc", version.to_string(), Some(contrib.clone()))
+                .unwrap()
+                .load(Some(&schema_dir))
+                .unwrap();
+            let field_type = schema
+                .find_field("monequip", "oninit")
+                .and_then(|field| field.field_type.as_ref())
+                .expect("loaded monequip.oninit type");
+            assert_eq!(field_type.type_name, expected_type, "{version}");
+            assert_eq!(field_type.mem_size, expected_mem_size, "{version}");
+
+            let source = DocumentData::parse("oninit\n2\n", '\t');
+            assert_eq!(
+                validate_document("monequip", &source, Some(&schema), &SymbolIndex::new())
+                    .is_empty(),
+                accepts_two,
+                "{version} must retain its pre-existing monequip.oninit diagnostic behavior"
             );
         }
     }

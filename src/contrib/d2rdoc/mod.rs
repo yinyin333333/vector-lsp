@@ -133,23 +133,28 @@ impl SchemaLoader for D2rDocLoader {
 }
 
 fn patch_1_13_reference_semantics(schema: &mut Schema) {
-    let Some(monprop) = schema.files.get_mut("MonProp") else {
-        return;
-    };
-    let Some(id) = monprop
-        .fields
-        .iter_mut()
-        .find(|field| field.name.eq_ignore_ascii_case("Id"))
-    else {
-        return;
-    };
-    if let Some(field_type) = id.field_type.as_mut() {
-        field_type.type_name = FieldTypeName::String;
+    if let Some(id) = schema_field_mut(schema, "monprop", "Id") {
+        if let Some(field_type) = id.field_type.as_mut() {
+            field_type.type_name = FieldTypeName::String;
+        }
+        id.description = Some(
+            "Defines the unique MonProp name referenced by the MonProp field in monstats.txt"
+                .to_string(),
+        );
     }
-    id.description = Some(
-        "Defines the unique MonProp name referenced by the MonProp field in monstats.txt"
-            .to_string(),
-    );
+
+    // D2Common's 1.13 loader stores these as uint8_t/uint16_t fields.  oninit
+    // is consumed as zero/nonzero, so it must not use the schema Boolean
+    // validator, which accepts only the canonical spellings 0 and 1.
+    for (field, mem_size) in [("oninit", 8), ("level", 16), ("mod#", 8)] {
+        if let Some(field) = schema_field_mut(schema, "monequip", field) {
+            if let Some(field_type) = field.field_type.as_mut() {
+                field_type.type_name = FieldTypeName::Int;
+                field_type.data_length = 0;
+                field_type.mem_size = mem_size;
+            }
+        }
+    }
 }
 
 fn patch_2_4_reference_semantics(schema: &mut Schema) {
