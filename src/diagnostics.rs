@@ -1889,6 +1889,38 @@ mod tests {
     }
 
     #[test]
+    fn loaded_1_13_monprop_ids_are_name_keys_referenced_by_monstats() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("1.13").join("schema");
+        let schema = find_loader("d2rdoc", "1.13".to_string(), Some(contrib))
+            .unwrap()
+            .load(Some(&schema_dir))
+            .unwrap();
+
+        let id_type = schema
+            .find_field("monprop", "Id")
+            .and_then(|field| field.field_type.as_ref())
+            .expect("loaded MonProp.Id type");
+        assert_eq!(id_type.type_name, FieldTypeName::String);
+
+        let monprop_reference = schema
+            .find_field("monstats", "MonProp")
+            .and_then(|field| field.field_type.as_ref())
+            .expect("loaded MonStats.MonProp type");
+        assert_eq!(monprop_reference.type_name, FieldTypeName::Reference);
+        assert_eq!(monprop_reference.file.as_deref(), Some("MonProp"));
+        assert_eq!(monprop_reference.field.as_deref(), Some("Id"));
+
+        let source = DocumentData::parse("Id\nbaboon6\nirongolem\n", '\t');
+        assert!(
+            validate_document("monprop", &source, Some(&schema), &SymbolIndex::new()).is_empty(),
+            "stock 1.13c MonProp name keys must not receive integer diagnostics"
+        );
+    }
+
+    #[test]
     fn loaded_3_2_skills_range_uses_scoped_space_padded_fixed4_codes() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("contrib")

@@ -2256,6 +2256,23 @@ function validate(ctx: PluginContext): string[] {
         .await
     }
 
+    async fn run_plugin_localized(
+        plugin_name: &str,
+        file: &str,
+        fx: &PluginFixture,
+        locale: Locale,
+    ) -> Vec<Diagnostic> {
+        let host = PluginHost::new(vec![plugin_path(plugin_name)]).unwrap();
+        let doc = fx.docs.get(file).expect("test document should exist");
+        host.run_localized(
+            build_context(file, doc),
+            Arc::clone(&fx.index),
+            Arc::clone(&fx.snapshot),
+            locale,
+        )
+        .await
+    }
+
     fn range(diag: &Diagnostic) -> (u32, u32, u32) {
         (
             diag.range.start.line,
@@ -3586,9 +3603,9 @@ function validate(ctx: PluginContext): string[] {
     }
 
     #[tokio::test]
-    async fn skill_param_aliases_are_explained_only_for_3_1_and_3_2_skill_scopes() {
+    async fn skill_param_aliases_are_explained_for_confirmed_skill_scope_versions() {
         fn versioned_fixture(file: &str, text: &str, version: &str) -> PluginFixture {
-            let skillcalc = "code\npar1\npar2\npa10\npa11\npa12\npa13\npa14\npa15\npa16\npa17\npa18\npa19\npa20\n";
+            let skillcalc = "code\npar1\npar2\npar3\npa10\npa11\npa12\npa13\npa14\npa15\npa16\npa17\npa18\npa19\npa20\n";
             let mut fx = fixture(&[("skillcalc", skillcalc), (file, text)]);
             Arc::get_mut(&mut fx.snapshot)
                 .expect("unshared fixture snapshot")
@@ -3645,6 +3662,80 @@ function validate(ctx: PluginContext): string[] {
         let uppercase = versioned_fixture("skills", "skill\tcalc1\nrow\tPAR10\n", "3.2");
         let uppercase_diags = run_plugin("calcCheck.ts", "skills", &uppercase).await;
         assert_code(&uppercase_diags[0], "unknownIdentifier");
+
+        let legacy_113c = versioned_fixture("skills", "skill\tcalc1\nrow\tpar34\n", "1.13c");
+        let legacy_113c_diags = run_plugin("calcCheck.ts", "skills", &legacy_113c).await;
+        assert_eq!(legacy_113c_diags.len(), 1, "{legacy_113c_diags:#?}");
+        let legacy_113c_diag = &legacy_113c_diags[0];
+        assert_eq!(legacy_113c_diag.severity, Some(DiagnosticSeverity::WARNING));
+        assert_code(legacy_113c_diag, "calc.skill-param-alias");
+        assert_eq!(data_str(legacy_113c_diag, "kind"), "identifier-alias");
+        assert_eq!(data_str(legacy_113c_diag, "scope"), "Skill scope BBE");
+        assert_eq!(data_str(legacy_113c_diag, "identifier"), "par34");
+        assert_eq!(data_str(legacy_113c_diag, "interpretedAs"), "par3");
+        assert_eq!(
+            data_str(legacy_113c_diag, "lookup"),
+            "first-four-byte exact case-sensitive"
+        );
+
+        let legacy_113c_korean =
+            run_plugin_localized("calcCheck.ts", "skills", &legacy_113c, Locale::KoKr).await;
+        assert_eq!(legacy_113c_korean.len(), 1, "{legacy_113c_korean:#?}");
+        let korean_diag = &legacy_113c_korean[0];
+        assert!(
+            korean_diag.message.contains("par34"),
+            "{}",
+            korean_diag.message
+        );
+        assert!(
+            korean_diag.message.contains("par3"),
+            "{}",
+            korean_diag.message
+        );
+        assert!(
+            !korean_diag.message.contains("{\"identifier\""),
+            "{}",
+            korean_diag.message
+        );
+        assert!(
+            !korean_diag.message.contains("올바른 식별자: par34"),
+            "{}",
+            korean_diag.message
+        );
+        assert_eq!(data_str(korean_diag, "identifier"), "par34");
+        assert_eq!(data_str(korean_diag, "interpretedAs"), "par3");
+        assert_eq!(
+            korean_diag.data.as_ref().unwrap()["messageArgs"]["alias"],
+            "par34"
+        );
+        assert_eq!(
+            korean_diag.data.as_ref().unwrap()["messageArgs"]["identifier"],
+            "par3"
+        );
+        let guidance = korean_diag.data.as_ref().unwrap()["localizedGuidance"]
+            .as_str()
+            .expect("localized guidance");
+        assert!(guidance.contains("`par34`"), "{guidance}");
+        assert!(guidance.contains("`par3`"), "{guidance}");
+        assert!(!guidance.contains("`par3` 참조에는 `par3`"), "{guidance}");
+
+        let unknown_113c = versioned_fixture("skills", "skill\tcalc1\nrow\tnope5\n", "1.13c");
+        let unknown_113c_diags = run_plugin("calcCheck.ts", "skills", &unknown_113c).await;
+        assert_eq!(unknown_113c_diags.len(), 1, "{unknown_113c_diags:#?}");
+        assert_eq!(
+            unknown_113c_diags[0].severity,
+            Some(DiagnosticSeverity::ERROR)
+        );
+        assert_code(&unknown_113c_diags[0], "unknownIdentifier");
+
+        let uppercase_113c = versioned_fixture("skills", "skill\tcalc1\nrow\tPAR34\n", "1.13c");
+        let uppercase_113c_diags = run_plugin("calcCheck.ts", "skills", &uppercase_113c).await;
+        assert_eq!(uppercase_113c_diags.len(), 1, "{uppercase_113c_diags:#?}");
+        assert_eq!(
+            uppercase_113c_diags[0].severity,
+            Some(DiagnosticSeverity::ERROR)
+        );
+        assert_code(&uppercase_113c_diags[0], "unknownIdentifier");
 
         let missile = fixture(&[
             ("misscalc", "code\npar1\n"),

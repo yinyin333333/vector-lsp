@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 
 use crate::runtime::ScriptRuntime;
 use crate::schema::registry::LoaderEntry;
-use crate::schema::{ReferenceResolver, Schema, SchemaFile, SchemaLoader};
+use crate::schema::{FieldTypeName, ReferenceResolver, Schema, SchemaFile, SchemaLoader};
 
 /// Variant names that cannot be used as `schema_variant` values because they
 /// conflict with reserved subdirectory names in the contrib layout.
@@ -106,6 +106,9 @@ impl SchemaLoader for D2rDocLoader {
         let patches_dir = self.effective_patches_dir();
         let mut rt = ScriptRuntime::new()?;
         let mut schema = load_js(&mut rt, &schema_dir, patches_dir.as_deref())?;
+        if self.variant == "1.13" {
+            patch_1_13_reference_semantics(&mut schema);
+        }
         if self.variant == "3.2" {
             patch_3_2_reference_semantics(&mut schema);
         }
@@ -122,6 +125,26 @@ impl SchemaLoader for D2rDocLoader {
         }
         dirs
     }
+}
+
+fn patch_1_13_reference_semantics(schema: &mut Schema) {
+    let Some(monprop) = schema.files.get_mut("MonProp") else {
+        return;
+    };
+    let Some(id) = monprop
+        .fields
+        .iter_mut()
+        .find(|field| field.name.eq_ignore_ascii_case("Id"))
+    else {
+        return;
+    };
+    if let Some(field_type) = id.field_type.as_mut() {
+        field_type.type_name = FieldTypeName::String;
+    }
+    id.description = Some(
+        "Defines the unique MonProp name referenced by the MonProp field in monstats.txt"
+            .to_string(),
+    );
 }
 
 fn patch_3_2_reference_semantics(schema: &mut Schema) {
