@@ -9,9 +9,9 @@ use tower_lsp::lsp_types::Url;
 
 use crate::document::DocumentData;
 use crate::schema::{Schema, format_description};
-use crate::source_selection::{
-    EffectiveSource, effective_workspace_sources, effective_workspace_sources_with_fallback,
-};
+#[cfg(test)]
+use crate::source_selection::effective_workspace_sources;
+use crate::source_selection::{EffectiveSource, effective_workspace_sources_with_fallback};
 use crate::workspace::fixed4_key;
 
 // ---------------------------------------------------------------------------
@@ -112,6 +112,7 @@ impl WorkspaceIndex {
 /// Build a `WorkspaceIndex` from open documents and the file cache.
 /// Open documents shadow file-cache entries for the same stem.
 /// Returns an `Arc` so the index can be shared cheaply across multiple plugin calls.
+#[cfg(test)]
 pub fn build_workspace_index(
     open_docs: &HashMap<Url, Arc<DocumentData>>,
     file_cache: &HashMap<PathBuf, Arc<DocumentData>>,

@@ -89,10 +89,6 @@ impl D2rDocLoader {
 }
 
 impl SchemaLoader for D2rDocLoader {
-    fn id(&self) -> &'static str {
-        "d2rdoc"
-    }
-
     fn load(&self, explicit_dir: Option<&Path>) -> Result<Schema> {
         if RESERVED_VARIANT_NAMES.contains(&self.variant.as_str()) {
             anyhow::bail!(

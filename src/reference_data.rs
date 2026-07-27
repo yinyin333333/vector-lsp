@@ -86,6 +86,7 @@ struct FileManifest {
 
 #[derive(Clone)]
 pub struct ReferenceDataset {
+    #[cfg(test)]
     pub schema_variant: String,
     pub game_version: String,
     pub canonical_sha256: String,
@@ -215,6 +216,7 @@ pub(crate) fn load_reference_dataset(
     );
 
     Ok(ReferenceDataset {
+        #[cfg(test)]
         schema_variant: dataset.schema_variant.clone(),
         game_version: dataset.game_version.clone(),
         canonical_sha256: dataset.canonical_sha256.clone(),

@@ -27,6 +27,7 @@ pub enum Locale {
 }
 
 impl Locale {
+    #[cfg(test)]
     pub const ALL: [Self; 13] = [
         Self::EnUs,
         Self::ZhTw,
@@ -91,6 +92,7 @@ impl Locale {
 /// Public, product-authored core keys. Bundled plugin keys are listed
 /// separately below; third-party plugin content remains compatibility data
 /// owned by its plugin author.
+#[cfg(test)]
 pub const CATALOG_KEYS: &[&str] = &[
     "diag.duplicate_unique",
     "diag.reference.unresolved",
@@ -5266,6 +5268,7 @@ fn mexican_spanish(key: &str) -> &'static str {
 }
 
 /// An enumerated catalog is exposed for parity tests and build-time auditing.
+#[cfg(test)]
 pub fn catalog(locale: Locale) -> Vec<(&'static str, String)> {
     CATALOG_KEYS
         .iter()
@@ -5293,6 +5296,7 @@ pub fn placeholder_names(template: &str) -> std::collections::BTreeSet<String> {
     names
 }
 
+#[cfg(test)]
 pub fn catalog_parity_errors() -> Vec<String> {
     let en = catalog(Locale::EnUs);
     let en_keys = en

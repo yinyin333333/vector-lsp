@@ -12,9 +12,10 @@ use crate::document::DocumentData;
 use crate::i18n::{self, Locale};
 use crate::runtime::{ScriptRuntime, WorkspaceFileSnapshot, WorkspaceIndex, WorkspaceSourceInfo};
 use crate::schema::Schema;
+#[cfg(test)]
+use crate::source_selection::effective_workspace_sources;
 use crate::source_selection::{
-    EffectiveSource, SourceKind, effective_workspace_sources,
-    effective_workspace_sources_with_fallback,
+    EffectiveSource, SourceKind, effective_workspace_sources_with_fallback,
 };
 
 // ---------------------------------------------------------------------------
@@ -510,6 +511,7 @@ impl PluginHost {
     }
 
     /// Run all `validate` plugin functions and return any diagnostics.
+    #[cfg(test)]
     pub async fn run(
         &self,
         ctx: String,
@@ -561,6 +563,7 @@ impl PluginHost {
     }
 
     /// Run all `hover` plugin functions and return the first non-null markdown content.
+    #[cfg(test)]
     pub async fn hover(
         &self,
         ctx: Value,
@@ -1192,6 +1195,7 @@ pub fn build_hover_context(
 /// Build a per-file snapshot for plugin ops.
 /// Open documents shadow file-cache entries for the same stem.
 /// No serialization happens here — ops serialize only the data they need on demand.
+#[cfg(test)]
 pub fn build_workspace_snapshot(
     open_docs: &HashMap<Url, Arc<DocumentData>>,
     file_cache: &HashMap<PathBuf, Arc<DocumentData>>,

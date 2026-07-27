@@ -30,6 +30,7 @@ pub fn validate_document(
     ))
 }
 
+#[cfg(test)]
 pub fn validate_document_for_version(
     file_stem: &str,
     doc: &DocumentData,
@@ -47,6 +48,7 @@ pub fn validate_document_for_version(
     ))
 }
 
+#[cfg(test)]
 fn legacy_schema_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
     for diagnostic in &mut diagnostics {
         if diagnostic
