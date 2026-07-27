@@ -1921,6 +1921,112 @@ mod tests {
     }
 
     #[test]
+    fn loaded_2_4_schema_uses_text_keys_and_monprop_id_reference() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("2.4").join("schema");
+        let schema = find_loader("d2rdoc", "2.4".to_string(), Some(contrib))
+            .unwrap()
+            .load(Some(&schema_dir))
+            .unwrap();
+
+        for (file, field) in [
+            ("shareditems", "TMogType"),
+            ("monstats", "Id"),
+            ("monseq", "sequence"),
+            ("automagic", "transformcolor"),
+        ] {
+            assert_eq!(
+                schema
+                    .find_field(file, field)
+                    .and_then(|field| field.field_type.as_ref())
+                    .map(|field| field.type_name.clone()),
+                Some(FieldTypeName::String),
+                "{file}.{field} must not be validated as an integer"
+            );
+        }
+
+        let monprop_id = schema
+            .find_field("monprop", "Id")
+            .and_then(|field| field.field_type.as_ref())
+            .expect("loaded MonProp.Id type");
+        assert_eq!(monprop_id.type_name, FieldTypeName::Reference);
+        assert_eq!(monprop_id.file.as_deref(), Some("monstats"));
+        assert_eq!(monprop_id.field.as_deref(), Some("Id"));
+
+        for (file, source) in [
+            ("shareditems", "TMogType\nxxx\nhax\n"),
+            ("monstats", "Id\nFallen\n"),
+            ("monseq", "sequence\ncharge\ncharge\n"),
+            ("automagic", "transformcolor\nred\n"),
+        ] {
+            let source = DocumentData::parse(source, '\t');
+            assert!(
+                validate_document(file, &source, Some(&schema), &SymbolIndex::new()).is_empty(),
+                "{file} textual values must not receive integer diagnostics"
+            );
+        }
+
+        let targets = schema.reference_targets();
+        let mut symbols = SymbolIndex::new();
+        let monstats = DocumentData::parse("Id\nFallen\n", '\t');
+        symbols.index_effective_document(
+            None,
+            "monstats",
+            &monstats,
+            &targets,
+            SourceKind::Bundled,
+            Some("2.4"),
+        );
+        let valid = DocumentData::parse("Id\nFallen\n", '\t');
+        assert!(validate_document("monprop", &valid, Some(&schema), &symbols).is_empty());
+
+        let missing = DocumentData::parse("Id\nMissing\n", '\t');
+        let diagnostics = validate_document("monprop", &missing, Some(&schema), &symbols);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diagnostics[0].message.contains("Missing"));
+        assert!(diagnostics[0].message.contains("monstats"));
+    }
+
+    #[test]
+    fn schema_2_4_text_key_declarations_do_not_change_other_d2r_schema_versions() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+
+        for version in ["1.13", "3.1", "3.2"] {
+            let schema_dir = contrib.join(version).join("schema");
+            let schema = find_loader("d2rdoc", version.to_string(), Some(contrib.clone()))
+                .unwrap()
+                .load(Some(&schema_dir))
+                .unwrap();
+            let expected = if version == "1.13" {
+                FieldTypeName::String
+            } else {
+                FieldTypeName::Text
+            };
+            assert_eq!(
+                schema
+                    .find_field("monstats", "Id")
+                    .and_then(|field| field.field_type.as_ref())
+                    .map(|field| field.type_name.clone()),
+                Some(expected.clone()),
+                "{version} MonStats.Id must retain its existing declaration"
+            );
+            assert_eq!(
+                schema
+                    .find_field("monseq", "sequence")
+                    .and_then(|field| field.field_type.as_ref())
+                    .map(|field| field.type_name.clone()),
+                Some(expected),
+                "{version} MonSeq.sequence must retain its existing declaration"
+            );
+        }
+    }
+
+    #[test]
     fn loaded_3_2_skills_range_uses_scoped_space_padded_fixed4_codes() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("contrib")

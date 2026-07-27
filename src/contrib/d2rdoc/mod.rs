@@ -5,7 +5,9 @@ use anyhow::{Result, anyhow};
 
 use crate::runtime::ScriptRuntime;
 use crate::schema::registry::LoaderEntry;
-use crate::schema::{FieldTypeName, ReferenceResolver, Schema, SchemaFile, SchemaLoader};
+use crate::schema::{
+    FieldTypeName, ReferenceResolver, Schema, SchemaField, SchemaFile, SchemaLoader,
+};
 
 /// Variant names that cannot be used as `schema_variant` values because they
 /// conflict with reserved subdirectory names in the contrib layout.
@@ -109,6 +111,9 @@ impl SchemaLoader for D2rDocLoader {
         if self.variant == "1.13" {
             patch_1_13_reference_semantics(&mut schema);
         }
+        if self.variant == "2.4" {
+            patch_2_4_reference_semantics(&mut schema);
+        }
         if self.variant == "3.2" {
             patch_3_2_reference_semantics(&mut schema);
         }
@@ -145,6 +150,47 @@ fn patch_1_13_reference_semantics(schema: &mut Schema) {
         "Defines the unique MonProp name referenced by the MonProp field in monstats.txt"
             .to_string(),
     );
+}
+
+fn patch_2_4_reference_semantics(schema: &mut Schema) {
+    for (file, field) in [
+        ("shareditems", "TMogType"),
+        ("monstats", "Id"),
+        ("monseq", "sequence"),
+        ("automagic", "transformcolor"),
+    ] {
+        if let Some(field) = schema_field_mut(schema, file, field) {
+            if let Some(field_type) = field.field_type.as_mut() {
+                field_type.type_name = FieldTypeName::String;
+            }
+        }
+    }
+
+    if let Some(monprop_id) = schema_field_mut(schema, "monprop", "Id") {
+        if let Some(field_type) = monprop_id.field_type.as_mut() {
+            field_type.type_name = FieldTypeName::Reference;
+            field_type.data_length = 47;
+            field_type.mem_size = 16;
+            field_type.file = Some("monstats".to_string());
+            field_type.field = Some("Id".to_string());
+        }
+    }
+}
+
+fn schema_field_mut<'a>(
+    schema: &'a mut Schema,
+    file_name: &str,
+    field_name: &str,
+) -> Option<&'a mut SchemaField> {
+    schema
+        .files
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case(file_name))
+        .and_then(|(_, file)| {
+            file.fields
+                .iter_mut()
+                .find(|field| field.name.eq_ignore_ascii_case(field_name))
+        })
 }
 
 fn patch_3_2_reference_semantics(schema: &mut Schema) {
