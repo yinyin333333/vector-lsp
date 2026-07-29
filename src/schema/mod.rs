@@ -245,8 +245,7 @@ impl Schema {
         if let Some(f) = sf.find_field(col_name) {
             return Some(f);
         }
-        let appended = sf.append_files.clone();
-        for stem in &appended {
+        for stem in &sf.append_files {
             if let Some(f) = self.find_field_inner(stem, col_name, visited) {
                 return Some(f);
             }

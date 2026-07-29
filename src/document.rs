@@ -52,6 +52,7 @@ impl DocumentData {
     /// Handles both LF and CRLF line endings (Rust's `str::lines` strips both).
     pub fn parse(text: &str, delimiter: char) -> Self {
         let mut line_iter = text.lines().enumerate();
+        let delimiter_utf16_len = delimiter.len_utf16() as u32;
 
         let headers = match line_iter.next() {
             Some((_, header_line)) => header_line
@@ -62,7 +63,7 @@ impl DocumentData {
                 return Self {
                     headers: vec![],
                     rows: vec![],
-                    delimiter_utf16_len: delimiter.len_utf16() as u32,
+                    delimiter_utf16_len,
                 };
             }
         };
@@ -78,7 +79,7 @@ impl DocumentData {
                     });
                     // LSP positions use UTF-16 code units for both field content and
                     // the delimiter that separates it from the following field.
-                    col_start += utf16_len(field) + delimiter.len_utf16() as u32;
+                    col_start += utf16_len(field) + delimiter_utf16_len;
                 }
                 Row {
                     cells,
@@ -90,7 +91,7 @@ impl DocumentData {
         Self {
             headers,
             rows,
-            delimiter_utf16_len: delimiter.len_utf16() as u32,
+            delimiter_utf16_len,
         }
     }
 
