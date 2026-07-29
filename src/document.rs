@@ -94,12 +94,6 @@ impl DocumentData {
         }
     }
 
-    /// Return the cell at (row_index, col_name), or None if out of bounds.
-    pub fn get_cell(&self, row_index: usize, col_name: &str) -> Option<&Cell> {
-        let col_index = self.headers.iter().position(|h| h == col_name)?;
-        self.rows.get(row_index)?.cells.get(col_index)
-    }
-
     /// Return the column index whose header starts at or before `character` in line 0,
     /// using the same "last winner" rule as `cell_at`. Returns None if headers is empty.
     pub fn header_at(&self, character: u32) -> Option<usize> {

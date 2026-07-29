@@ -19,8 +19,6 @@ use serde::Deserialize;
 /// and returns a fully-populated `Schema`. The driver is selected at startup by
 /// the `schema_loader` config key.
 pub trait SchemaLoader: Send + Sync {
-    /// Short identifier used in config to select this driver (e.g. `"d2rdoc"`).
-    fn id(&self) -> &'static str;
     /// Load a schema from `dir`, or auto-discover the schema directory if `None`.
     /// May block on IO.
     fn load(&self, dir: Option<&Path>) -> anyhow::Result<Schema>;
@@ -102,7 +100,15 @@ pub struct FieldType {
 /// Declares that this field's valid values come from an enum defined in another schema file.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppendField {
+    #[expect(
+        dead_code,
+        reason = "Bundled schema append metadata is retained for input-model fidelity."
+    )]
     pub file: String,
+    #[expect(
+        dead_code,
+        reason = "Bundled schema append metadata is retained for input-model fidelity."
+    )]
     pub field: String,
 }
 
@@ -118,6 +124,10 @@ pub struct SchemaField {
     #[serde(default)]
     pub alt_names: Vec<String>,
     /// If set, valid values for this field are drawn from the named enum table.
+    #[expect(
+        dead_code,
+        reason = "Bundled schema append metadata is retained for input-model fidelity."
+    )]
     pub append_field: Option<AppendField>,
     /// Enum table for `comment`-type fields in reference-only schema files.
     /// Each inner vec is [code, description].
@@ -132,14 +142,26 @@ pub struct SchemaField {
 #[serde(rename_all = "camelCase")]
 pub struct SchemaFile {
     /// Human-readable title (usually the filename).
+    #[expect(
+        dead_code,
+        reason = "Bundled schema presentation metadata is retained for input-model fidelity."
+    )]
     pub title: Option<String>,
     /// Human-readable overview of what this file controls.
+    #[expect(
+        dead_code,
+        reason = "Bundled schema presentation metadata is retained for input-model fidelity."
+    )]
     pub overview: Option<String>,
     /// If true, this entry is a reference table only and has no corresponding data file.
     #[serde(default)]
     pub guide_only: bool,
     /// Schema files whose fields are merged into this one for reference purposes.
     #[serde(default)]
+    #[expect(
+        dead_code,
+        reason = "Bundled schema reference metadata is retained for input-model fidelity."
+    )]
     pub reference_files: Vec<String>,
     /// Schema files whose fields are prepended to this file's field list.
     #[serde(default)]
@@ -149,11 +171,27 @@ pub struct SchemaFile {
     pub fields: Vec<SchemaField>,
     /// Columns that exist in the data file but are intentionally undocumented / ignored.
     #[serde(default)]
+    #[expect(
+        dead_code,
+        reason = "Bundled schema compatibility metadata is retained for input-model fidelity."
+    )]
     pub ignore_fields: Vec<String>,
+    #[expect(
+        dead_code,
+        reason = "Bundled schema compatibility metadata is retained for input-model fidelity."
+    )]
     pub code_dependency: Option<String>,
     #[serde(default)]
+    #[expect(
+        dead_code,
+        reason = "Bundled schema presentation metadata is retained for input-model fidelity."
+    )]
     pub not_searchable: bool,
     #[serde(default)]
+    #[expect(
+        dead_code,
+        reason = "Bundled schema presentation metadata is retained for input-model fidelity."
+    )]
     pub no_html: bool,
 }
 

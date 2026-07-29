@@ -30,6 +30,7 @@ pub fn validate_document(
     ))
 }
 
+#[cfg(test)]
 pub fn validate_document_for_version(
     file_stem: &str,
     doc: &DocumentData,
@@ -47,6 +48,7 @@ pub fn validate_document_for_version(
     ))
 }
 
+#[cfg(test)]
 fn legacy_schema_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
     for diagnostic in &mut diagnostics {
         if diagnostic
@@ -157,6 +159,33 @@ pub fn validate_document_for_locale(
                     character: cell_end,
                 },
             };
+
+            if let Some(kind) = confirmed_boolean_kind(file_stem, col_name) {
+                if cell.value.trim().is_empty() {
+                    continue;
+                }
+                if parse_confirmed_boolean(&cell.value, kind).is_none() {
+                    diags.push(i18n::localized_diagnostic(
+                        locale,
+                        "diag.boolean.type29_invalid",
+                        i18n::args([
+                            ("value", serde_json::json!(cell.value)),
+                            ("column", serde_json::json!(col_name)),
+                        ]),
+                        Diagnostic {
+                            range: cell_range,
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            source: Some("vector-lsp".into()),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                continue;
+            }
+
+            if is_excluded_boolean(file_stem, col_name) {
+                continue;
+            }
 
             match ft.type_name {
                 FieldTypeName::Reference => {
@@ -419,25 +448,6 @@ pub fn validate_document_for_locale(
                     if cell.value.trim().is_empty() {
                         continue;
                     }
-                    if is_confirmed_type29_boolean(file_stem, col_name) {
-                        if parse_type29_boolean(&cell.value).is_none() {
-                            diags.push(i18n::localized_diagnostic(
-                                locale,
-                                "diag.boolean.type29_invalid",
-                                i18n::args([
-                                    ("value", serde_json::json!(cell.value)),
-                                    ("column", serde_json::json!(col_name)),
-                                ]),
-                                Diagnostic {
-                                    range: cell_range,
-                                    severity: Some(DiagnosticSeverity::WARNING),
-                                    source: Some("vector-lsp".into()),
-                                    ..Default::default()
-                                },
-                            ));
-                        }
-                        continue;
-                    }
                     if cell.value != "0" && cell.value != "1" {
                         diags.push(i18n::localized_diagnostic(
                             locale,
@@ -461,6 +471,43 @@ pub fn validate_document_for_locale(
     }
 
     diags
+}
+
+pub fn attach_display_context(doc: &DocumentData, diagnostics: &mut [Diagnostic]) {
+    for diagnostic in diagnostics {
+        let line = diagnostic.range.start.line;
+        let character = diagnostic.range.start.character;
+        let Some((column_index, _)) = doc.cell_at(line, character) else {
+            continue;
+        };
+        let Some(row) = doc.rows.iter().find(|row| row.line == line) else {
+            continue;
+        };
+        let Some(column_name) = doc
+            .headers
+            .get(column_index)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(row_id) = row
+            .cells
+            .iter()
+            .map(|cell| cell.value.trim())
+            .find(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let data = diagnostic.data.get_or_insert_with(|| serde_json::json!({}));
+        let Some(data) = data.as_object_mut() else {
+            continue;
+        };
+        data.insert(
+            "displayColumnName".to_string(),
+            serde_json::json!(column_name),
+        );
+        data.insert("displayRowId".to_string(), serde_json::json!(row_id));
+    }
 }
 
 pub(crate) const HIT_SUMMON_MODE_CODES: [&str; 16] = [
@@ -696,9 +743,73 @@ fn property_slot(column: &str, prefix: &str) -> Option<u8> {
     (1..=7).contains(&slot).then_some(slot)
 }
 
-pub(crate) fn is_confirmed_type29_boolean(file_stem: &str, column: &str) -> bool {
-    file_stem.eq_ignore_ascii_case("missiles")
-        && (column.eq_ignore_ascii_case("Explosion") || column.eq_ignore_ascii_case("NoMultiShot"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConfirmedBooleanKind {
+    General,
+    Stored,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConfirmedBooleanValue {
+    pub enabled: bool,
+    pub input_nonzero: bool,
+}
+
+pub(crate) fn confirmed_boolean_kind(
+    file_stem: &str,
+    column: &str,
+) -> Option<ConfirmedBooleanKind> {
+    let matches = |file: &str, columns: &[&str]| {
+        file_stem.eq_ignore_ascii_case(file)
+            && columns
+                .iter()
+                .any(|candidate| column.eq_ignore_ascii_case(candidate))
+    };
+    if matches("missiles", &["explosion", "nomultishot"])
+        || matches(
+            "monstats",
+            &[
+                "enabled",
+                "rangedtype",
+                "placespawn",
+                "setboss",
+                "bossxfer",
+                "isspawn",
+                "ismelee",
+                "npc",
+                "zoo",
+                "cannotdesecrate",
+            ],
+        )
+        || matches(
+            "states",
+            &[
+                "remhit",
+                "nosend",
+                "transform",
+                "aura",
+                "curable",
+                "curse",
+                "active",
+                "restrict",
+                "notondead",
+            ],
+        )
+    {
+        Some(ConfirmedBooleanKind::General)
+    } else if matches("misc", &["autobelt", "multibuy"])
+        || matches("states", &["canstack"])
+        || matches("superuniques", &["autopos", "stacks"])
+        || matches("weapons", &["1or2handed", "2handed"])
+    {
+        Some(ConfirmedBooleanKind::Stored)
+    } else {
+        None
+    }
+}
+
+fn is_excluded_boolean(file_stem: &str, column: &str) -> bool {
+    file_stem.eq_ignore_ascii_case("superuniques") && column.eq_ignore_ascii_case("replaceable")
 }
 
 pub(crate) fn is_monpet_consumestat_reference(file_stem: &str, column: &str) -> bool {
@@ -742,15 +853,35 @@ fn mark_whitespace(value: &str) -> String {
     value.replace(' ', "␠").replace('\t', "⇥")
 }
 
-/// Parse the binary-revalidated type-29 meaning without imposing an
-/// unverified host-language integer limit. The binary evidence establishes
-/// signed decimal zero vs nonzero, but not an i64 storage boundary.
-pub(crate) fn parse_type29_boolean(value: &str) -> Option<bool> {
+/// Parse the verified Boolean fields without imposing a host-language integer
+/// limit, then reproduce the game's wrapping conversion for hover output.
+pub(crate) fn parse_confirmed_boolean(
+    value: &str,
+    kind: ConfirmedBooleanKind,
+) -> Option<ConfirmedBooleanValue> {
+    let negative = value.starts_with('-');
     let digits = value.strip_prefix('-').unwrap_or(value);
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    Some(digits.bytes().any(|byte| byte != b'0'))
+    let input_nonzero = digits.bytes().any(|byte| byte != b'0');
+    let mut converted = 0_u32;
+    for digit in digits.bytes() {
+        converted = converted
+            .wrapping_mul(10)
+            .wrapping_add(u32::from(digit - b'0'));
+    }
+    if negative {
+        converted = converted.wrapping_neg();
+    }
+    let enabled = match kind {
+        ConfirmedBooleanKind::General => converted != 0,
+        ConfirmedBooleanKind::Stored => converted & 0xff != 0,
+    };
+    Some(ConfirmedBooleanValue {
+        enabled,
+        input_nonzero,
+    })
 }
 
 fn target_exists(
@@ -809,6 +940,32 @@ mod tests {
     use super::*;
     use crate::schema::{FieldType, SchemaField, SchemaFile, find_loader};
     use crate::source_selection::SourceKind;
+
+    #[test]
+    fn display_context_identifies_the_row_and_column_without_an_open_editor_document() {
+        let document = DocumentData::parse("Id\tEDmgSymPerCalc\nBone Prison\tpar10", '\t');
+        let mut diagnostics = vec![Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 1,
+                    character: 12,
+                },
+                end: Position {
+                    line: 1,
+                    character: 17,
+                },
+            },
+            data: Some(serde_json::json!({ "kind": "reference" })),
+            ..Default::default()
+        }];
+
+        attach_display_context(&document, &mut diagnostics);
+
+        let data = diagnostics[0].data.as_ref().unwrap();
+        assert_eq!(data["displayRowId"], "Bone Prison");
+        assert_eq!(data["displayColumnName"], "EDmgSymPerCalc");
+        assert_eq!(data["kind"], "reference");
+    }
 
     #[test]
     fn diagnostic_ranges_use_utf16_code_units() {
@@ -1113,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn type29_boolean_accepts_zero_and_every_signed_decimal_nonzero() {
+    fn verified_boolean_parser_accepts_arbitrary_signed_decimals_and_wraps_like_the_game() {
         for (value, expected) in [
             ("0", false),
             ("-0", false),
@@ -1122,14 +1279,40 @@ mod tests {
             ("2", true),
             ("3", true),
             ("999999", true),
-            ("184467440737095516160000", true),
+            ("4294967296", false),
+            ("184467440737095516160000", false),
             ("-1", true),
             ("-987654321", true),
         ] {
-            assert_eq!(parse_type29_boolean(value), Some(expected), "{value}");
+            assert_eq!(
+                parse_confirmed_boolean(value, ConfirmedBooleanKind::General)
+                    .map(|parsed| parsed.enabled),
+                Some(expected),
+                "{value}"
+            );
         }
         for value in ["", "+1", "1.0", "1x", "true", " 1"] {
-            assert_eq!(parse_type29_boolean(value), None, "{value}");
+            assert_eq!(
+                parse_confirmed_boolean(value, ConfirmedBooleanKind::General),
+                None,
+                "{value}"
+            );
+        }
+
+        for (value, expected) in [
+            ("0", false),
+            ("1", true),
+            ("255", true),
+            ("256", false),
+            ("-256", false),
+            ("257", true),
+        ] {
+            assert_eq!(
+                parse_confirmed_boolean(value, ConfirmedBooleanKind::Stored)
+                    .map(|parsed| parsed.enabled),
+                Some(expected),
+                "{value}"
+            );
         }
 
         let document = DocumentData::parse(
@@ -1173,6 +1356,170 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("'+1'"))
+        );
+    }
+
+    #[test]
+    fn verified_boolean_field_classification_covers_both_families_and_excludes_replaceable() {
+        for (file, columns, kind) in [
+            (
+                "missiles",
+                &["explosion", "nomultishot"][..],
+                ConfirmedBooleanKind::General,
+            ),
+            (
+                "monstats",
+                &[
+                    "enabled",
+                    "rangedtype",
+                    "placespawn",
+                    "setboss",
+                    "bossxfer",
+                    "isspawn",
+                    "ismelee",
+                    "npc",
+                    "zoo",
+                    "cannotdesecrate",
+                ][..],
+                ConfirmedBooleanKind::General,
+            ),
+            (
+                "states",
+                &[
+                    "remhit",
+                    "nosend",
+                    "transform",
+                    "aura",
+                    "curable",
+                    "curse",
+                    "active",
+                    "restrict",
+                    "notondead",
+                ][..],
+                ConfirmedBooleanKind::General,
+            ),
+            (
+                "misc",
+                &["autobelt", "multibuy"][..],
+                ConfirmedBooleanKind::Stored,
+            ),
+            ("states", &["canstack"][..], ConfirmedBooleanKind::Stored),
+            (
+                "superuniques",
+                &["autopos", "stacks"][..],
+                ConfirmedBooleanKind::Stored,
+            ),
+            (
+                "weapons",
+                &["1or2handed", "2handed"][..],
+                ConfirmedBooleanKind::Stored,
+            ),
+        ] {
+            for column in columns {
+                assert_eq!(
+                    confirmed_boolean_kind(file, column),
+                    Some(kind),
+                    "{file}.{column}"
+                );
+            }
+        }
+        assert_eq!(confirmed_boolean_kind("superuniques", "replaceable"), None);
+    }
+
+    #[test]
+    fn verified_boolean_diagnostics_bypass_i64_limits_and_replaceable_is_ignored() {
+        let field = |name: &str, type_name| SchemaField {
+            name: name.to_string(),
+            description: None,
+            field_type: Some(FieldType {
+                type_name,
+                data_length: 0,
+                mem_size: 0,
+                file: None,
+                field: None,
+                resolver: ReferenceResolver::default(),
+                unknown_policy: ReferenceUnknownPolicy::default(),
+            }),
+            alt_names: vec![],
+            append_field: None,
+            table: None,
+            unique: false,
+        };
+        let values = [
+            "0",
+            "1",
+            "2",
+            "3",
+            "255",
+            "256",
+            "-1",
+            "-256",
+            "4294967296",
+            "184467440737095516160000000000000000000000000000000000000000",
+            "true",
+            "false",
+            "+1",
+            " 1",
+            "1 ",
+        ];
+        let mut schema = Schema::default();
+        schema.files.insert(
+            "monstats".to_string(),
+            SchemaFile {
+                fields: vec![field("enabled", FieldTypeName::Int)],
+                ..Default::default()
+            },
+        );
+        schema.files.insert(
+            "misc".to_string(),
+            SchemaFile {
+                fields: vec![field("autobelt", FieldTypeName::Int)],
+                ..Default::default()
+            },
+        );
+        schema.files.insert(
+            "superuniques".to_string(),
+            SchemaFile {
+                fields: vec![field("replaceable", FieldTypeName::Boolean)],
+                ..Default::default()
+            },
+        );
+
+        for file in ["monstats", "misc"] {
+            let header = if file == "monstats" {
+                "enabled"
+            } else {
+                "autobelt"
+            };
+            let document = DocumentData::parse(&format!("{header}\n{}", values.join("\n")), '\t');
+            let diagnostics =
+                validate_document(file, &document, Some(&schema), &SymbolIndex::new());
+            assert_eq!(diagnostics.len(), 5, "{file}: {diagnostics:#?}");
+            for value in ["true", "false", "+1", " 1", "1 "] {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.message.contains(value)),
+                    "{file}:{value}: {diagnostics:#?}"
+                );
+            }
+            assert!(diagnostics.iter().all(|diagnostic| {
+                diagnostic.message.contains("number format accepted")
+                    && diagnostic
+                        .message
+                        .contains("0 to turn it off or 1 to turn it on")
+            }));
+        }
+
+        let replaceable = DocumentData::parse("replaceable\n2\ntrue\n-1", '\t');
+        assert!(
+            validate_document(
+                "superuniques",
+                &replaceable,
+                Some(&schema),
+                &SymbolIndex::new()
+            )
+            .is_empty()
         );
     }
 
@@ -1541,6 +1888,213 @@ mod tests {
             validate_document("magicsuffix", &source, Some(&schema), &symbols).is_empty(),
             "ring plus trailing spaces must pack to the same four bytes as ring"
         );
+    }
+
+    #[test]
+    fn loaded_1_13_monprop_ids_are_name_keys_referenced_by_monstats() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("1.13").join("schema");
+        let schema = find_loader("d2rdoc", "1.13".to_string(), Some(contrib))
+            .unwrap()
+            .load(Some(&schema_dir))
+            .unwrap();
+
+        let id_type = schema
+            .find_field("monprop", "Id")
+            .and_then(|field| field.field_type.as_ref())
+            .expect("loaded MonProp.Id type");
+        assert_eq!(id_type.type_name, FieldTypeName::String);
+
+        let monprop_reference = schema
+            .find_field("monstats", "MonProp")
+            .and_then(|field| field.field_type.as_ref())
+            .expect("loaded MonStats.MonProp type");
+        assert_eq!(monprop_reference.type_name, FieldTypeName::Reference);
+        assert_eq!(monprop_reference.file.as_deref(), Some("MonProp"));
+        assert_eq!(monprop_reference.field.as_deref(), Some("Id"));
+
+        let source = DocumentData::parse("Id\nbaboon6\nirongolem\n", '\t');
+        assert!(
+            validate_document("monprop", &source, Some(&schema), &SymbolIndex::new()).is_empty(),
+            "stock 1.13c MonProp name keys must not receive integer diagnostics"
+        );
+    }
+
+    #[test]
+    fn loaded_1_13_monequip_byte_fields_accept_signed_decimals_without_boolean_warnings() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("1.13").join("schema");
+        let schema = find_loader("d2rdoc", "1.13".to_string(), Some(contrib))
+            .unwrap()
+            .load(Some(&schema_dir))
+            .unwrap();
+
+        for (field, mem_size) in [("oninit", 8), ("level", 16), ("mod1", 8)] {
+            let field_type = schema
+                .find_field("monequip", field)
+                .and_then(|field| field.field_type.as_ref())
+                .expect("loaded 1.13 monequip field type");
+            assert_eq!(field_type.type_name, FieldTypeName::Int, "{field}");
+            assert_eq!(field_type.mem_size, mem_size, "{field}");
+        }
+
+        let source = DocumentData::parse("oninit\n0\n1\n2\n255\n-1\n256\n", '\t');
+        assert!(
+            validate_document("monequip", &source, Some(&schema), &SymbolIndex::new()).is_empty(),
+            "1.13 oninit is a byte consumed as zero/nonzero, not a canonical Boolean"
+        );
+
+        let invalid = DocumentData::parse("oninit\nnot-a-number\n", '\t');
+        let diagnostics =
+            validate_document("monequip", &invalid, Some(&schema), &SymbolIndex::new());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.contains("standard integer"));
+    }
+
+    #[test]
+    fn loaded_2_4_schema_uses_text_keys_and_monprop_id_reference() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+        let schema_dir = contrib.join("2.4").join("schema");
+        let schema = find_loader("d2rdoc", "2.4".to_string(), Some(contrib))
+            .unwrap()
+            .load(Some(&schema_dir))
+            .unwrap();
+
+        for (file, field) in [
+            ("shareditems", "TMogType"),
+            ("monstats", "Id"),
+            ("monseq", "sequence"),
+            ("automagic", "transformcolor"),
+        ] {
+            assert_eq!(
+                schema
+                    .find_field(file, field)
+                    .and_then(|field| field.field_type.as_ref())
+                    .map(|field| field.type_name.clone()),
+                Some(FieldTypeName::String),
+                "{file}.{field} must not be validated as an integer"
+            );
+        }
+
+        let monprop_id = schema
+            .find_field("monprop", "Id")
+            .and_then(|field| field.field_type.as_ref())
+            .expect("loaded MonProp.Id type");
+        assert_eq!(monprop_id.type_name, FieldTypeName::Reference);
+        assert_eq!(monprop_id.file.as_deref(), Some("monstats"));
+        assert_eq!(monprop_id.field.as_deref(), Some("Id"));
+
+        for (file, source) in [
+            ("shareditems", "TMogType\nxxx\nhax\n"),
+            ("monstats", "Id\nFallen\n"),
+            ("monseq", "sequence\ncharge\ncharge\n"),
+            ("automagic", "transformcolor\nred\n"),
+        ] {
+            let source = DocumentData::parse(source, '\t');
+            assert!(
+                validate_document(file, &source, Some(&schema), &SymbolIndex::new()).is_empty(),
+                "{file} textual values must not receive integer diagnostics"
+            );
+        }
+
+        let targets = schema.reference_targets();
+        let mut symbols = SymbolIndex::new();
+        let monstats = DocumentData::parse("Id\nFallen\n", '\t');
+        symbols.index_effective_document(
+            None,
+            "monstats",
+            &monstats,
+            &targets,
+            SourceKind::Bundled,
+            Some("2.4"),
+        );
+        let valid = DocumentData::parse("Id\nFallen\n", '\t');
+        assert!(validate_document("monprop", &valid, Some(&schema), &symbols).is_empty());
+
+        let missing = DocumentData::parse("Id\nMissing\n", '\t');
+        let diagnostics = validate_document("monprop", &missing, Some(&schema), &symbols);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diagnostics[0].message.contains("Missing"));
+        assert!(diagnostics[0].message.contains("monstats"));
+    }
+
+    #[test]
+    fn schema_2_4_text_key_declarations_do_not_change_other_d2r_schema_versions() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+
+        for version in ["1.13", "3.1", "3.2"] {
+            let schema_dir = contrib.join(version).join("schema");
+            let schema = find_loader("d2rdoc", version.to_string(), Some(contrib.clone()))
+                .unwrap()
+                .load(Some(&schema_dir))
+                .unwrap();
+            let expected = if version == "1.13" {
+                FieldTypeName::String
+            } else {
+                FieldTypeName::Text
+            };
+            assert_eq!(
+                schema
+                    .find_field("monstats", "Id")
+                    .and_then(|field| field.field_type.as_ref())
+                    .map(|field| field.type_name.clone()),
+                Some(expected.clone()),
+                "{version} MonStats.Id must retain its existing declaration"
+            );
+            assert_eq!(
+                schema
+                    .find_field("monseq", "sequence")
+                    .and_then(|field| field.field_type.as_ref())
+                    .map(|field| field.type_name.clone()),
+                Some(expected),
+                "{version} MonSeq.sequence must retain its existing declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn monequip_oninit_patch_is_limited_to_1_13() {
+        let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib")
+            .join("d2rdoc");
+
+        for (version, expected_type, expected_mem_size, accepts_two) in [
+            // The ignored upstream 2.4 asset still spells this `bool`, which
+            // the schema model preserves as Unknown.  This test pins that
+            // existing declaration and its absence of a type diagnostic.
+            ("2.4", FieldTypeName::Unknown, 0, true),
+            ("3.1", FieldTypeName::Int, 8, true),
+            ("3.2", FieldTypeName::Int, 8, true),
+        ] {
+            let schema_dir = contrib.join(version).join("schema");
+            let schema = find_loader("d2rdoc", version.to_string(), Some(contrib.clone()))
+                .unwrap()
+                .load(Some(&schema_dir))
+                .unwrap();
+            let field_type = schema
+                .find_field("monequip", "oninit")
+                .and_then(|field| field.field_type.as_ref())
+                .expect("loaded monequip.oninit type");
+            assert_eq!(field_type.type_name, expected_type, "{version}");
+            assert_eq!(field_type.mem_size, expected_mem_size, "{version}");
+
+            let source = DocumentData::parse("oninit\n2\n", '\t');
+            assert_eq!(
+                validate_document("monequip", &source, Some(&schema), &SymbolIndex::new())
+                    .is_empty(),
+                accepts_two,
+                "{version} must retain its pre-existing monequip.oninit diagnostic behavior"
+            );
+        }
     }
 
     #[test]

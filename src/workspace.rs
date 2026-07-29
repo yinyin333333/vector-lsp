@@ -126,7 +126,9 @@ pub struct SymbolIndex {
 #[derive(Clone, Debug)]
 pub struct SymbolEntry {
     pub location: Option<Location>,
+    #[cfg(test)]
     pub source_kind: SourceKind,
+    #[cfg(test)]
     pub bundled_version: Option<String>,
     pub stored_value: String,
 }
@@ -152,6 +154,7 @@ impl SymbolIndex {
     }
 
     /// Index the cells of `doc` that belong to columns listed in `ref_targets`.
+    #[cfg(test)]
     pub fn index_document(
         &mut self,
         uri: &Url,
@@ -176,7 +179,7 @@ impl SymbolIndex {
         doc: &DocumentData,
         ref_targets: &HashSet<(String, String)>,
         source_kind: SourceKind,
-        bundled_version: Option<&str>,
+        _bundled_version: Option<&str>,
     ) {
         let stem = file_stem.to_ascii_lowercase();
         self.files.insert(stem.clone());
@@ -225,8 +228,10 @@ impl SymbolIndex {
                 };
                 let entry = SymbolEntry {
                     location,
+                    #[cfg(test)]
                     source_kind,
-                    bundled_version: bundled_version.map(str::to_string),
+                    #[cfg(test)]
+                    bundled_version: _bundled_version.map(str::to_string),
                     stored_value: cell.value.clone(),
                 };
                 self.ascii_ci_entries.insert(
@@ -1044,6 +1049,7 @@ impl Workspace {
         true
     }
 
+    #[cfg(test)]
     pub fn commit_scan_documents(
         &mut self,
         scan_generation: u64,
@@ -1500,6 +1506,7 @@ impl Workspace {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn restore_closed_document(
         &mut self,
         uri: &Url,
@@ -1841,6 +1848,7 @@ impl Workspace {
             .map(|snapshot| snapshot.version)
     }
 
+    #[cfg(test)]
     pub fn record_json_diagnostics(&mut self, uri: Url, diagnostics: Vec<Diagnostic>) {
         self.record_json_diagnostics_for_version(uri, diagnostics, None);
     }

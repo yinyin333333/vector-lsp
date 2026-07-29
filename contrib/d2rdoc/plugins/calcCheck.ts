@@ -1063,6 +1063,21 @@ function skillParamAlias(
     selectedVersion: string | undefined,
     skillIds: Set<string>,
 ): SkillParamAlias | null {
+    // Diablo II 1.13c resolves SkillCalc identifiers through the first four
+    // bytes of the identifier key. Keep this binary-compatible lookup scoped
+    // to its confirmed version and Skill scope caller below.
+    if (selectedVersion === "1.13c") {
+        const interpretedAs = identifier.slice(0, 4);
+        if (identifier.length <= 4 || !skillIds.has(interpretedAs)) return null;
+        return {
+            identifier,
+            interpretedAs,
+            suggestion: interpretedAs,
+            // The localized guidance is "use par3 to reference par34", not
+            // the redundant "use par3 to reference par3".
+            parameter: identifier,
+        };
+    }
     if (selectedVersion !== "3.1" && selectedVersion !== "3.2") return null;
     const match = /^par(1[0-9]|20)$/.exec(identifier);
     if (!match) return null;
@@ -1227,14 +1242,14 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                                 : "plugin." + err.code),
                         messageArgs: {
                             code: err.code,
-                            identifier: unknownIdentifier,
+                            identifier: paramAlias ? paramAlias.interpretedAs : unknownIdentifier,
                             expected: err.expected || "",
                             actual: err.actual || "",
                             insertText: err.insertText || "",
                             hint: err.hint || "",
                             consumedPrefix: err.consumedPrefix || "",
                             ignoredSuffix: err.ignoredSuffix || "",
-                            alias: paramAlias || "",
+                            alias: paramAlias ? paramAlias.identifier : "",
                             policyWarning,
                         },
                         legacyMessage,

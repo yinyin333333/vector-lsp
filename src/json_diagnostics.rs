@@ -279,6 +279,7 @@ enum JsMapKey {
 /// Analyze all physical mod scopes represented by primary TXT documents.
 /// File I/O is synchronous so callers should run this function on a blocking
 /// worker. Results and diagnostics are deterministic by normalized path.
+#[cfg(test)]
 pub fn analyze(primary_documents: Vec<PrimaryTxtDocument>) -> JsonDiagnosticReport {
     analyze_with_rules(
         primary_documents,
@@ -293,6 +294,7 @@ pub fn analyze(primary_documents: Vec<PrimaryTxtDocument>) -> JsonDiagnosticRepo
 /// Json/Syntax diagnostic when the source cannot be parsed. A caller publishing
 /// aggregate diagnostics must merge them with its cached semantic results
 /// before replacing diagnostics for a JSON URI.
+#[cfg(test)]
 pub fn analyze_with_rules(
     primary_documents: Vec<PrimaryTxtDocument>,
     rules: JsonDiagnosticRules,
@@ -306,6 +308,7 @@ pub fn analyze_with_rules(
     )
 }
 
+#[cfg(test)]
 pub fn analyze_with_rules_and_profile(
     primary_documents: Vec<PrimaryTxtDocument>,
     rules: JsonDiagnosticRules,
@@ -321,6 +324,7 @@ pub fn analyze_with_rules_and_profile(
     )
 }
 
+#[cfg(test)]
 pub fn analyze_with_rules_profile_and_open_json(
     primary_documents: Vec<PrimaryTxtDocument>,
     rules: JsonDiagnosticRules,
@@ -487,10 +491,6 @@ fn analyze_scope(
     Some(JsonDiagnosticReport { batches, warnings })
 }
 
-fn parse_string_file(path: PathBuf, uri: Url) -> Result<StringFile, String> {
-    parse_string_file_localized(path, uri, Locale::EnUs)
-}
-
 fn parse_string_file_localized(
     path: PathBuf,
     uri: Url,
@@ -501,6 +501,7 @@ fn parse_string_file_localized(
     parse_string_source_localized(path, uri, source, locale)
 }
 
+#[cfg(test)]
 fn parse_string_source(path: PathBuf, uri: Url, source: String) -> Result<StringFile, String> {
     parse_string_source_localized(path, uri, source, Locale::EnUs)
 }
@@ -556,10 +557,6 @@ fn parse_string_source_localized(
 /// and `Key`. Validate the complete JSON stream, then retain only those two
 /// values and their lexical spans instead of materializing the full Value tree
 /// and 15-field maps for every entry.
-fn parse_string_file_key_usage(path: PathBuf, uri: Url) -> Result<StringFile, String> {
-    parse_string_file_key_usage_localized(path, uri, Locale::EnUs)
-}
-
 fn parse_string_file_key_usage_localized(
     path: PathBuf,
     uri: Url,
@@ -570,6 +567,7 @@ fn parse_string_file_key_usage_localized(
     parse_string_source_key_usage_localized(path, uri, source, locale)
 }
 
+#[cfg(test)]
 fn parse_string_source_key_usage(
     path: PathBuf,
     uri: Url,

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,6 +77,102 @@ fn mark_edge_whitespace(value: &str) -> String {
             }
         })
         .collect()
+}
+
+const FIELD_METADATA_COMMAND: &str = "vectorLsp.fieldMetadata";
+
+fn longest_backtick_run(value: &str) -> usize {
+    value.split(|ch| ch != '`').map(str::len).max().unwrap_or(0)
+}
+
+fn markdown_text_block(value: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(value).max(2) + 1);
+    format!("{fence}text\n{value}\n{fence}")
+}
+
+fn localized_cell_hover_details(
+    locale: Locale,
+    value: &str,
+    calculation_limit: Option<usize>,
+) -> String {
+    let (value_label, count_label, warning) = match locale {
+        Locale::EnUs => (
+            "Cell value",
+            "Character count",
+            "Recommended length exceeded",
+        ),
+        Locale::ZhTw => ("儲存格值", "字元數", "已超過建議長度"),
+        Locale::DeDe => (
+            "Zellenwert",
+            "Zeichenanzahl",
+            "Empfohlene Länge überschritten",
+        ),
+        Locale::EsEs | Locale::EsMx => (
+            "Valor de celda",
+            "Número de caracteres",
+            "Se superó la longitud recomendada",
+        ),
+        Locale::FrFr => (
+            "Valeur de la cellule",
+            "Nombre de caractères",
+            "Longueur recommandée dépassée",
+        ),
+        Locale::ItIt => (
+            "Valore della cella",
+            "Numero di caratteri",
+            "Lunghezza consigliata superata",
+        ),
+        Locale::KoKr => ("셀 값", "글자 수", "권장 길이를 초과했습니다"),
+        Locale::PlPl => (
+            "Wartość komórki",
+            "Liczba znaków",
+            "Przekroczono zalecaną długość",
+        ),
+        Locale::JaJp => ("セルの値", "文字数", "推奨長を超えています"),
+        Locale::PtBr => (
+            "Valor da célula",
+            "Contagem de caracteres",
+            "Comprimento recomendado excedido",
+        ),
+        Locale::RuRu => (
+            "Значение ячейки",
+            "Количество символов",
+            "Превышена рекомендуемая длина",
+        ),
+        Locale::ZhCn => ("单元格值", "字符数", "已超过建议长度"),
+    };
+    let mut sections = vec![format!(
+        "**{value_label}**\n\n{}",
+        markdown_text_block(value)
+    )];
+    if let Some(limit) = calculation_limit {
+        let current = value.chars().count();
+        let mut count = format!("**{count_label}: {current}/{limit}**");
+        if current > limit {
+            count.push_str(&format!("\n\n⚠ {warning} (+{}).", current - limit));
+        }
+        sections.push(count);
+    }
+    sections.join("\n\n")
+}
+
+fn schema_field_metadata(
+    schema: Option<&crate::schema::Schema>,
+    file_stem: &str,
+    column_name: &str,
+) -> Option<Value> {
+    let field_type = schema?
+        .find_field(file_stem, column_name)?
+        .field_type
+        .as_ref()?;
+    if field_type.type_name != FieldTypeName::Parse || field_type.data_length != 255 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "fieldType": "parse",
+        "maxLength": field_type.data_length,
+        "source": "schema"
+    }))
 }
 
 impl tower_lsp::lsp_types::notification::Notification for VectorLspReady {
@@ -1408,14 +1505,16 @@ impl Backend {
         };
         let locale = self.locale().await;
         tokio::task::spawn_blocking(move || {
-            diagnostics::validate_document_for_locale(
+            let mut diagnostics = diagnostics::validate_document_for_locale(
                 &stem,
                 &doc,
                 schema.as_deref(),
                 &symbols,
                 reference_version.as_deref(),
                 locale,
-            )
+            );
+            diagnostics::attach_display_context(&doc, &mut diagnostics);
+            diagnostics
         })
         .await
         .ok()
@@ -1476,6 +1575,7 @@ impl Backend {
                 return None;
             }
         }
+        diagnostics::attach_display_context(&doc, &mut diagnostics);
         Some(diagnostics)
     }
 
@@ -1801,6 +1901,7 @@ impl Backend {
                     return false;
                 }
             }
+            diagnostics::attach_display_context(&document, &mut diagnostics);
             if !self
                 .publish_disk_if_current(scan_generation, workspace_revision, uri, diagnostics)
                 .await
@@ -2517,6 +2618,10 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![FIELD_METADATA_COMMAND.to_string()],
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -3228,6 +3333,32 @@ impl LanguageServer for Backend {
         .map(GotoDefinitionResponse::Scalar))
     }
 
+    async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<Value>> {
+        if params.command != FIELD_METADATA_COMMAND {
+            return Ok(None);
+        }
+        let Some(argument) = params.arguments.first() else {
+            return Ok(None);
+        };
+        let Some(uri) = argument
+            .get("uri")
+            .and_then(Value::as_str)
+            .and_then(|value| Url::parse(value).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(column_name) = argument.get("columnName").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let file_stem = Self::file_stem(&uri);
+        let workspace = self.workspace.read().await;
+        Ok(schema_field_metadata(
+            workspace.schema.as_deref(),
+            &file_stem,
+            column_name,
+        ))
+    }
+
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
@@ -3304,8 +3435,9 @@ impl LanguageServer for Backend {
             _col_name,
             cell_value,
             reference_content,
-            type29_content,
+            boolean_content,
             hit_summon_mode_content,
+            calculation_limit,
             plugin_hover_data,
         ) = {
             let ws = self.workspace.read().await;
@@ -3333,6 +3465,15 @@ impl LanguageServer for Backend {
             let properties_stat_func = current_row.and_then(|row| {
                 diagnostics::properties_stat_dispatch_func(&file_stem, doc, row, &col_name)
             });
+            let calculation_limit = ws
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.find_field(&file_stem, &col_name))
+                .and_then(|field| field.field_type.as_ref())
+                .filter(|field_type| {
+                    field_type.type_name == FieldTypeName::Parse && field_type.data_length == 255
+                })
+                .map(|field_type| field_type.data_length as usize);
 
             let reference_content = ws
                 .schema
@@ -3430,35 +3571,18 @@ impl LanguageServer for Backend {
                     }
                 });
 
-            let type29_content = if diagnostics::is_confirmed_type29_boolean(&file_stem, &col_name)
-            {
-                diagnostics::parse_type29_boolean(&cell_value).map(|value| {
-                    let version = ws.reference_version.as_deref().map_or_else(
-                        || i18n::localize(locale, "hover.game_version_unselected", &i18n::args([])),
-                        |version| {
-                            i18n::localize(
-                                locale,
-                                "hover.game_version",
-                                &i18n::args([("version", serde_json::json!(version))]),
-                            )
-                        },
-                    );
-                    i18n::localize(
-                        locale,
-                        "hover.boolean_value",
-                        &i18n::args([
-                            ("value", serde_json::json!(cell_value)),
-                            (
-                                "result",
-                                serde_json::json!(if value { "true" } else { "false" }),
-                            ),
-                            ("version", serde_json::json!(version)),
-                        ]),
-                    )
-                })
-            } else {
-                None
-            };
+            let boolean_content = diagnostics::confirmed_boolean_kind(&file_stem, &col_name)
+                .and_then(|kind| diagnostics::parse_confirmed_boolean(&cell_value, kind))
+                .map(|value| {
+                    let key = if value.enabled {
+                        "hover.boolean_on"
+                    } else if value.input_nonzero {
+                        "hover.boolean_off_recommendation"
+                    } else {
+                        "hover.boolean_off"
+                    };
+                    i18n::localize(locale, key, &i18n::args([]))
+                });
 
             let hit_summon_mode_content = current_row
                 .filter(|row| {
@@ -3539,8 +3663,9 @@ impl LanguageServer for Backend {
                 col_name,
                 cell_value,
                 reference_content,
-                type29_content,
+                boolean_content,
                 hit_summon_mode_content,
+                calculation_limit,
                 plugin_hover_data,
             )
         }; // read lock released here
@@ -3560,28 +3685,40 @@ impl LanguageServer for Backend {
             _ => None,
         };
 
-        let combined = match (
+        let contextual = match (
             plugin_content,
             reference_content,
-            type29_content,
+            boolean_content,
             hit_summon_mode_content,
         ) {
             (Some(plugin), Some(reference), _, _) if !plugin.is_empty() => {
-                format!("{plugin}\n\n---\n\n{reference}")
+                Some(format!("{plugin}\n\n---\n\n{reference}"))
             }
-            (Some(plugin), _, Some(type29), _) if !plugin.is_empty() => {
-                format!("{plugin}\n\n---\n\n{type29}")
+            (Some(plugin), _, Some(boolean), _) if !plugin.is_empty() => {
+                Some(format!("{plugin}\n\n---\n\n{boolean}"))
             }
             (Some(plugin), _, _, Some(hit_summon)) if !plugin.is_empty() => {
-                format!("{plugin}\n\n---\n\n{hit_summon}")
+                Some(format!("{plugin}\n\n---\n\n{hit_summon}"))
             }
-            (Some(plugin), _, _, _) if !plugin.is_empty() => plugin,
-            (_, Some(reference), _, _) => reference,
-            (_, _, Some(type29), _) => type29,
-            (_, _, _, Some(hit_summon)) => hit_summon,
-            _ if cell_value.is_empty() => return Ok(None),
-            _ => cell_value.clone(),
+            (Some(plugin), _, _, _) if !plugin.is_empty() => Some(plugin),
+            (_, Some(reference), _, _) => Some(reference),
+            (_, _, Some(boolean), _) => Some(boolean),
+            (_, _, _, Some(hit_summon)) => Some(hit_summon),
+            _ => None,
         };
+        let combined = if calculation_limit.is_some() {
+            let cell_details = localized_cell_hover_details(locale, &cell_value, calculation_limit);
+            contextual
+                .filter(|content| !content.is_empty())
+                .map_or(cell_details.clone(), |content| {
+                    format!("{content}\n\n---\n\n{cell_details}")
+                })
+        } else {
+            contextual.unwrap_or(cell_value)
+        };
+        if combined.is_empty() {
+            return Ok(None);
+        }
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -3617,6 +3754,22 @@ mod tests {
         let mut lines = vec![text.to_string()];
         apply_change(&mut lines, range(start, end), replacement);
         lines.join("\n")
+    }
+
+    #[test]
+    fn calculation_hover_details_count_unicode_characters_and_warn_without_truncating() {
+        let value = format!("{}한", "x".repeat(255));
+        let details = localized_cell_hover_details(Locale::KoKr, &value, Some(255));
+        assert!(details.contains(&value));
+        assert!(details.contains("글자 수: 256/255"));
+        assert!(details.contains("권장 길이를 초과했습니다"));
+    }
+
+    #[test]
+    fn markdown_text_block_uses_a_fence_longer_than_cell_content() {
+        let block = markdown_text_block("a```b");
+        assert!(block.starts_with("````text\n"));
+        assert!(block.ends_with("\n````"));
     }
 
     async fn wait_for_watched_change_worker(workspace: &Arc<RwLock<Workspace>>) {
@@ -5005,7 +5158,11 @@ mod tests {
             ),
             (
                 Url::parse("file:///workspace/missiles.txt").unwrap(),
-                "Explosion\tNoMultiShot\n2\t-1\n",
+                "Explosion\tNoMultiShot\n0\t2\n-1\t4294967296\n",
+            ),
+            (
+                Url::parse("file:///workspace/misc.txt").unwrap(),
+                "AutoBelt\tMultiBuy\n0\t1\n255\t256\n-256\t257\n",
             ),
         ];
 
@@ -5083,12 +5240,7 @@ mod tests {
             (
                 "file:///workspace/missiles.txt",
                 1,
-                "Numeric 0 means false. Any numeric nonzero value means true",
-            ),
-            (
-                "file:///workspace/missiles.txt",
-                12,
-                "including negative values",
+                "Use 0 to turn this off or 1 to turn it on. Other integers are accepted; hover over a value to see how the game treats it.",
             ),
         ];
 
@@ -5115,35 +5267,95 @@ mod tests {
                 "header hover at {uri}:{character} did not contain {expected:?}: {}",
                 markup.value
             );
+            assert!(
+                !markup
+                    .value
+                    .contains("Any numeric nonzero value means true"),
+                "{}",
+                markup.value
+            );
         }
 
-        for (character, expected_value, expected_truth) in
-            [(0, "`2`", "**true**"), (3, "`-1`", "**true**")]
-        {
+        for (uri, line, character, expected) in [
+            (
+                "file:///workspace/missiles.txt",
+                1,
+                0,
+                "The current value is treated as off by the game.",
+            ),
+            (
+                "file:///workspace/missiles.txt",
+                1,
+                2,
+                "The current value is treated as on by the game.",
+            ),
+            (
+                "file:///workspace/missiles.txt",
+                2,
+                0,
+                "The current value is treated as on by the game.",
+            ),
+            (
+                "file:///workspace/missiles.txt",
+                2,
+                3,
+                "The current value is treated as off by the game. Enter 1 to turn it on.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                1,
+                0,
+                "The current value is treated as off by the game.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                1,
+                2,
+                "The current value is treated as on by the game.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                2,
+                0,
+                "The current value is treated as on by the game.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                2,
+                4,
+                "The current value is treated as off by the game. Enter 1 to turn it on.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                3,
+                0,
+                "The current value is treated as off by the game. Enter 1 to turn it on.",
+            ),
+            (
+                "file:///workspace/misc.txt",
+                3,
+                5,
+                "The current value is treated as on by the game.",
+            ),
+        ] {
             let hover = service
                 .inner()
                 .hover(HoverParams {
                     text_document_position_params: TextDocumentPositionParams {
                         text_document: TextDocumentIdentifier {
-                            uri: Url::parse("file:///workspace/missiles.txt").unwrap(),
+                            uri: Url::parse(uri).unwrap(),
                         },
-                        position: Position::new(1, character),
+                        position: Position::new(line, character),
                     },
                     work_done_progress_params: WorkDoneProgressParams::default(),
                 })
                 .await
                 .unwrap()
-                .expect("type-29 value hover");
+                .expect("verified Boolean value hover");
             let HoverContents::Markup(markup) = hover.contents else {
-                panic!("type-29 hover should be Markdown markup");
+                panic!("Boolean hover should be Markdown markup");
             };
-            assert!(markup.value.contains(expected_value), "{}", markup.value);
-            assert!(markup.value.contains(expected_truth), "{}", markup.value);
-            assert!(
-                markup.value.contains("Game version: 3.2"),
-                "{}",
-                markup.value
-            );
+            assert_eq!(markup.value, expected);
         }
     }
 
