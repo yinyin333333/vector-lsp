@@ -694,7 +694,7 @@ function parseLegacyMonPetFuncArgs(st: ParseState, funcName: string): CalcParseE
 
 function parseFuncArgs(st: ParseState, funcName: string): CalcParseError | null {
     if (!st.enforceRevalidatedFunctions) return parseLegacyMonPetFuncArgs(st, funcName);
-    const funcLower = st.enforceRevalidatedFunctions ? funcName.toLowerCase() : funcName;
+    const funcLower = funcName.toLowerCase();
 
     if (check(st, "RPAREN")) {
         if (QUOTED_ARG_FUNCS[funcLower]) {
