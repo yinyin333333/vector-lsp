@@ -52,12 +52,10 @@ fn schemas_present() -> bool {
     };
     for entry in entries.flatten() {
         let schema_dir = entry.path().join("schema");
-        if schema_dir.is_dir() {
-            if let Ok(mut inner) = std::fs::read_dir(&schema_dir) {
-                if inner.next().is_some() {
-                    return true;
-                }
-            }
+        if schema_dir.is_dir()
+            && std::fs::read_dir(&schema_dir).is_ok_and(|mut inner| inner.next().is_some())
+        {
+            return true;
         }
     }
     false

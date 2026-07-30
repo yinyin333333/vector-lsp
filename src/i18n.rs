@@ -277,7 +277,7 @@ pub fn localize(locale: Locale, key: &str, args: &Map<String, Value>) -> String 
         && let Some(legend) = fixed4_marker_legend(locale, args)
     {
         text.push(' ');
-        text.push_str(&legend);
+        text.push_str(legend);
     }
     if let Some(detail) = plugin_semantic_detail(locale, key, args) {
         text.push_str("\n\n");

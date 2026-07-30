@@ -171,10 +171,8 @@ fn index_doc(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
             if cell.value.trim().is_empty() {
                 continue;
             }
-            if let Some(h) = doc.headers.get(col_i) {
-                if !h.is_empty() {
-                    idx.insert(stem, h, cell.value.clone());
-                }
+            if let Some(h) = doc.headers.get(col_i).filter(|h| !h.is_empty()) {
+                idx.insert(stem, h, cell.value.clone());
             }
         }
     }

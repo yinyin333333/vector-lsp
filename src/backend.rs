@@ -66,8 +66,8 @@ fn mark_edge_whitespace(value: &str) -> String {
         .iter()
         .enumerate()
         .map(|(index, ch)| {
-            let at_edge = first_visible.map_or(true, |first| index < first)
-                || last_visible.map_or(true, |last| index > last);
+            let at_edge = first_visible.is_none_or(|first| index < first)
+                || last_visible.is_none_or(|last| index > last);
             if at_edge && *ch == ' ' {
                 '␠'
             } else if at_edge && *ch == '\t' {
@@ -1619,7 +1619,7 @@ impl Backend {
     }
 
     async fn validate_and_publish_open_schema_preview(&self, ticket: &ValidationTicket) -> bool {
-        let Some(schema_diags) = self.validate_open_schema_ticket(&ticket).await else {
+        let Some(schema_diags) = self.validate_open_schema_ticket(ticket).await else {
             return false;
         };
         self.publish_open_preview_if_current(ticket, schema_diags)
