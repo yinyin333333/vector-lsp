@@ -5079,15 +5079,17 @@ mod tests {
             plugin_host: None,
             publish_gates: Arc::clone(&publish_gates),
         });
-        let mut params = InitializeParams::default();
-        params.root_uri = Some(Url::parse("file:///E:/mod").unwrap());
-        params.initialization_options = Some(serde_json::json!({
-            "sessionGeneration": 42,
-            "referenceContextMode": "sibling",
-            "referenceRootUri": "file:///E:/explicit-workspace",
-            "includeSubfolders": false,
-            "workspaceDirectoryScopes": true
-        }));
+        let params = InitializeParams {
+            root_uri: Some(Url::parse("file:///E:/mod").unwrap()),
+            initialization_options: Some(serde_json::json!({
+                "sessionGeneration": 42,
+                "referenceContextMode": "sibling",
+                "referenceRootUri": "file:///E:/explicit-workspace",
+                "includeSubfolders": false,
+                "workspaceDirectoryScopes": true
+            })),
+            ..InitializeParams::default()
+        };
         service.inner().initialize(params).await.unwrap();
 
         let ws = workspace.read().await;

@@ -446,8 +446,10 @@ mod tests {
 
     #[test]
     fn settings_validation_rejects_ambiguous_delimiters_and_extensions() {
-        let mut settings = VectorLspSettings::default();
-        settings.delimiter = "||".to_string();
+        let mut settings = VectorLspSettings {
+            delimiter: "||".to_string(),
+            ..VectorLspSettings::default()
+        };
         assert!(
             settings
                 .validate()

@@ -2137,6 +2137,10 @@ function validate(ctx: PluginContext): string[] {
         let _ = std::fs::remove_file(path);
     }
 
+    #[expect(
+        clippy::type_complexity,
+        reason = "test helper returns the coordinated live, disk, and document fixtures used by workspace precedence tests"
+    )]
     fn open_shadow_sources() -> (
         HashMap<Url, Arc<DocumentData>>,
         HashMap<PathBuf, Arc<DocumentData>>,
