@@ -1098,27 +1098,23 @@ pub fn build_context(file_stem: &str, doc: &DocumentData) -> String {
         s.push_str(",\"__colstarts\":{");
         let mut first_cs = true;
         for (i, cell) in row.cells.iter().enumerate() {
-            if let Some(h) = doc.headers.get(i) {
-                if !h.is_empty() {
-                    if !first_cs {
-                        s.push(',');
-                    }
-                    first_cs = false;
-                    push_json_str(&mut s, h);
-                    s.push(':');
-                    s.push_str(&cell.col_start.to_string());
+            if let Some(h) = doc.headers.get(i).filter(|h| !h.is_empty()) {
+                if !first_cs {
+                    s.push(',');
                 }
+                first_cs = false;
+                push_json_str(&mut s, h);
+                s.push(':');
+                s.push_str(&cell.col_start.to_string());
             }
         }
         s.push('}');
         for (i, cell) in row.cells.iter().enumerate() {
-            if let Some(h) = doc.headers.get(i) {
-                if !h.is_empty() {
-                    s.push(',');
-                    push_json_str(&mut s, h);
-                    s.push(':');
-                    push_json_str(&mut s, &cell.value);
-                }
+            if let Some(h) = doc.headers.get(i).filter(|h| !h.is_empty()) {
+                s.push(',');
+                push_json_str(&mut s, h);
+                s.push(':');
+                push_json_str(&mut s, &cell.value);
             }
         }
         s.push('}');
@@ -1377,9 +1373,7 @@ fn strip_ts_inline(src: &str) -> String {
             continue;
         }
         if ch == ')' {
-            if paren_above_brace > 0 {
-                paren_above_brace -= 1;
-            }
+            paren_above_brace = paren_above_brace.saturating_sub(1);
             if ternary.len() > 1 {
                 ternary.pop();
             }
@@ -1440,22 +1434,21 @@ fn strip_ts_inline(src: &str) -> String {
             // (function/arrow params), or immediately after `)` (return-type
             // annotation — `): Type` is never a valid JS object-literal colon).
             let depth_ok = brace_depth == 0 || paren_above_brace > 0 || prev_out == Some(')');
-            let prev_ok = prev_out.map_or(false, |c| is_id(c) || matches!(c, ')' | ']' | '>'));
+            let prev_ok = prev_out.is_some_and(|c| is_id(c) || matches!(c, ')' | ']' | '>'));
             // What follows `:` must look like a type start
             let next_ok = chars[i + 1..]
                 .iter()
                 .find(|&&c| c != ' ' && c != '\t')
-                .map_or(false, |&c| {
+                .is_some_and(|&c| {
                     c.is_alphabetic() || c == '_' || matches!(c, '(' | '[' | '{' | '"' | '\'')
                 });
 
             // Also strip `const x: T`, `let x: T`, `var x: T` inside function
             // bodies where depth_ok would otherwise be false.
-            let var_decl_ok = !depth_ok && prev_out.map_or(false, is_id) && {
-                let trimmed = out.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+            let var_decl_ok = !depth_ok && prev_out.is_some_and(is_id) && {
+                let trimmed = out.trim_end_matches([' ', '\t', '\n', '\r']);
                 let before_id = trimmed.trim_end_matches(|c: char| is_id(c));
-                let before_id =
-                    before_id.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+                let before_id = before_id.trim_end_matches([' ', '\t', '\n', '\r']);
                 let kw_start = before_id
                     .rfind(|c: char| !is_id(c))
                     .map(|i| i + 1)
@@ -1482,9 +1475,8 @@ fn strip_ts_inline(src: &str) -> String {
             let after = skip_ws(&chars, i + 2);
             if after < n && (chars[after].is_alphabetic() || chars[after] == '_') {
                 let prev_out = out.chars().rev().find(|c| !c.is_whitespace());
-                let prev_expr = prev_out.map_or(false, |c| {
-                    is_id(c) || matches!(c, ')' | ']' | '"' | '\'' | '`')
-                });
+                let prev_expr =
+                    prev_out.is_some_and(|c| is_id(c) || matches!(c, ')' | ']' | '"' | '\'' | '`'));
                 if prev_expr {
                     i = after; // jump past `as ` + whitespace
                     i = skip_type_expr(&chars, i, false);
