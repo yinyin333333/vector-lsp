@@ -968,6 +968,10 @@ fn collect_layout_at_keys(content: &str, used: &mut HashSet<String>) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "source/span, rule/kind, severity, localization, and locale are the explicit d2rlint diagnostic contract"
+)]
 fn rule_diagnostic(
     source: &str,
     span: Span,

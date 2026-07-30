@@ -98,6 +98,10 @@ pub fn effective_workspace_sources_with_fallback_kind(
 /// open document > primary disk tier > explicit reference-root tier > bundled.
 /// In a standalone session the primary disk tier is the direct sibling folder;
 /// otherwise it is the normal workspace and the secondary tier is empty.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit cache and presence inputs keep open, primary, reference, and bundled source precedence auditable"
+)]
 pub fn effective_workspace_sources_with_priority_tiers(
     open_documents: &HashMap<Url, Arc<DocumentData>>,
     primary_cache: &HashMap<PathBuf, Arc<DocumentData>>,
