@@ -2492,6 +2492,14 @@ fn reconstruct_text(doc: &DocumentData, delimiter: char) -> String {
         .join("\n")
 }
 
+fn split_text_lines(text: &str) -> Vec<String> {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Apply a single LSP incremental content change to a lines buffer.
 fn apply_change(lines: &mut Vec<String>, range: tower_lsp::lsp_types::Range, new_text: &str) {
     let sl = range.start.line as usize;
@@ -2508,7 +2516,8 @@ fn apply_change(lines: &mut Vec<String>, range: tower_lsp::lsp_types::Range, new
         .map(|line| &line[utf16_offset_to_byte_index(line, ec)..])
         .unwrap_or_default();
 
-    let new_lines: Vec<&str> = new_text.split('\n').collect();
+    let normalized_new_text = new_text.replace("\r\n", "\n").replace('\r', "\n");
+    let new_lines: Vec<&str> = normalized_new_text.split('\n').collect();
     let replacement: Vec<String> = match new_lines.as_slice() {
         [] | [""] => vec![format!("{prefix}{suffix}")],
         [only] => vec![format!("{prefix}{}{suffix}", only.trim_end_matches('\r'))],
@@ -2937,7 +2946,7 @@ impl LanguageServer for Backend {
                     Err(DocumentChangeError::NotOpen)
                 } else {
                     let existing = workspace.open_json_text(&uri).unwrap_or_default();
-                    let mut lines = existing.lines().map(str::to_owned).collect::<Vec<_>>();
+                    let mut lines = split_text_lines(existing);
                     let mut full_text = None;
                     for change in &params.content_changes {
                         match change.range {
@@ -2945,12 +2954,10 @@ impl LanguageServer for Backend {
                                 apply_change(&mut lines, range, &change.text)
                             }
                             Some(range) => {
-                                let mut current = full_text
+                                let current = full_text
                                     .take()
-                                    .unwrap_or_else(|| lines.join("\n"))
-                                    .lines()
-                                    .map(str::to_owned)
-                                    .collect::<Vec<_>>();
+                                    .unwrap_or_else(|| lines.join("\n"));
+                                let mut current = split_text_lines(&current);
                                 apply_change(&mut current, range, &change.text);
                                 full_text = Some(current.join("\n"));
                             }
@@ -2986,11 +2993,11 @@ impl LanguageServer for Backend {
                 .map(|d| reconstruct_text(d, delimiter))
                 .unwrap_or_default();
 
-            let mut lines: Vec<String> = existing_text.lines().map(str::to_owned).collect();
+            let mut lines = split_text_lines(&existing_text);
             for change in &params.content_changes {
                 match change.range {
                     Some(range) => apply_change(&mut lines, range, &change.text),
-                    None => lines = change.text.lines().map(str::to_owned).collect(),
+                    None => lines = split_text_lines(&change.text),
                 }
             }
 
@@ -4336,6 +4343,15 @@ mod tests {
         assert_eq!(apply("A🙂B", 3, 3, "X"), "A🙂XB");
         assert_eq!(apply("A🙂B", 1, 3, ""), "AB");
         assert_eq!(apply("A🙂B\told", 5, 8, "new"), "A🙂B\tnew");
+    }
+
+    #[test]
+    fn incremental_json_changes_keep_bare_carriage_return_lines() {
+        let existing = "[\r  {\"id\":1}\r]";
+        let mut lines = split_text_lines(existing);
+        apply_change(&mut lines, Range::new(Position::new(1, 2), Position::new(1, 2)), "X");
+
+        assert_eq!(lines.join("\n"), "[\n  X{\"id\":1}\n]");
     }
 
     #[test]
