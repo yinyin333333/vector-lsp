@@ -1349,6 +1349,10 @@ fn strip_ts_inline(src: &str) -> String {
             }
             continue;
         }
+        if ch == '/' && regex_literal_can_start(&out) {
+            i = copy_regex_lit(&chars, i, &mut out);
+            continue;
+        }
 
         // ---- Depth bookkeeping ----------------------------------------------
         if ch == '{' {
@@ -1656,6 +1660,46 @@ fn copy_template_lit(chars: &[char], start: usize, out: &mut String) -> usize {
     i
 }
 
+fn regex_literal_can_start(out: &str) -> bool {
+    let trimmed = out.trim_end_matches(char::is_whitespace);
+    let previous = trimmed.chars().next_back();
+    previous.is_none()
+        || previous.is_some_and(|c| matches!(c, '=' | '(' | '[' | '{' | ',' | ':' | ';' | '!' | '&' | '|'))
+        || trimmed.ends_with("return")
+}
+
+fn copy_regex_lit(chars: &[char], start: usize, out: &mut String) -> usize {
+    out.push('/');
+    let mut i = start + 1;
+    let mut in_class = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        out.push(ch);
+        i += 1;
+        if ch == '\\' {
+            if i < chars.len() {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+        } else if ch == ']' {
+            in_class = false;
+        } else if ch == '/' && !in_class {
+            while i < chars.len() && is_id(chars[i]) {
+                out.push(chars[i]);
+                i += 1;
+            }
+            break;
+        } else if ch == '\n' || ch == '\r' {
+            break;
+        }
+    }
+    i
+}
+
 // --- Pass 1: structural declaration removal ---------------------------------
 
 fn strip_ts_declarations(src: &str) -> String {
@@ -1837,6 +1881,17 @@ mod tests {
         assert!(out.contains("function validate(ctx)"), "got: {out:?}");
         assert!(out.contains("const message"), "got: {out:?}");
         assert!(!out.contains(": string"), "got: {out:?}");
+    }
+
+    #[test]
+    fn typescript_preprocessing_preserves_regex_literals() {
+        let source = r#"function validate(ctx: PluginContext): string[] {
+  const regex = /https?:\/\/example/;
+  return regex.test("https://example");
+}"#;
+        let output = strip_typescript(source);
+
+        assert!(output.contains("/https?:\\/\\/example/"), "regex changed: {output:?}");
     }
 
     #[test]
