@@ -1292,8 +1292,7 @@ pub fn build_workspace_snapshot_from_sources(
 /// Full TypeScript → JavaScript preprocessor.  Chains structural stripping then
 /// inline annotation stripping.
 fn strip_typescript(src: &str) -> String {
-    let normalized = src.replace("\r\n", "\n").replace('\r', "\n");
-    strip_ts_inline(&strip_ts_declarations(&normalized))
+    strip_ts_inline(&strip_ts_declarations(src))
 }
 // --- Pass 2: inline annotation stripping ------------------------------------
 
@@ -1328,7 +1327,7 @@ fn strip_ts_inline(src: &str) -> String {
             continue;
         }
         if i + 1 < n && ch == '/' && chars[i + 1] == '/' {
-            while i < n && chars[i] != '\n' {
+            while i < n && chars[i] != '\n' && chars[i] != '\r' {
                 out.push(chars[i]);
                 i += 1;
             }
@@ -1664,7 +1663,8 @@ fn regex_literal_can_start(out: &str) -> bool {
     let trimmed = out.trim_end_matches(char::is_whitespace);
     let previous = trimmed.chars().next_back();
     previous.is_none()
-        || previous.is_some_and(|c| matches!(c, '=' | '(' | '[' | '{' | ',' | ':' | ';' | '!' | '&' | '|'))
+        || previous
+            .is_some_and(|c| matches!(c, '=' | '(' | '[' | '{' | ',' | ':' | ';' | '!' | '&' | '|'))
         || trimmed.ends_with("return")
 }
 
@@ -1891,7 +1891,67 @@ mod tests {
 }"#;
         let output = strip_typescript(source);
 
-        assert!(output.contains("/https?:\\/\\/example/"), "regex changed: {output:?}");
+        assert!(
+            output.contains("/https?:\\/\\/example/"),
+            "regex changed: {output:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_preprocessing_preserves_lf_crlf_and_cr_bytes() {
+        for separator in ["\n", "\r\n", "\r"] {
+            let source = [
+                "interface PluginContext {",
+                separator,
+                "  file: string;",
+                separator,
+                "}",
+                separator,
+                "function validate(ctx: PluginContext): string[] {",
+                separator,
+                "  // comment ends at the source line ending",
+                separator,
+                "  const escaped = \"\\\\r\\\\n\";",
+                separator,
+                "  const template = `first",
+                separator,
+                "second`;",
+                separator,
+                "  const regex = /https?:\\/\\/example/;",
+                separator,
+                "  return [];",
+                separator,
+                "}",
+                separator,
+            ]
+            .concat();
+            let output = strip_typescript(&source);
+
+            assert!(
+                !output.contains("interface PluginContext"),
+                "got: {output:?}"
+            );
+            assert!(output.contains("function validate(ctx)"), "got: {output:?}");
+            assert!(
+                output.contains("\\\\r\\\\n"),
+                "escaped string changed: {output:?}"
+            );
+            assert!(
+                output.contains(&["`first", separator, "second`"].concat()),
+                "template changed: {output:?}"
+            );
+            assert!(
+                output.contains("/https?:\\/\\/example/"),
+                "regex changed: {output:?}"
+            );
+            if separator == "\n" {
+                assert!(!output.contains('\r'), "LF output contains CR: {output:?}");
+            } else if separator == "\r" {
+                assert!(!output.contains('\n'), "CR output contains LF: {output:?}");
+            } else {
+                assert!(output.contains("\r\n"), "CRLF output lost CR: {output:?}");
+            }
+        }
     }
 
     #[test]
