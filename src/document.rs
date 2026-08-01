@@ -49,9 +49,11 @@ pub struct DocumentData {
 
 impl DocumentData {
     /// Parse a delimited text document into rows and cells.
-    /// Handles both LF and CRLF line endings (Rust's `str::lines` strips both).
+    /// Handles LF, CRLF, and bare CR line endings used by the editor's text
+    /// codec.
     pub fn parse(text: &str, delimiter: char) -> Self {
-        let mut line_iter = text.lines().enumerate();
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut line_iter = normalized.lines().enumerate();
         let delimiter_utf16_len = delimiter.len_utf16() as u32;
 
         let headers = match line_iter.next() {
@@ -154,5 +156,17 @@ mod tests {
         assert_eq!(document.header_span(1), Some((3, 9)));
         assert_eq!(document.cell_at(1, 2).map(|(index, _)| index), Some(0));
         assert_eq!(document.cell_at(1, 3).map(|(index, _)| index), Some(1));
+    }
+
+    #[test]
+    fn parse_accepts_bare_carriage_return_line_endings() {
+        let document = DocumentData::parse("code\rvalue\rnext", '\t');
+
+        assert_eq!(document.headers, vec!["code"]);
+        assert_eq!(document.rows.len(), 2);
+        assert_eq!(document.rows[0].line, 1);
+        assert_eq!(document.rows[0].cells[0].value, "value");
+        assert_eq!(document.rows[1].line, 2);
+        assert_eq!(document.rows[1].cells[0].value, "next");
     }
 }
