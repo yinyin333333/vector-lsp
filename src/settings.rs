@@ -83,7 +83,10 @@ impl Encoding {
     pub fn decode(&self, bytes: &[u8]) -> anyhow::Result<String> {
         match self {
             Encoding::Auto => Self::decode_auto(bytes),
-            Encoding::Utf8 => Ok(String::from_utf8_lossy(bytes).into_owned()),
+            Encoding::Utf8 => Ok(String::from_utf8_lossy(
+                bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes),
+            )
+            .into_owned()),
             Encoding::Latin1 => Ok(bytes.iter().map(|&b| b as char).collect()),
             Encoding::Utf16Le => Self::decode_utf16(bytes, false),
             Encoding::Utf16Be => Self::decode_utf16(bytes, true),
@@ -441,6 +444,16 @@ mod tests {
                 .decode(&[0xEF, 0xBB, 0xBF, b'A', b'B'])
                 .unwrap(),
             "AB"
+        );
+    }
+
+    #[test]
+    fn explicit_utf8_encoding_strips_a_utf8_bom_before_table_parsing() {
+        assert_eq!(
+            Encoding::Utf8
+                .decode(&[0xEF, 0xBB, 0xBF, b'c', b'o', b'd', b'e'])
+                .unwrap(),
+            "code"
         );
     }
 
