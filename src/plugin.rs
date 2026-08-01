@@ -1658,12 +1658,13 @@ fn copy_template_lit(chars: &[char], start: usize, out: &mut String) -> usize {
 // --- Pass 1: structural declaration removal ---------------------------------
 
 fn strip_ts_declarations(src: &str) -> String {
+    let normalized = src.replace("\r\n", "\n").replace('\r', "\n");
     let mut out: Vec<&str> = Vec::with_capacity(64);
     let mut in_block = false; // inside a removed { ... } body
     let mut after_decl = false; // saw keyword, waiting for opening { on next line
     let mut depth: usize = 0;
 
-    for line in src.lines() {
+    for line in normalized.lines() {
         if in_block {
             for ch in line.chars() {
                 match ch {
@@ -1745,10 +1746,16 @@ fn strip_ts_declarations(src: &str) -> String {
         }
     }
 
-    let sep = if src.contains("\r\n") { "\r\n" } else { "\n" };
+    let sep = if src.contains("\r\n") {
+        "\r\n"
+    } else if src.contains('\r') && !src.contains('\n') {
+        "\r"
+    } else {
+        "\n"
+    };
     let mut result = out.join(sep);
-    if src.ends_with('\n') || src.ends_with("\r\n") {
-        result.push('\n');
+    if src.ends_with('\n') || src.ends_with('\r') {
+        result.push_str(sep);
     }
     result
 }
@@ -1809,6 +1816,16 @@ mod tests {
             src.lines().count(),
             "line count preserved"
         );
+    }
+
+    #[test]
+    fn strips_interface_block_with_bare_carriage_return_line_endings() {
+        let src = "interface Foo {\r  bar: string;\r}\rfunction validate() {}\r";
+        let out = strip_ts_declarations(src);
+
+        assert!(!out.contains("interface"));
+        assert!(out.contains("function validate()"));
+        assert_eq!(out.split_terminator('\r').count(), 4);
     }
 
     #[test]
