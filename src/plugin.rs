@@ -1292,7 +1292,8 @@ pub fn build_workspace_snapshot_from_sources(
 /// Full TypeScript → JavaScript preprocessor.  Chains structural stripping then
 /// inline annotation stripping.
 fn strip_typescript(src: &str) -> String {
-    strip_ts_inline(&strip_ts_declarations(src))
+    let normalized = src.replace("\r\n", "\n").replace('\r', "\n");
+    strip_ts_inline(&strip_ts_declarations(&normalized))
 }
 // --- Pass 2: inline annotation stripping ------------------------------------
 
@@ -1826,6 +1827,16 @@ mod tests {
         assert!(!out.contains("interface"));
         assert!(out.contains("function validate()"));
         assert_eq!(out.split_terminator('\r').count(), 4);
+    }
+
+    #[test]
+    fn strips_inline_types_and_comments_with_bare_carriage_return_line_endings() {
+        let src = "function validate(ctx: PluginContext) {\r  // keep parsing\r  const message: string = \"ok\";\r  return [message];\r}\r";
+        let out = strip_typescript(src);
+
+        assert!(out.contains("function validate(ctx)"), "got: {out:?}");
+        assert!(out.contains("const message"), "got: {out:?}");
+        assert!(!out.contains(": string"), "got: {out:?}");
     }
 
     #[test]
