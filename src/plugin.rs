@@ -2141,10 +2141,7 @@ function validate(ctx: PluginContext): string[] {
         )
         .unwrap();
         let host = PluginHost::new(vec![path.clone()]).unwrap();
-        let fx = fixture(&[
-            ("target", "id\n1"),
-            ("source", "a\ta|b\nb|c\tother"),
-        ]);
+        let fx = fixture(&[("target", "id\n1"), ("source", "a\ta|b\nb|c\tother")]);
 
         let diagnostics = host
             .run(

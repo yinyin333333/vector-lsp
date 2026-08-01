@@ -2954,9 +2954,7 @@ impl LanguageServer for Backend {
                                 apply_change(&mut lines, range, &change.text)
                             }
                             Some(range) => {
-                                let current = full_text
-                                    .take()
-                                    .unwrap_or_else(|| lines.join("\n"));
+                                let current = full_text.take().unwrap_or_else(|| lines.join("\n"));
                                 let mut current = split_text_lines(&current);
                                 apply_change(&mut current, range, &change.text);
                                 full_text = Some(current.join("\n"));
@@ -4349,7 +4347,11 @@ mod tests {
     fn incremental_json_changes_keep_bare_carriage_return_lines() {
         let existing = "[\r  {\"id\":1}\r]";
         let mut lines = split_text_lines(existing);
-        apply_change(&mut lines, Range::new(Position::new(1, 2), Position::new(1, 2)), "X");
+        apply_change(
+            &mut lines,
+            Range::new(Position::new(1, 2), Position::new(1, 2)),
+            "X",
+        );
 
         assert_eq!(lines.join("\n"), "[\n  X{\"id\":1}\n]");
     }

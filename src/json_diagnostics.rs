@@ -1591,10 +1591,7 @@ mod tests {
         let source = "[\r  {\"id\":1,\"Key\":\"first\"},\r  {\"id\":1,\"Key\":\"second\"}]";
         let second_value = source.rfind("second").unwrap();
 
-        assert_eq!(
-            position_at(&source, second_value),
-            Position::new(2, 17)
-        );
+        assert_eq!(position_at(source, second_value), Position::new(2, 17));
     }
 
     #[test]
