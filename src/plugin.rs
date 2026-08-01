@@ -294,7 +294,7 @@ impl PluginHost {
                  var __firstLineCache={};\
                  var __filteredCvCache={};\
                  function lookupKey(file,col,value){\
-                     var k=file+'|'+col+'|'+value;\
+                     var k=JSON.stringify([file,col,value]);\
                      if(!(k in __lookupCache)){__lookupCache[k]=Deno.core.ops.op_lookup_key(file,col,value);}\
                      return __lookupCache[k];\
                  }\
@@ -302,7 +302,7 @@ impl PluginHost {
                      return Deno.core.ops.op_lookup_key_fixed4(file,col,value);\
                  }\
                  function getColumn(file,col){\
-                     var k=file+'|'+col;\
+                     var k=JSON.stringify([file,col]);\
                      if(!(k in __colCache)){__colCache[k]=Deno.core.ops.op_get_column(file,col)||undefined;}\
                      return __colCache[k];\
                  }\
@@ -316,17 +316,17 @@ impl PluginHost {
                      return Deno.core.ops.op_has_lookup_target(file,col);\
                  }\
                  function getColumnValues(stem,col){\
-                     var k=stem+'|'+col;\
+                     var k=JSON.stringify([stem,col]);\
                      if(!(k in __cvCache)){__cvCache[k]=Deno.core.ops.op_get_column_values(stem,col);}\
                      return __cvCache[k];\
                  }\
                  function getFirstColumnValueLine(stem,col,value){\
-                     var k=stem+'|'+col+'|'+value;\
+                     var k=JSON.stringify([stem,col,value]);\
                      if(!(k in __firstLineCache)){var result=Deno.core.ops.op_get_first_column_value_line(stem,col,value);__firstLineCache[k]=result===null?null:result.line;}\
                      return __firstLineCache[k];\
                  }\
                  function getFilteredColumnValues(stem,valueCol,filterCol,filterValue){\
-                     var k=stem+'|'+valueCol+'|'+filterCol+'|'+filterValue;\
+                     var k=JSON.stringify([stem,valueCol,filterCol,filterValue]);\
                      if(!(k in __filteredCvCache)){__filteredCvCache[k]=Deno.core.ops.op_get_filtered_column_values(stem,valueCol,filterCol,filterValue);}\
                      return __filteredCvCache[k];\
                  }\
@@ -2126,6 +2126,39 @@ function validate(ctx: PluginContext): string[] {
                 "NEWEST".to_string()
             ))
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn lookup_cache_keeps_column_and_value_boundaries_distinct() {
+        let path = std::env::temp_dir().join(format!(
+            "vector-lsp-lookup-cache-boundaries-{}.js",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "function validate(){return [{line:0,col:0,message:'first='+lookupKey('source','a','b|c')},{line:0,col:0,message:'second='+lookupKey('source','a|b','c')}];}\n",
+        )
+        .unwrap();
+        let host = PluginHost::new(vec![path.clone()]).unwrap();
+        let fx = fixture(&[
+            ("target", "id\n1"),
+            ("source", "a\ta|b\nb|c\tother"),
+        ]);
+
+        let diagnostics = host
+            .run(
+                build_context("target", fx.docs.get("target").unwrap()),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await;
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["first=true", "second=false"]);
+
         let _ = std::fs::remove_file(path);
     }
 
