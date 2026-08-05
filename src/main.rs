@@ -9,8 +9,6 @@ mod i18n_operations_europe_a;
 mod i18n_operations_pl_ru;
 mod i18n_operations_ptbr;
 mod json_diagnostics;
-#[cfg(test)]
-mod performance_measurement_tests;
 mod plugin;
 mod reference_data;
 mod runtime;
