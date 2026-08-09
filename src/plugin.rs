@@ -294,7 +294,7 @@ impl PluginHost {
                  var __firstLineCache={};\
                  var __filteredCvCache={};\
                  function lookupKey(file,col,value){\
-                     var k=file+'|'+col+'|'+value;\
+                     var k=JSON.stringify([file,col,value]);\
                      if(!(k in __lookupCache)){__lookupCache[k]=Deno.core.ops.op_lookup_key(file,col,value);}\
                      return __lookupCache[k];\
                  }\
@@ -302,7 +302,7 @@ impl PluginHost {
                      return Deno.core.ops.op_lookup_key_fixed4(file,col,value);\
                  }\
                  function getColumn(file,col){\
-                     var k=file+'|'+col;\
+                     var k=JSON.stringify([file,col]);\
                      if(!(k in __colCache)){__colCache[k]=Deno.core.ops.op_get_column(file,col)||undefined;}\
                      return __colCache[k];\
                  }\
@@ -316,17 +316,17 @@ impl PluginHost {
                      return Deno.core.ops.op_has_lookup_target(file,col);\
                  }\
                  function getColumnValues(stem,col){\
-                     var k=stem+'|'+col;\
+                     var k=JSON.stringify([stem,col]);\
                      if(!(k in __cvCache)){__cvCache[k]=Deno.core.ops.op_get_column_values(stem,col);}\
                      return __cvCache[k];\
                  }\
                  function getFirstColumnValueLine(stem,col,value){\
-                     var k=stem+'|'+col+'|'+value;\
+                     var k=JSON.stringify([stem,col,value]);\
                      if(!(k in __firstLineCache)){var result=Deno.core.ops.op_get_first_column_value_line(stem,col,value);__firstLineCache[k]=result===null?null:result.line;}\
                      return __firstLineCache[k];\
                  }\
                  function getFilteredColumnValues(stem,valueCol,filterCol,filterValue){\
-                     var k=stem+'|'+valueCol+'|'+filterCol+'|'+filterValue;\
+                     var k=JSON.stringify([stem,valueCol,filterCol,filterValue]);\
                      if(!(k in __filteredCvCache)){__filteredCvCache[k]=Deno.core.ops.op_get_filtered_column_values(stem,valueCol,filterCol,filterValue);}\
                      return __filteredCvCache[k];\
                  }\
@@ -1098,27 +1098,23 @@ pub fn build_context(file_stem: &str, doc: &DocumentData) -> String {
         s.push_str(",\"__colstarts\":{");
         let mut first_cs = true;
         for (i, cell) in row.cells.iter().enumerate() {
-            if let Some(h) = doc.headers.get(i) {
-                if !h.is_empty() {
-                    if !first_cs {
-                        s.push(',');
-                    }
-                    first_cs = false;
-                    push_json_str(&mut s, h);
-                    s.push(':');
-                    s.push_str(&cell.col_start.to_string());
+            if let Some(h) = doc.headers.get(i).filter(|h| !h.is_empty()) {
+                if !first_cs {
+                    s.push(',');
                 }
+                first_cs = false;
+                push_json_str(&mut s, h);
+                s.push(':');
+                s.push_str(&cell.col_start.to_string());
             }
         }
         s.push('}');
         for (i, cell) in row.cells.iter().enumerate() {
-            if let Some(h) = doc.headers.get(i) {
-                if !h.is_empty() {
-                    s.push(',');
-                    push_json_str(&mut s, h);
-                    s.push(':');
-                    push_json_str(&mut s, &cell.value);
-                }
+            if let Some(h) = doc.headers.get(i).filter(|h| !h.is_empty()) {
+                s.push(',');
+                push_json_str(&mut s, h);
+                s.push(':');
+                push_json_str(&mut s, &cell.value);
             }
         }
         s.push('}');
@@ -1331,7 +1327,7 @@ fn strip_ts_inline(src: &str) -> String {
             continue;
         }
         if i + 1 < n && ch == '/' && chars[i + 1] == '/' {
-            while i < n && chars[i] != '\n' {
+            while i < n && chars[i] != '\n' && chars[i] != '\r' {
                 out.push(chars[i]);
                 i += 1;
             }
@@ -1350,6 +1346,10 @@ fn strip_ts_inline(src: &str) -> String {
                 out.push('/');
                 i += 2;
             }
+            continue;
+        }
+        if ch == '/' && regex_literal_can_start(&out) {
+            i = copy_regex_lit(&chars, i, &mut out);
             continue;
         }
 
@@ -1377,9 +1377,7 @@ fn strip_ts_inline(src: &str) -> String {
             continue;
         }
         if ch == ')' {
-            if paren_above_brace > 0 {
-                paren_above_brace -= 1;
-            }
+            paren_above_brace = paren_above_brace.saturating_sub(1);
             if ternary.len() > 1 {
                 ternary.pop();
             }
@@ -1440,22 +1438,21 @@ fn strip_ts_inline(src: &str) -> String {
             // (function/arrow params), or immediately after `)` (return-type
             // annotation — `): Type` is never a valid JS object-literal colon).
             let depth_ok = brace_depth == 0 || paren_above_brace > 0 || prev_out == Some(')');
-            let prev_ok = prev_out.map_or(false, |c| is_id(c) || matches!(c, ')' | ']' | '>'));
+            let prev_ok = prev_out.is_some_and(|c| is_id(c) || matches!(c, ')' | ']' | '>'));
             // What follows `:` must look like a type start
             let next_ok = chars[i + 1..]
                 .iter()
                 .find(|&&c| c != ' ' && c != '\t')
-                .map_or(false, |&c| {
+                .is_some_and(|&c| {
                     c.is_alphabetic() || c == '_' || matches!(c, '(' | '[' | '{' | '"' | '\'')
                 });
 
             // Also strip `const x: T`, `let x: T`, `var x: T` inside function
             // bodies where depth_ok would otherwise be false.
-            let var_decl_ok = !depth_ok && prev_out.map_or(false, is_id) && {
-                let trimmed = out.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+            let var_decl_ok = !depth_ok && prev_out.is_some_and(is_id) && {
+                let trimmed = out.trim_end_matches([' ', '\t', '\n', '\r']);
                 let before_id = trimmed.trim_end_matches(|c: char| is_id(c));
-                let before_id =
-                    before_id.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+                let before_id = before_id.trim_end_matches([' ', '\t', '\n', '\r']);
                 let kw_start = before_id
                     .rfind(|c: char| !is_id(c))
                     .map(|i| i + 1)
@@ -1482,9 +1479,8 @@ fn strip_ts_inline(src: &str) -> String {
             let after = skip_ws(&chars, i + 2);
             if after < n && (chars[after].is_alphabetic() || chars[after] == '_') {
                 let prev_out = out.chars().rev().find(|c| !c.is_whitespace());
-                let prev_expr = prev_out.map_or(false, |c| {
-                    is_id(c) || matches!(c, ')' | ']' | '"' | '\'' | '`')
-                });
+                let prev_expr =
+                    prev_out.is_some_and(|c| is_id(c) || matches!(c, ')' | ']' | '"' | '\'' | '`'));
                 if prev_expr {
                     i = after; // jump past `as ` + whitespace
                     i = skip_type_expr(&chars, i, false);
@@ -1663,15 +1659,57 @@ fn copy_template_lit(chars: &[char], start: usize, out: &mut String) -> usize {
     i
 }
 
+fn regex_literal_can_start(out: &str) -> bool {
+    let trimmed = out.trim_end_matches(char::is_whitespace);
+    let previous = trimmed.chars().next_back();
+    previous.is_none()
+        || previous
+            .is_some_and(|c| matches!(c, '=' | '(' | '[' | '{' | ',' | ':' | ';' | '!' | '&' | '|'))
+        || trimmed.ends_with("return")
+}
+
+fn copy_regex_lit(chars: &[char], start: usize, out: &mut String) -> usize {
+    out.push('/');
+    let mut i = start + 1;
+    let mut in_class = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        out.push(ch);
+        i += 1;
+        if ch == '\\' {
+            if i < chars.len() {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+        } else if ch == ']' {
+            in_class = false;
+        } else if ch == '/' && !in_class {
+            while i < chars.len() && is_id(chars[i]) {
+                out.push(chars[i]);
+                i += 1;
+            }
+            break;
+        } else if ch == '\n' || ch == '\r' {
+            break;
+        }
+    }
+    i
+}
+
 // --- Pass 1: structural declaration removal ---------------------------------
 
 fn strip_ts_declarations(src: &str) -> String {
+    let normalized = src.replace("\r\n", "\n").replace('\r', "\n");
     let mut out: Vec<&str> = Vec::with_capacity(64);
     let mut in_block = false; // inside a removed { ... } body
     let mut after_decl = false; // saw keyword, waiting for opening { on next line
     let mut depth: usize = 0;
 
-    for line in src.lines() {
+    for line in normalized.lines() {
         if in_block {
             for ch in line.chars() {
                 match ch {
@@ -1753,10 +1791,16 @@ fn strip_ts_declarations(src: &str) -> String {
         }
     }
 
-    let sep = if src.contains("\r\n") { "\r\n" } else { "\n" };
+    let sep = if src.contains("\r\n") {
+        "\r\n"
+    } else if src.contains('\r') && !src.contains('\n') {
+        "\r"
+    } else {
+        "\n"
+    };
     let mut result = out.join(sep);
-    if src.ends_with('\n') || src.ends_with("\r\n") {
-        result.push('\n');
+    if src.ends_with('\n') || src.ends_with('\r') {
+        result.push_str(sep);
     }
     result
 }
@@ -1817,6 +1861,97 @@ mod tests {
             src.lines().count(),
             "line count preserved"
         );
+    }
+
+    #[test]
+    fn strips_interface_block_with_bare_carriage_return_line_endings() {
+        let src = "interface Foo {\r  bar: string;\r}\rfunction validate() {}\r";
+        let out = strip_ts_declarations(src);
+
+        assert!(!out.contains("interface"));
+        assert!(out.contains("function validate()"));
+        assert_eq!(out.split_terminator('\r').count(), 4);
+    }
+
+    #[test]
+    fn strips_inline_types_and_comments_with_bare_carriage_return_line_endings() {
+        let src = "function validate(ctx: PluginContext) {\r  // keep parsing\r  const message: string = \"ok\";\r  return [message];\r}\r";
+        let out = strip_typescript(src);
+
+        assert!(out.contains("function validate(ctx)"), "got: {out:?}");
+        assert!(out.contains("const message"), "got: {out:?}");
+        assert!(!out.contains(": string"), "got: {out:?}");
+    }
+
+    #[test]
+    fn typescript_preprocessing_preserves_regex_literals() {
+        let source = r#"function validate(ctx: PluginContext): string[] {
+  const regex = /https?:\/\/example/;
+  return regex.test("https://example");
+}"#;
+        let output = strip_typescript(source);
+
+        assert!(
+            output.contains("/https?:\\/\\/example/"),
+            "regex changed: {output:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_preprocessing_preserves_lf_crlf_and_cr_bytes() {
+        for separator in ["\n", "\r\n", "\r"] {
+            let source = [
+                "interface PluginContext {",
+                separator,
+                "  file: string;",
+                separator,
+                "}",
+                separator,
+                "function validate(ctx: PluginContext): string[] {",
+                separator,
+                "  // comment ends at the source line ending",
+                separator,
+                "  const escaped = \"\\\\r\\\\n\";",
+                separator,
+                "  const template = `first",
+                separator,
+                "second`;",
+                separator,
+                "  const regex = /https?:\\/\\/example/;",
+                separator,
+                "  return [];",
+                separator,
+                "}",
+                separator,
+            ]
+            .concat();
+            let output = strip_typescript(&source);
+
+            assert!(
+                !output.contains("interface PluginContext"),
+                "got: {output:?}"
+            );
+            assert!(output.contains("function validate(ctx)"), "got: {output:?}");
+            assert!(
+                output.contains("\\\\r\\\\n"),
+                "escaped string changed: {output:?}"
+            );
+            assert!(
+                output.contains(&["`first", separator, "second`"].concat()),
+                "template changed: {output:?}"
+            );
+            assert!(
+                output.contains("/https?:\\/\\/example/"),
+                "regex changed: {output:?}"
+            );
+            if separator == "\n" {
+                assert!(!output.contains('\r'), "LF output contains CR: {output:?}");
+            } else if separator == "\r" {
+                assert!(!output.contains('\n'), "CR output contains LF: {output:?}");
+            } else {
+                assert!(output.contains("\r\n"), "CRLF output lost CR: {output:?}");
+            }
+        }
     }
 
     #[test]
@@ -2137,6 +2272,40 @@ function validate(ctx: PluginContext): string[] {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn lookup_cache_keeps_column_and_value_boundaries_distinct() {
+        let path = std::env::temp_dir().join(format!(
+            "vector-lsp-lookup-cache-boundaries-{}.js",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "function validate(){return [{line:0,col:0,message:'first='+lookupKey('source','a','b|c')},{line:0,col:0,message:'second='+lookupKey('source','a|b','c')}];}\n",
+        )
+        .unwrap();
+        let host = PluginHost::new(vec![path.clone()]).unwrap();
+        let fx = fixture(&[("target", "id\n1"), ("source", "a\ta|b\nb|c\tother")]);
+
+        let diagnostics = host
+            .run(
+                build_context("target", fx.docs.get("target").unwrap()),
+                Arc::clone(&fx.index),
+                Arc::clone(&fx.snapshot),
+            )
+            .await;
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["first=true", "second=false"]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "test helper returns the coordinated live, disk, and document fixtures used by workspace precedence tests"
+    )]
     fn open_shadow_sources() -> (
         HashMap<Url, Arc<DocumentData>>,
         HashMap<PathBuf, Arc<DocumentData>>,

@@ -968,6 +968,10 @@ fn collect_layout_at_keys(content: &str, used: &mut HashSet<String>) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "source/span, rule/kind, severity, localization, and locale are the explicit d2rlint diagnostic contract"
+)]
 fn rule_diagnostic(
     source: &str,
     span: Span,
@@ -1011,8 +1015,28 @@ fn source_range(source: &str, span: Span) -> Range {
 
 fn position_at(source: &str, byte_offset: usize) -> Position {
     let prefix = source.get(..byte_offset).unwrap_or(source);
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
-    let current_line = prefix.rsplit_once('\n').map_or(prefix, |(_, line)| line);
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    let mut index = 0usize;
+    while index < prefix.len() {
+        match prefix.as_bytes()[index] {
+            b'\r' => {
+                line += 1;
+                index += 1;
+                if index < prefix.len() && prefix.as_bytes()[index] == b'\n' {
+                    index += 1;
+                }
+                line_start = index;
+            }
+            b'\n' => {
+                line += 1;
+                index += 1;
+                line_start = index;
+            }
+            _ => index += 1,
+        }
+    }
+    let current_line = &prefix[line_start..];
     // Editors decode the UTF-8 signature and expose the first JSON token at
     // character zero. Keep byte spans in the original source, but do not count
     // a leading BOM as an LSP character on line zero.
@@ -1560,6 +1584,24 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn json_diagnostic_positions_accept_bare_carriage_return_line_endings() {
+        let source = "[\r  {\"id\":1,\"Key\":\"first\"},\r  {\"id\":1,\"Key\":\"second\"}]";
+        let second_value = source.rfind("second").unwrap();
+
+        assert_eq!(position_at(source, second_value), Position::new(2, 17));
+    }
+
+    #[test]
+    fn invalid_json_syntax_positions_accept_bare_carriage_return_line_endings() {
+        let source = "[\r  {\"Key\":\"🙂\",}\r]";
+        let error = serde_json::from_str::<Value>(source).unwrap_err();
+        let span = syntax_error_span(source, &error);
+
+        assert_eq!(source_range(source, span).start, Position::new(1, 14));
+        assert_eq!(source_range(source, span).end, Position::new(1, 15));
     }
 
     #[test]

@@ -245,8 +245,7 @@ impl Schema {
         if let Some(f) = sf.find_field(col_name) {
             return Some(f);
         }
-        let appended = sf.append_files.clone();
-        for stem in &appended {
+        for stem in &sf.append_files {
             if let Some(f) = self.find_field_inner(stem, col_name, visited) {
                 return Some(f);
             }
@@ -284,13 +283,16 @@ impl Schema {
         let mut targets = HashSet::new();
         for schema_file in self.files.values() {
             for field in &schema_file.fields {
-                if let Some(ft) = &field.field_type {
-                    if ft.type_name == FieldTypeName::Reference {
-                        if let (Some(file), Some(col)) = (&ft.file, &ft.field) {
-                            targets.insert((file.to_lowercase(), col.to_lowercase()));
-                        }
-                    }
+                let Some(ft) = &field.field_type else {
+                    continue;
+                };
+                if ft.type_name != FieldTypeName::Reference {
+                    continue;
                 }
+                let (Some(file), Some(col)) = (&ft.file, &ft.field) else {
+                    continue;
+                };
+                targets.insert((file.to_lowercase(), col.to_lowercase()));
             }
         }
         targets

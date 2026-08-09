@@ -344,8 +344,10 @@ mod tests {
 
     #[test]
     fn supported_versions_are_explicit_and_1_13_maps_to_1_13c_resources() {
-        let mut settings = VectorLspSettings::default();
-        settings.schema_variant = "1.13".to_string();
+        let mut settings = VectorLspSettings {
+            schema_variant: "1.13".to_string(),
+            ..VectorLspSettings::default()
+        };
         assert_eq!(
             selected_reference_variant(&settings).unwrap().as_deref(),
             Some("1.13")

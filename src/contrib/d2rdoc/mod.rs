@@ -143,12 +143,12 @@ fn patch_1_13_reference_semantics(schema: &mut Schema) {
     // is consumed as zero/nonzero, so it must not use the schema Boolean
     // validator, which accepts only the canonical spellings 0 and 1.
     for (field, mem_size) in [("oninit", 8), ("level", 16), ("mod#", 8)] {
-        if let Some(field) = schema_field_mut(schema, "monequip", field) {
-            if let Some(field_type) = field.field_type.as_mut() {
-                field_type.type_name = FieldTypeName::Int;
-                field_type.data_length = 0;
-                field_type.mem_size = mem_size;
-            }
+        if let Some(field_type) =
+            schema_field_mut(schema, "monequip", field).and_then(|field| field.field_type.as_mut())
+        {
+            field_type.type_name = FieldTypeName::Int;
+            field_type.data_length = 0;
+            field_type.mem_size = mem_size;
         }
     }
 }
@@ -160,21 +160,21 @@ fn patch_2_4_reference_semantics(schema: &mut Schema) {
         ("monseq", "sequence"),
         ("automagic", "transformcolor"),
     ] {
-        if let Some(field) = schema_field_mut(schema, file, field) {
-            if let Some(field_type) = field.field_type.as_mut() {
-                field_type.type_name = FieldTypeName::String;
-            }
+        if let Some(field_type) =
+            schema_field_mut(schema, file, field).and_then(|field| field.field_type.as_mut())
+        {
+            field_type.type_name = FieldTypeName::String;
         }
     }
 
-    if let Some(monprop_id) = schema_field_mut(schema, "monprop", "Id") {
-        if let Some(field_type) = monprop_id.field_type.as_mut() {
-            field_type.type_name = FieldTypeName::Reference;
-            field_type.data_length = 47;
-            field_type.mem_size = 16;
-            field_type.file = Some("monstats".to_string());
-            field_type.field = Some("Id".to_string());
-        }
+    if let Some(field_type) =
+        schema_field_mut(schema, "monprop", "Id").and_then(|field| field.field_type.as_mut())
+    {
+        field_type.type_name = FieldTypeName::Reference;
+        field_type.data_length = 47;
+        field_type.mem_size = 16;
+        field_type.file = Some("monstats".to_string());
+        field_type.field = Some("Id".to_string());
     }
 }
 
@@ -221,8 +221,8 @@ fn load_js(runtime: &mut ScriptRuntime, dir: &Path, patches_dir: Option<&Path>) 
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
-            p.extension().map_or(false, |ext| ext == "js")
-                && p.file_name().map_or(true, |n| n != "_patches.js")
+            p.extension().is_some_and(|ext| ext == "js")
+                && p.file_name().is_none_or(|n| n != "_patches.js")
         })
         .collect();
     paths.sort();

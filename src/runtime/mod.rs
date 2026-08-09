@@ -171,10 +171,8 @@ fn index_doc(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
             if cell.value.trim().is_empty() {
                 continue;
             }
-            if let Some(h) = doc.headers.get(col_i) {
-                if !h.is_empty() {
-                    idx.insert(stem, h, cell.value.clone());
-                }
+            if let Some(h) = doc.headers.get(col_i).filter(|h| !h.is_empty()) {
+                idx.insert(stem, h, cell.value.clone());
             }
         }
     }
@@ -427,30 +425,24 @@ pub fn op_get_enum_table(
     #[string] col: &str,
 ) -> Option<EnumTableResult> {
     let debug = std::env::var("VLSP_DEBUG_LOGGING").is_ok();
-    let schema = state.try_borrow::<Arc<Schema>>();
-    if schema.is_none() {
+    let Some(schema) = state.try_borrow::<Arc<Schema>>() else {
         if debug {
             eprintln!("[enum-debug] no schema in OpState for file={file} col={col}");
         }
         return None;
-    }
-    let schema = schema.unwrap();
-    let field = schema.find_field(file, col);
-    if field.is_none() {
+    };
+    let Some(field) = schema.find_field(file, col) else {
         if debug {
             eprintln!("[enum-debug] find_field returned None for file={file} col={col}");
         }
         return None;
-    }
-    let field = field.unwrap();
-    let table = field.table.as_ref();
-    if table.is_none() {
+    };
+    let Some(table) = field.table.as_ref() else {
         if debug {
             eprintln!("[enum-debug] field has no table for file={file} col={col}");
         }
         return None;
-    }
-    let table = table.unwrap();
+    };
     let header_row = table.first()?;
     let headers = header_row.iter().map(cell_raw).collect();
     let rows = table

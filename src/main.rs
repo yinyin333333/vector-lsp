@@ -9,8 +9,6 @@ mod i18n_operations_europe_a;
 mod i18n_operations_pl_ru;
 mod i18n_operations_ptbr;
 mod json_diagnostics;
-#[cfg(test)]
-mod performance_measurement_tests;
 mod plugin;
 mod reference_data;
 mod runtime;
@@ -54,7 +52,7 @@ fn scan_plugin_dir(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
                     p.extension().and_then(|e| e.to_str()),
                     Some("ts") | Some("js")
                 )
-                && p.file_name().map_or(true, |n| n != "_patches.js")
+                && p.file_name().is_none_or(|n| n != "_patches.js")
         })
         .collect();
     found.sort();
@@ -317,7 +315,7 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_lowercase();
-        match std::fs::read(&path).and_then(|b| Ok(settings.encoding.decode(&b))) {
+        match std::fs::read(&path).map(|b| settings.encoding.decode(&b)) {
             Ok(Ok(src)) => {
                 parsed.push((path, stem, Arc::new(DocumentData::parse(&src, delimiter))))
             }
