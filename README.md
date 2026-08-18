@@ -34,17 +34,18 @@ The bundled `d2rdoc` schema loader ships schemas for the following game versions
 
 | `schema_variant` | Game version |
 |---|---|
-| `1.13` | Diablo II: Lord of Destruction 1.13 (classic) |
-| `2.4` | Diablo II: Resurrected 2.4 |
-| `3.1` | Diablo II: Resurrected 3.1 |
+| `3.3` | Diablo II: Resurrected 3.3 |
 | `3.2` | Diablo II: Resurrected 3.2 |
+| `3.1` | Diablo II: Resurrected 3.1 |
+| `2.4` | Diablo II: Resurrected 2.4 |
+| `1.13` | Diablo II: Lord of Destruction 1.13 (classic) |
 
 Each variant includes schemas for 65–80+ data files (armor, weapons, skills, monsters, cube recipes, item types, etc.) and a shared set of base plugins for cross-file validation.
 
 To use a bundled schema, set `schema_variant` in your `config.json`:
 
 ```json
-{ "schema_variant": "3.2" }
+{ "schema_variant": "3.3" }
 ```
 
 You can also point at a custom schema directory with `schema_path` — see [Configuration](#configuration).
@@ -82,7 +83,7 @@ Configuration is loaded from a JSON file (default: `config.json` in the working 
 | `extension` | string | `"txt"` | File extension to treat as workspace data files (without leading dot) |
 | `encoding` | `"utf8"` \| `"utf-16-le"` \| `"utf-16-be"` \| `"latin-1"` | `"utf8"` | File encoding |
 | `schema_loader` | string | `"d2rdoc"` | Schema driver to use (currently only `"d2rdoc"` is built in) |
-| `schema_variant` | string | `""` | Bundled schema set to use (e.g. `"3.2"`) |
+| `schema_variant` | string | `""` | Bundled schema set to use (e.g. `"3.3"`) |
 | `schema_path` | path | _(none)_ | Explicit path to a schema directory; overrides `schema_variant` auto-discovery |
 | `plugin_path` | path | _(none)_ | Directory of additional plugin files (`.ts`/`.js`); loaded on top of any bundled plugins |
 | `workspace_path` | path | _(none)_ | Root directory of the data file workspace; required for single-shot mode |
@@ -99,14 +100,14 @@ Configuration is loaded from a JSON file (default: `config.json` in the working 
 vector-lsp [--config-file <path>] [--single-shot] [--schema-path <path>]
 ```
 
-**Example `config.json` for D2R 3.2:**
+**Example `config.json` for D2R 3.3:**
 
 ```json
 {
   "delimiter": "\t",
   "extension": "txt",
   "encoding": "utf-16-le",
-  "schema_variant": "3.2",
+  "schema_variant": "3.3",
   "workspace_path": "/path/to/d2r/data/global/excel"
 }
 ```
@@ -570,10 +571,11 @@ src/
 contrib/           Runtime assets shipped alongside the binary
   d2rdoc/
     plugins/       Base plugins loaded for all variants
-    1.13/schema/   Diablo II 1.13 schema files
-    2.4/schema/    D2R 2.4 schema files
-    3.1/schema/    D2R 3.1 schema files
+    3.3/schema/    D2R 3.3 schema files
     3.2/schema/    D2R 3.2 schema files
+    3.1/schema/    D2R 3.1 schema files
+    2.4/schema/    D2R 2.4 schema files
+    1.13/schema/   Diablo II 1.13 schema files
   vector-lsp-plugin.d.ts   TypeScript type declarations for plugin authors
 ```
 

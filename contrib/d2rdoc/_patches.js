@@ -79,7 +79,7 @@
     if (!field || !field.type) return;
     field.type.field = "code";*/
 
-    // Local D2R 3.2 corpus/schema gaps found by vector-lsp phase 3:
+    // Local D2R RotW corpus/schema gaps found by vector-lsp phase 3:
     // - monsounds.txt uses a non-star EOL terminator column.
     // - sounds.txt carries a numeric trailing padding/header column.
     // - shrines.txt includes a numeric rarity field.
@@ -98,7 +98,7 @@
     });
 
     // Magic affix itype#/etype# fields use the binary fixed-width code
-    // resolver. 1.13/2.4 declare the fields directly; 3.1/3.2 inherit them
+    // resolver. 1.13/2.4 declare the fields directly; 3.1/3.2/3.3 inherit them
     // from SharedItemMods, so patch every possible owner without guessing the
     // selected schema variant.
     ["magicprefix", "magicsuffix", "SharedItemMods"].forEach(function (stem) {

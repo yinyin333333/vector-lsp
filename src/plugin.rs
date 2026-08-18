@@ -3789,7 +3789,7 @@ function validate(ctx: PluginContext): string[] {
             fx
         }
 
-        for version in ["3.1", "3.2"] {
+        for version in ["3.1", "3.2", "3.3"] {
             for parameter in 10..=20 {
                 let identifier = format!("par{parameter}");
                 let text = format!("skill\tcalc1\nrow\t{identifier}\n");
@@ -3821,6 +3821,11 @@ function validate(ctx: PluginContext): string[] {
         let skilldesc_diags = run_plugin("calcCheck.ts", "skilldesc", &skilldesc).await;
         assert_code(&skilldesc_diags[0], "calc.skill-param-alias");
         assert_eq!(data_str(&skilldesc_diags[0], "interpretedAs"), "par2");
+
+        let skilldesc_3_3 =
+            versioned_fixture("skilldesc", "skilldesc\tdsc3calca1\nrow\t6.25\n", "3.3");
+        let skilldesc_3_3_diags = run_plugin("calcCheck.ts", "skilldesc", &skilldesc_3_3).await;
+        assert_code(&skilldesc_3_3_diags[0], "calc.skilldesc-decimal-prefix");
 
         let older = versioned_fixture("skills", "skill\tcalc1\nrow\tpar10\n", "2.4");
         let older_diags = run_plugin("calcCheck.ts", "skills", &older).await;

@@ -26,7 +26,7 @@ $D2rdocRepo = "https://github.com/eezstreet/d2rdoc.git"
 
 # Version name assigned to data/files (the current/latest schema set).
 # Update this when a new game version ships and data/files is bumped.
-$CurrentVersion = "3.2"
+$CurrentVersion = "3.3"
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
