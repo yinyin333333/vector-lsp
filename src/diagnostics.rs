@@ -9,10 +9,9 @@ use crate::workspace::SymbolIndex;
 
 /// Validate a single document against the schema and symbol index.
 ///
-/// Three classes of diagnostic are produced:
-///   ERROR   — cross-reference target not found in the workspace symbol index
-///   WARNING — value cannot be parsed as the column's declared int/float type
-///   INFO    — column header is not declared in the schema and not in ignoreFields
+/// Diagnostics include duplicate unique keys, unresolved references (using the
+/// schema's severity policy), and invalid integer, float, or boolean values.
+/// Unknown headers do not currently produce a standalone diagnostic.
 #[cfg(test)]
 pub fn validate_document(
     file_stem: &str,
