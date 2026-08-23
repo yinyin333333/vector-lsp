@@ -83,6 +83,7 @@ pub struct FieldType {
     #[serde(default)]
     pub data_length: i64,
     #[serde(default)]
+    #[cfg_attr(not(feature = "d2rdoc"), allow(dead_code))]
     pub mem_size: i64,
     /// For `reference` fields: the file containing the target rows.
     pub file: Option<String>,

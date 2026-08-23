@@ -20,7 +20,7 @@ use crate::scan::{ScanFailure, ScanPolicy};
 use crate::schema::{FieldTypeName, ReferenceResolver, find_loader};
 use crate::schema_i18n::localized_field_description;
 use crate::settings::VectorLspSettings;
-#[cfg(test)]
+#[cfg(all(test, feature = "d2rdoc"))]
 use crate::source_selection::SourceKind;
 use crate::source_selection::normalized_file_stem_from_uri;
 use crate::workspace::{
@@ -5049,6 +5049,7 @@ mod tests {
         assert!(!workspace_identity_matches((4, 9), (5, 9)));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn d2rdoc_binary_patches_reach_the_actual_header_hover_path() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5274,6 +5275,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn hit_summon_mode_hover_is_limited_to_server_parameter_two_in_3_2() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5353,6 +5355,7 @@ mod tests {
         assert!(!client_markup.value.contains("HitSummon monster mode"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn monpet_consumestat_miss_hover_uses_plain_slot_skip_explanation() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5420,6 +5423,7 @@ mod tests {
         assert!(!markup.value.contains("loader"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn properties_stat_hover_reports_only_reachable_active_slots() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5509,6 +5513,7 @@ mod tests {
         assert!(!generic_markup.value.contains("has no effect"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn skills_range_hover_marks_trailing_space_and_reports_effective_code() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5574,6 +5579,7 @@ mod tests {
         assert!(!markup.value.contains("Source:"), "{}", markup.value);
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn ordinary_reference_hover_hides_source_selection() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

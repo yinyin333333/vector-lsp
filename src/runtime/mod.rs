@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "d2rdoc")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
+#[cfg(feature = "d2rdoc")]
+use anyhow::Context as _;
+use anyhow::Result;
 use deno_core::{FastString, JsRuntime, OpState, RuntimeOptions, extension, op2};
 use serde_json::Value;
 use tower_lsp::lsp_types::Url;
@@ -587,6 +591,7 @@ impl ScriptRuntime {
 
     /// Load and execute a JavaScript file from disk.
     /// The script name shown in error messages will be the filename.
+    #[cfg(feature = "d2rdoc")]
     pub fn exec_file(&mut self, path: &Path) -> Result<()> {
         let src = std::fs::read_to_string(path)?;
         self.inner

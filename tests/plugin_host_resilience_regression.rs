@@ -119,6 +119,7 @@ fn run_with_timeout(
 }
 
 // V-VLSP-11: exercise the actual sorted bundled set in one PluginHost.
+#[cfg(feature = "d2rdoc")]
 #[test]
 fn all_bundled_plugins_load_together_for_a_representative_fixture() {
     let tree = TempTree::new("bundled-plugins");
@@ -207,6 +208,7 @@ fn plugin_applicability_skips_only_declared_non_targets_and_keeps_custom_fallbac
     assert!(stdout.contains("CUSTOM_other"), "{stdout}\n{stderr}");
 }
 
+#[cfg(feature = "d2rdoc")]
 #[test]
 fn single_shot_duplicate_stems_use_one_lexical_source_for_every_consumer() {
     let tree = TempTree::new("single-shot-duplicate-stem");

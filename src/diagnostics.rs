@@ -949,7 +949,9 @@ fn unique_target_columns(file_stem: &str, schema: Option<&Schema>) -> HashSet<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{FieldType, SchemaField, SchemaFile, find_loader};
+    #[cfg(feature = "d2rdoc")]
+    use crate::schema::find_loader;
+    use crate::schema::{FieldType, SchemaField, SchemaFile};
     use crate::source_selection::SourceKind;
 
     #[test]
@@ -1888,6 +1890,7 @@ mod tests {
         assert!(!is_monpet_consumestat_reference("items", "consumestat1"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_3_2_magicsuffix_etype_accepts_space_padded_fixed4_reference() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1923,6 +1926,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_1_13_monprop_ids_are_name_keys_referenced_by_monstats() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1955,6 +1959,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_1_13_monequip_byte_fields_accept_signed_decimals_without_boolean_warnings() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1988,6 +1993,7 @@ mod tests {
         assert!(diagnostics[0].message.contains("standard integer"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_2_4_schema_uses_text_keys_and_monprop_id_reference() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2058,6 +2064,7 @@ mod tests {
         assert!(diagnostics[0].message.contains("monstats"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn schema_2_4_text_key_declarations_do_not_change_other_d2r_schema_versions() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2094,6 +2101,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn monequip_oninit_patch_is_limited_to_1_13() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2130,6 +2138,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_rotw_skills_range_uses_scoped_space_padded_fixed4_codes() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2189,6 +2198,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_3_2_properties_schema_skips_unreachable_val7_but_not_other_ints() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
