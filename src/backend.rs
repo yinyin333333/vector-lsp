@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, jsonrpc::Result as LspResult};
 
 use crate::diagnostics;
-use crate::document::{DocumentData, utf16_len, utf16_offset_to_byte_index};
+use crate::document::{DocumentData, apply_change, reconstruct_text, split_text_lines, utf16_len};
 use crate::i18n::{self, Locale};
 use crate::json_diagnostics::{
     JsonAnalysisTrigger, JsonDiagnosticBatch, JsonDiagnosticReport, JsonEvidenceProfile,
@@ -2471,75 +2471,6 @@ fn workspace_identity_matches(expected: (u64, u64), current: (u64, u64)) -> bool
     expected == current
 }
 
-/// Rebuild TSV text from a parsed document. Used to seed incremental change application.
-fn reconstruct_text(doc: &DocumentData, delimiter: char) -> String {
-    let delim_str = delimiter.to_string();
-    let header = doc.headers.join(&delim_str);
-    let rows: Vec<String> = doc
-        .rows
-        .iter()
-        .map(|row| {
-            row.cells
-                .iter()
-                .map(|c| c.value.as_str())
-                .collect::<Vec<_>>()
-                .join(&delim_str)
-        })
-        .collect();
-    std::iter::once(header)
-        .chain(rows)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn split_text_lines(text: &str) -> Vec<String> {
-    text.replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .split('\n')
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Apply a single LSP incremental content change to a lines buffer.
-fn apply_change(lines: &mut Vec<String>, range: tower_lsp::lsp_types::Range, new_text: &str) {
-    let sl = range.start.line as usize;
-    let sc = range.start.character;
-    let el = range.end.line as usize;
-    let ec = range.end.character;
-
-    let prefix = lines
-        .get(sl)
-        .map(|line| &line[..utf16_offset_to_byte_index(line, sc)])
-        .unwrap_or_default();
-    let suffix = lines
-        .get(el)
-        .map(|line| &line[utf16_offset_to_byte_index(line, ec)..])
-        .unwrap_or_default();
-
-    let normalized_new_text = new_text.replace("\r\n", "\n").replace('\r', "\n");
-    let new_lines: Vec<&str> = normalized_new_text.split('\n').collect();
-    let replacement: Vec<String> = match new_lines.as_slice() {
-        [] | [""] => vec![format!("{prefix}{suffix}")],
-        [only] => vec![format!("{prefix}{}{suffix}", only.trim_end_matches('\r'))],
-        [first, rest @ ..] => {
-            let mut v = vec![format!("{prefix}{}", first.trim_end_matches('\r'))];
-            for mid in &rest[..rest.len() - 1] {
-                v.push(mid.trim_end_matches('\r').to_string());
-            }
-            v.push(format!(
-                "{}{suffix}",
-                rest.last().unwrap().trim_end_matches('\r')
-            ));
-            v
-        }
-    };
-
-    while lines.len() <= el {
-        lines.push(String::new());
-    }
-    lines.splice(sl..=el, replacement);
-}
-
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
@@ -3751,16 +3682,6 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn range(start: u32, end: u32) -> Range {
-        Range::new(Position::new(0, start), Position::new(0, end))
-    }
-
-    fn apply(text: &str, start: u32, end: u32, replacement: &str) -> String {
-        let mut lines = vec![text.to_string()];
-        apply_change(&mut lines, range(start, end), replacement);
-        lines.join("\n")
-    }
-
     #[test]
     fn calculation_hover_details_count_unicode_characters_and_warn_without_truncating() {
         let value = format!("{}한", "x".repeat(255));
@@ -4333,32 +4254,6 @@ mod tests {
 
         std::fs::remove_dir_all(base).unwrap();
         socket_task.abort();
-    }
-
-    #[test]
-    fn incremental_changes_use_utf16_offsets_around_supplementary_characters() {
-        assert_eq!(apply("A🙂B", 1, 1, "X"), "AX🙂B");
-        assert_eq!(apply("A🙂B", 3, 3, "X"), "A🙂XB");
-        assert_eq!(apply("A🙂B", 1, 3, ""), "AB");
-        assert_eq!(apply("A🙂B\told", 5, 8, "new"), "A🙂B\tnew");
-    }
-
-    #[test]
-    fn incremental_json_changes_keep_bare_carriage_return_lines() {
-        let existing = "[\r  {\"id\":1}\r]";
-        let mut lines = split_text_lines(existing);
-        apply_change(
-            &mut lines,
-            Range::new(Position::new(1, 2), Position::new(1, 2)),
-            "X",
-        );
-
-        assert_eq!(lines.join("\n"), "[\n  X{\"id\":1}\n]");
-    }
-
-    #[test]
-    fn invalid_half_surrogate_offsets_clamp_to_the_code_point_start() {
-        assert_eq!(apply("A🙂B", 2, 2, "X"), "AX🙂B");
     }
 
     #[tokio::test]
