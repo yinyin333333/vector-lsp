@@ -1078,7 +1078,7 @@ function skillParamAlias(
             parameter: identifier,
         };
     }
-    if (selectedVersion !== "3.1" && selectedVersion !== "3.2") return null;
+    if (selectedVersion !== "3.1" && selectedVersion !== "3.2" && selectedVersion !== "3.3") return null;
     const match = /^par(1[0-9]|20)$/.exec(identifier);
     if (!match) return null;
     const parameterNumber = Number(match[1]);
@@ -1193,7 +1193,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
 
                 const revalidatedScope = scope !== "Monster scope BBE";
                 const confirmedSkillDescDisplay = ctx.file === "skilldesc"
-                    && selectedVersion === "3.2"
+                    && (selectedVersion === "3.2" || selectedVersion === "3.3")
                     && /^dsc3calc[ab][1-4]$/i.test(col);
                 const err = parseBBE(
                     val,

@@ -1,11 +1,11 @@
 {
     "formatVersion":  1,
-    "generatedAtUtc":  "2026-07-14T04:16:07Z",
+    "generatedAtUtc":  "2026-08-18T22:44:44Z",
     "provenance":  "Bundled versioned reference TXT bytes; runtime never reads external source directories.",
     "canonicalHashFormat":  "SHA-256 of UTF-8 (no BOM) lines: \u003cfile-sha256\u003e\u003ctwo spaces\u003e\u003clowercase-relative-path\u003e\u003cLF\u003e, sorted by lowercase path, including the final LF. Root paths are prefixed with gameVersion/.",
-    "totalFileCount":  331,
-    "totalBytes":  17726566,
-    "canonicalSha256":  "6930d9c39b5380fd4c242bae4df24a9b0115386bdc074cb8482007e2a033cab0",
+    "totalFileCount":  422,
+    "totalBytes":  22874009,
+    "canonicalSha256":  "71f25ac353cb02053a3e7326b530fb599b77dde4ef2b24e03fc78304c60e69f4",
     "datasets":  [
                      {
                          "schemaVariant":  "1.13",
@@ -2018,6 +2018,565 @@
                                            "bytes":  84209,
                                            "encoding":  "utf-8",
                                            "sha256":  "1eb8daff5de5e35704eb28febc84fb18ec0724d8e66f880e723399c751365f81"
+                                       },
+                                       {
+                                           "path":  "uniqueprefix.txt",
+                                           "bytes":  392,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "564ce70637b464c3cfe735c898310208b062751f80c5952afb78bbfb48f45369"
+                                       },
+                                       {
+                                           "path":  "uniquesuffix.txt",
+                                           "bytes":  527,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "5c9597373fd8c3621c94afc95aa80487c59c81349c663635a2cae2f156e862f7"
+                                       },
+                                       {
+                                           "path":  "wanderingmon.txt",
+                                           "bytes":  15,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "8ce585fd155e5230c378cb9f05e8dc779c357bf97688f21286d92516e3d8ec41"
+                                       },
+                                       {
+                                           "path":  "weapons.txt",
+                                           "bytes":  119607,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "b0890901f87fd42fcb474ce835b6e1a9fe1e66dbab4e7c2f236a3d9c3224f923"
+                                       }
+                                   ]
+                     },
+                     {
+                         "schemaVariant":  "3.3",
+                         "gameVersion":  "3.3",
+                         "source":  {
+                                        "datasetId":  "d2r_3_3casc"
+                                    },
+                         "resourcePath":  "3.3/reference",
+                         "fileCount":  91,
+                         "totalBytes":  5147443,
+                         "canonicalSha256":  "5e80a3e35ef95949ed5f5550965d357fc2bc064b700353589f53866fa0931bd6",
+                         "files":  [
+                                       {
+                                           "path":  "actinfo.txt",
+                                           "bytes":  1474,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "a168b0c70d821e7360e42a843f63c156f51315ea1e119ac92d2dc57f8e3a6e8e"
+                                       },
+                                       {
+                                           "path":  "armor.txt",
+                                           "bytes":  81583,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "734872b6dde85073c6ebaf4199ec4bd2b30efcbf9f0e60e381af2e22662a1b4f"
+                                       },
+                                       {
+                                           "path":  "armtype.txt",
+                                           "bytes":  45,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "288a8c7964e5d4dc0dc3e2a05f6793e9b3946a46b50e1604c86c172e91d291a1"
+                                       },
+                                       {
+                                           "path":  "automagic.txt",
+                                           "bytes":  4113,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "aa5b30aa2bf51460955a5fb3ad5e9017607eac8e8cce40f9c7b08aeb9ffcb7df"
+                                       },
+                                       {
+                                           "path":  "automap.txt",
+                                           "bytes":  157027,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "0c63a8907b3cb4cf165bb09ebcb08f627a5ac69b485fe0e4e8a5d94e9c380ca1"
+                                       },
+                                       {
+                                           "path":  "belts.txt",
+                                           "bytes":  4182,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "3f2c2772a9f2055d114127e1983abe9c40cf91e3e4240a0356dc7c23933f24c9"
+                                       },
+                                       {
+                                           "path":  "bodylocs.txt",
+                                           "bytes":  160,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "6b3a6ac0bb1cef5e7f216f083ef85082acedf22c4bbfacf5b254fb36ecd8bbd5"
+                                       },
+                                       {
+                                           "path":  "books.txt",
+                                           "bytes":  289,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "0e5dbad85ce7b05e0de9b13f1284ee8876f436c77d927e250d7bce5009e42493"
+                                       },
+                                       {
+                                           "path":  "charstats.txt",
+                                           "bytes":  3985,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "4f9e9b670727634298ae562753966baab7eae701ceeb4edd159ba10e18e899c2"
+                                       },
+                                       {
+                                           "path":  "colors.txt",
+                                           "bytes":  374,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "4c0e1274eab79daf5ecec10f12fea7fc11cce4db6d37f30ca0b4456dcad632ee"
+                                       },
+                                       {
+                                           "path":  "compcode.txt",
+                                           "bytes":  1862,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "a26b8437a13e5777801d8794ed49d103cdd5d274afbd013f09a107ca11ba2a4b"
+                                       },
+                                       {
+                                           "path":  "composit.txt",
+                                           "bytes":  207,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "f59507ae8d7d4fa6a919f502ea957b47369ac4077ae21e2fa28de360a515c604"
+                                       },
+                                       {
+                                           "path":  "cubemain.txt",
+                                           "bytes":  51936,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "785ae4a250244068cd1a5625760c03b86ea5dc73c23b08f6020fa2a240ab028d"
+                                       },
+                                       {
+                                           "path":  "cubemod.txt",
+                                           "bytes":  164,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "58c50ced7a4d922b5af42bf5738ff63d4e1306435beab1d994ce0b1214d4b138"
+                                       },
+                                       {
+                                           "path":  "difficultylevels.txt",
+                                           "bytes":  1076,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "8dc24e9f15c236f79dba3b039899155cf8e512ba387d97473583882358340c3e"
+                                       },
+                                       {
+                                           "path":  "elemtypes.txt",
+                                           "bytes":  195,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "91addf64ff87abb19dcceba77f6da6ed84e9e4194d30eeb1d69d36edd55cdc15"
+                                       },
+                                       {
+                                           "path":  "events.txt",
+                                           "bytes":  700,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "320e880dbdfbc3c8db714a56c15ef7fbfb48ff115bad6ce0a6843bb192ecfc9c"
+                                       },
+                                       {
+                                           "path":  "experience.txt",
+                                           "bytes":  8007,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "7a3676c71f6984e6bac6e7c2fb8f26fb1a2f876e90ea9a875915f3c2519d61b2"
+                                       },
+                                       {
+                                           "path":  "gamble.txt",
+                                           "bytes":  1945,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "fe26418cbfd3b774197d55d39525f6dddb5723203be9c38aeb0b552a09781635"
+                                       },
+                                       {
+                                           "path":  "gems.txt",
+                                           "bytes":  7688,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "955d22eb1e7fced4f138d975670de642e2410bfd72df03e2bcfcf689339e155b"
+                                       },
+                                       {
+                                           "path":  "hireling.txt",
+                                           "bytes":  33634,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "5401a23343348aaa2710337297e85d2edf124a5f84d16cd2ca4330d3209cfa8b"
+                                       },
+                                       {
+                                           "path":  "hitclass.txt",
+                                           "bytes":  279,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "57d43b716f248a7f72a4fef39b774569ecaccd644396fe3deebf29206b3b6b30"
+                                       },
+                                       {
+                                           "path":  "inventory.txt",
+                                           "bytes":  8423,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "d8f404c65ddecfa39838a7258958ded34531690f612b914d12a0b4234d0855a7"
+                                       },
+                                       {
+                                           "path":  "itemratio.txt",
+                                           "bytes":  662,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "f8ebb2128c09311d2f17f9f3ea9e1933441f3322ab2c4c203eb9858a00af90ff"
+                                       },
+                                       {
+                                           "path":  "itemstatcost.txt",
+                                           "bytes":  40068,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "99960b46e1963b20fa120bd4d1f77e4b28138330ccec65c7fab0bfd3db6fd8e8"
+                                       },
+                                       {
+                                           "path":  "itemtypes.txt",
+                                           "bytes":  10452,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "ae957abde89a2d0276a55feffa809e0ccbdaf82f65c6eaed9443b886b960e26a"
+                                       },
+                                       {
+                                           "path":  "itemuicategories.txt",
+                                           "bytes":  889,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "4d37d7496f9031b6dfe2f6e5edd99dd4d8a7fa8dfd7b2905e0eed0890998f48d"
+                                       },
+                                       {
+                                           "path":  "levelgroups.txt",
+                                           "bytes":  5943,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "e38dc1eff60432d35c75159e55584d69cb4bbd210b8be3d793bab92eefea51fa"
+                                       },
+                                       {
+                                           "path":  "levels.txt",
+                                           "bytes":  81527,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "67b99ee9c928d758c25a08f3fbc8d2e02acf57f98e5d351567e20a0fdf37427e"
+                                       },
+                                       {
+                                           "path":  "lowqualityitems.txt",
+                                           "bytes":  44,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "66a8a59dd88e0bed8130a08d803a057f9331f575a7c9a28f0aa622b34f098108"
+                                       },
+                                       {
+                                           "path":  "lvlmaze.txt",
+                                           "bytes":  3295,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "c1735a975013dc7e4804e0525c249f4c4b96ae59b714db4773cb20231b64dd64"
+                                       },
+                                       {
+                                           "path":  "lvlprest.txt",
+                                           "bytes":  130676,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "c0f715a9368f9f7ccfc3c52f3c1fbd782914945877fa1cd3a711e13c13320037"
+                                       },
+                                       {
+                                           "path":  "lvlsub.txt",
+                                           "bytes":  3313,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "4e394c3cb5e36375996960284c8c8b2bfb853c9e24fa832a0e376c9b2fe75808"
+                                       },
+                                       {
+                                           "path":  "lvltypes.txt",
+                                           "bytes":  10558,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "578a75beabf4a1c6cb11679a6f01008908ca419ccddf8f0239384fa15081ad36"
+                                       },
+                                       {
+                                           "path":  "lvlwarp.txt",
+                                           "bytes":  5534,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "e458abf0309fa6879e64c1aeffa964888a860e102a203a5c922df59d1f9678b6"
+                                       },
+                                       {
+                                           "path":  "magicprefix.txt",
+                                           "bytes":  59837,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "3cf2b5f730d5b93388146acdb6e2a7cffb0aa0bf23e2c95b2d80d00841720381"
+                                       },
+                                       {
+                                           "path":  "magicsuffix.txt",
+                                           "bytes":  68312,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "a697a051d988c78cbbbc8fe30d565cf473989817ce4d8a2bb08a321e2bc15c43"
+                                       },
+                                       {
+                                           "path":  "misc.txt",
+                                           "bytes":  62853,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "4b7259d1db5fa0a9da1d9530a019066cd40806ede91a4c0f4c69f81aebffdb7f"
+                                       },
+                                       {
+                                           "path":  "misscalc.txt",
+                                           "bytes":  1701,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "4fd7cc4a31bd2e5c961273e5ba1c85b2ffd19a35a45bd8ad6f7f683268018576"
+                                       },
+                                       {
+                                           "path":  "missiles.txt",
+                                           "bytes":  231770,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "d1d561538d08a9d59842482a82d890a80b83fe3ef460939efe985ec4e4904a27"
+                                       },
+                                       {
+                                           "path":  "monai.txt",
+                                           "bytes":  17560,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "7c7c7b8866c46078356bcc6118789699351004f39edea92922425699d6aa86a8"
+                                       },
+                                       {
+                                           "path":  "moncalc.txt",
+                                           "bytes":  558,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "5e144c6462a11e1b48df097799254743f24433a6ed803ee270d3a30150a5c706"
+                                       },
+                                       {
+                                           "path":  "monequip.txt",
+                                           "bytes":  1764,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "f731a867dc96c1f44d23e48b6e819b976280da907f7a95fca0dbfe97d9e83f0a"
+                                       },
+                                       {
+                                           "path":  "monlvl.txt",
+                                           "bytes":  14707,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "bda243efe1d1e9591f75b8cf97ac73f78ff691362381f35cc000233eb46c092a"
+                                       },
+                                       {
+                                           "path":  "monmode.txt",
+                                           "bytes":  238,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "2663c45b5ca74916db0114335babe7fc6dd9d357322892df501f7850e4385b52"
+                                       },
+                                       {
+                                           "path":  "monpet.txt",
+                                           "bytes":  116484,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "44963ae6373a8b58ffaf82df1a256e8f844f86d1b67b347a4b20064905cc788d"
+                                       },
+                                       {
+                                           "path":  "monplace.txt",
+                                           "bytes":  658,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "1bc9f2d3acf57b65eb7036641c54e7424e5f235bfcd79a71a4ec040b46bc0b75"
+                                       },
+                                       {
+                                           "path":  "monpreset.txt",
+                                           "bytes":  3603,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "235bedd087a3d66ba647b62d35f67d678e1d4b2c3cc6549d1bf31d17b2b4003d"
+                                       },
+                                       {
+                                           "path":  "monprop.txt",
+                                           "bytes":  2454,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "2e7b22f19aa571f1ee3cca8426e219d146471b0b13a25c5fb70a452c2c8c9f4d"
+                                       },
+                                       {
+                                           "path":  "monseq.txt",
+                                           "bytes":  28393,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "a48a884a654cab7cafe0be2764fa8a77f428a9b48855d27461d133a1f553898c"
+                                       },
+                                       {
+                                           "path":  "monsounds.txt",
+                                           "bytes":  25111,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "8ab5439dcf8d26b1b0f1b3a3413e07edfbc6c0f2ff83f90a5f5d3604029988f0"
+                                       },
+                                       {
+                                           "path":  "monstats.txt",
+                                           "bytes":  494490,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "8831fce35fc549a4849b13a1bd467eb34913f58b8269c0c1bbfa76aeabb6d32e"
+                                       },
+                                       {
+                                           "path":  "monstats2.txt",
+                                           "bytes":  140282,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "a5d0f396d7916299f0925ebfbe13fbf61f1ded6d4b0577fa861cca81bac04c92"
+                                       },
+                                       {
+                                           "path":  "montype.txt",
+                                           "bytes":  1312,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "956f8d116381d526985630858e6cdcb3941d446a92699dc074e8a7047616ef5f"
+                                       },
+                                       {
+                                           "path":  "monumod.txt",
+                                           "bytes":  3236,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "3a192913d0f45fcd6fa3660b080040027586c5224af0d6a749fae7ae912fd0ad"
+                                       },
+                                       {
+                                           "path":  "npc.txt",
+                                           "bytes":  1289,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "a08a6e0f9f3e8a9c3341d73d07b9f4a8e580b7c155f4439cd7e79a43e05080e5"
+                                       },
+                                       {
+                                           "path":  "objects.txt",
+                                           "bytes":  208570,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "2e39bd709d38386ed5657693f202767e733e85691f4bd680372e219e93579dc7"
+                                       },
+                                       {
+                                           "path":  "objgroup.txt",
+                                           "bytes":  10333,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "4b16d5f6e4fc35985148d7576519f484f5e270a22abb697d247cdbd2a836d8b7"
+                                       },
+                                       {
+                                           "path":  "objmode.txt",
+                                           "bytes":  114,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "23fd7ab06a6942239c75ddd97540d89b16fcd88f51a956e61794700353babec3"
+                                       },
+                                       {
+                                           "path":  "objpreset.txt",
+                                           "bytes":  13096,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "277f58c9216433bbddc3f39ce9193526a35256481f2deb9bc312e27f6c3eed1c"
+                                       },
+                                       {
+                                           "path":  "objtype.txt",
+                                           "bytes":  9052,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "7f06868dbdad44c10a4f4c6742238568430ecc2f0cef6de7d092d6cf48efdcb0"
+                                       },
+                                       {
+                                           "path":  "overlay.txt",
+                                           "bytes":  32489,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "d683b4d70f9242fd55f4697a0152fd552cccec0a28920d88dcf0aee84fe36ba9"
+                                       },
+                                       {
+                                           "path":  "pettype.txt",
+                                           "bytes":  1565,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "56b3ff2da487a53f39be9e5e5e9d1609966e37cfe7fd408375b1bff8336df975"
+                                       },
+                                       {
+                                           "path":  "playerclass.txt",
+                                           "bytes":  141,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "f0d3ac87ee6d565d7b311be4023d808ffa50bf36c331a2c6a298be9178d2457a"
+                                       },
+                                       {
+                                           "path":  "plrmode.txt",
+                                           "bytes":  302,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "23106da08603bc215624e2837f3990b5ed4b5521bbe8b4a80b0ea6b6502fb8e3"
+                                       },
+                                       {
+                                           "path":  "plrtype.txt",
+                                           "bytes":  126,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "9155b6aa48974ebe619b0cfe65a8750c19a15c6f410b7a511d5251a0b2d28b0c"
+                                       },
+                                       {
+                                           "path":  "properties.txt",
+                                           "bytes":  37952,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "382528362751c68646e98d4a296c357276ab9a1ee0b7053c29e5df6b6252a1ef"
+                                       },
+                                       {
+                                           "path":  "propertygroups.txt",
+                                           "bytes":  3779,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "926d7f3c937d325d60aecebdcf25e246449b5004be48a14de1e30918facdfe64"
+                                       },
+                                       {
+                                           "path":  "qualityitems.txt",
+                                           "bytes":  459,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "2aadd8c89316f3c58dd958839776ab01c3937a5e2e5d03188fc26b27309f4444"
+                                       },
+                                       {
+                                           "path":  "rareprefix.txt",
+                                           "bytes":  1474,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "5ca9268675ab07cfbbcc74380bee6f76793a16df4fd9d534ef1e87ffde1cc289"
+                                       },
+                                       {
+                                           "path":  "raresuffix.txt",
+                                           "bytes":  4384,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "3e1c88bb069730d42f0586a3e585b67b05c7a010920ed727d0432101a956f493"
+                                       },
+                                       {
+                                           "path":  "runes.txt",
+                                           "bytes":  25003,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "4822d163649517a6a0a552e86b20b50accde0efe450ece5a9fb986308582f4c8"
+                                       },
+                                       {
+                                           "path":  "runeworduicategories.txt",
+                                           "bytes":  106,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "9eca4880fccce2f00e1fb0c0e4807ddcb738e607f56e416ae248a03be0b52cc9"
+                                       },
+                                       {
+                                           "path":  "setitems.txt",
+                                           "bytes":  31325,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "1aa7e5dbb16e27442634a630489b3eeebc37f568bf90a1afa761ea1e54557db4"
+                                       },
+                                       {
+                                           "path":  "sets.txt",
+                                           "bytes":  7114,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "3717d71ffb5a89087b1bfb9b191b625d11fda1232de9ac3e50697d1c894f9614"
+                                       },
+                                       {
+                                           "path":  "shrines.txt",
+                                           "bytes":  2474,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "b937a0f5f20c3471b1ff035807e500b3deda21193eb637f49a918a27d89ebe93"
+                                       },
+                                       {
+                                           "path":  "skillcalc.txt",
+                                           "bytes":  5225,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "4028d9985368b89fe5d84a93f60177ecc34957599a170a4f8496ddd169636a4f"
+                                       },
+                                       {
+                                           "path":  "skilldesc.txt",
+                                           "bytes":  95092,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "cdf11c518eab9fe678616a237fc64b28cea5ea51649ec641a14e09b06ea34b38"
+                                       },
+                                       {
+                                           "path":  "skills.txt",
+                                           "bytes":  270115,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "56944cb6b6b0f3c57f7b690977987a732afeafc961fa9dc969e7796e54c93f3f"
+                                       },
+                                       {
+                                           "path":  "soundenviron.txt",
+                                           "bytes":  20261,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "f7c4f82380d239a82dce54e2987b8f624933c16a4fb100150b7cec7243a00f78"
+                                       },
+                                       {
+                                           "path":  "sounds.txt",
+                                           "bytes":  2022802,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "c80b4d612e6f33edfea589d2fb6757b8fb92fadd8fc8a87a6e89ca6eeee2a512"
+                                       },
+                                       {
+                                           "path":  "states.txt",
+                                           "bytes":  26643,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "edca1756ad868308e91dd088708d69b3a583b6187edd0c0c001d4dbb8644d5c7"
+                                       },
+                                       {
+                                           "path":  "storepage.txt",
+                                           "bytes":  85,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "8f9cdd23c8b6a77dc0674ae2f2941b7e7e600ec0962ea96fc3c2e8a508aae690"
+                                       },
+                                       {
+                                           "path":  "superuniques.txt",
+                                           "bytes":  10518,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "f585ddb62b8f7e973a6343d278bdb6a243444ccba93ef95c0eacd8fab9f41720"
+                                       },
+                                       {
+                                           "path":  "treasureclassex.txt",
+                                           "bytes":  162624,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "3abbfc59535e67cf52b0256b3518623edba072eb4235e7d1824a7f847abeca6d"
+                                       },
+                                       {
+                                           "path":  "uniqueappellation.txt",
+                                           "bytes":  294,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "fbb5661f61f578219cd6b72b6709a319c0ee906fb9b1fb44f018ab17c3aa4c1a"
+                                       },
+                                       {
+                                           "path":  "uniqueitems.txt",
+                                           "bytes":  84464,
+                                           "encoding":  "utf-8",
+                                           "sha256":  "c9e01849630742f630babb0bdd33b2e0f5689bd0e13e71f1da69f8e3e8d238a2"
                                        },
                                        {
                                            "path":  "uniqueprefix.txt",

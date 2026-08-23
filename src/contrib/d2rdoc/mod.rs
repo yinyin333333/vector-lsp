@@ -110,8 +110,8 @@ impl SchemaLoader for D2rDocLoader {
         if self.variant == "2.4" {
             patch_2_4_reference_semantics(&mut schema);
         }
-        if self.variant == "3.2" {
-            patch_3_2_reference_semantics(&mut schema);
+        if self.variant == "3.2" || self.variant == "3.3" {
+            patch_rotw_reference_semantics(&mut schema);
         }
         Ok(schema)
     }
@@ -194,7 +194,7 @@ fn schema_field_mut<'a>(
         })
 }
 
-fn patch_3_2_reference_semantics(schema: &mut Schema) {
+fn patch_rotw_reference_semantics(schema: &mut Schema) {
     let Some(skills) = schema.files.get_mut("skills") else {
         return;
     };

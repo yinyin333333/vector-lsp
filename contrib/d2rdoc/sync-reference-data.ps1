@@ -12,7 +12,8 @@ $datasets = @(
     [ordered]@{ schemaVariant = "1.13"; gameVersion = "1.13c"; datasetId = "113c" },
     [ordered]@{ schemaVariant = "2.4"; gameVersion = "2.4"; datasetId = "69270" },
     [ordered]@{ schemaVariant = "3.1"; gameVersion = "3.1"; datasetId = "92198" },
-    [ordered]@{ schemaVariant = "3.2"; gameVersion = "3.2"; datasetId = "92777a" }
+    [ordered]@{ schemaVariant = "3.2"; gameVersion = "3.2"; datasetId = "92777a" },
+    [ordered]@{ schemaVariant = "3.3"; gameVersion = "3.3"; datasetId = "d2r_3_3casc" }
 )
 
 $contribRoot = $PSScriptRoot

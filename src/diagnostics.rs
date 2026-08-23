@@ -233,7 +233,7 @@ pub fn validate_document_for_locale(
                             let properties_stat_func =
                                 properties_stat_dispatch_func(file_stem, doc, row, col_name);
                             let skills_range =
-                                is_3_2_skills_range_reference(file_stem, col_name, ft.resolver);
+                                is_rotw_skills_range_reference(file_stem, col_name, ft.resolver);
                             let data = if monpet_consume_stat {
                                 Some(serde_json::json!({
                                     "rule": "reference",
@@ -529,7 +529,7 @@ pub(crate) fn is_hit_summon_mode_cell(
     column: &str,
     game_version: Option<&str>,
 ) -> bool {
-    if game_version != Some("3.2")
+    if !matches!(game_version, Some("3.2" | "3.3"))
         || !file_stem.eq_ignore_ascii_case("missiles")
         || !column.eq_ignore_ascii_case("sHitPar2")
     {
@@ -829,7 +829,7 @@ pub(crate) fn is_properties_stat_reference(file_stem: &str, column: &str) -> boo
     file_stem.eq_ignore_ascii_case("properties") && property_slot(column, "stat").is_some()
 }
 
-fn is_3_2_skills_range_reference(
+fn is_rotw_skills_range_reference(
     file_stem: &str,
     column: &str,
     resolver: ReferenceResolver,
@@ -1669,6 +1669,28 @@ mod tests {
                 .and_then(|value| value.as_str())
                 != Some("hit-summon-mode")
         }));
+
+        let diagnostics_3_3 = validate_document_for_version(
+            "missiles",
+            &document,
+            Some(&schema),
+            &SymbolIndex::new(),
+            Some("3.3"),
+        );
+        assert_eq!(
+            diagnostics_3_3
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("rule"))
+                        .and_then(|value| value.as_str())
+                        == Some("hit-summon-mode")
+                })
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -2098,7 +2120,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_3_2_skills_range_uses_scoped_space_padded_fixed4_codes() {
+    fn loaded_rotw_skills_range_uses_scoped_space_padded_fixed4_codes() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("contrib")
             .join("d2rdoc");
@@ -2128,7 +2150,7 @@ mod tests {
         }));
 
         let schema_3_1_dir = contrib.join("3.1").join("schema");
-        let schema_3_1 = find_loader("d2rdoc", "3.1".to_string(), Some(contrib))
+        let schema_3_1 = find_loader("d2rdoc", "3.1".to_string(), Some(contrib.clone()))
             .unwrap()
             .load(Some(&schema_3_1_dir))
             .unwrap();
@@ -2139,6 +2161,20 @@ mod tests {
                 .map(|field| field.resolver),
             Some(ReferenceResolver::AsciiCi),
             "the custom 3.2 descriptor must not be applied to 3.1"
+        );
+
+        let schema_3_3_dir = contrib.join("3.3").join("schema");
+        let schema_3_3 = find_loader("d2rdoc", "3.3".to_string(), Some(contrib))
+            .unwrap()
+            .load(Some(&schema_3_3_dir))
+            .unwrap();
+        assert_eq!(
+            schema_3_3
+                .find_field("skills", "range")
+                .and_then(|field| field.field_type.as_ref())
+                .map(|field| field.resolver),
+            Some(ReferenceResolver::Fixed4),
+            "the RotW descriptor must be applied to 3.3"
         );
     }
 
