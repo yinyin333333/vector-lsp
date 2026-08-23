@@ -79,6 +79,20 @@ pub fn validate_document_for_locale(
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
+    let field_types: Vec<_> = doc
+        .headers
+        .iter()
+        .map(|header| {
+            if header.is_empty() {
+                None
+            } else {
+                schema
+                    .and_then(|schema| schema.find_field(file_stem, header))
+                    .and_then(|field| field.field_type.as_ref())
+            }
+        })
+        .collect();
+
     let target_columns = unique_target_columns(file_stem, schema);
     let mut seen_targets: HashMap<usize, HashMap<String, (String, u32, u32)>> = HashMap::new();
     for (idx, header) in doc.headers.iter().enumerate() {
@@ -142,11 +156,9 @@ pub fn validate_document_for_locale(
                 }
             }
 
-            let field_type = schema
-                .and_then(|s| s.find_field(file_stem, col_name))
-                .and_then(|f| f.field_type.as_ref());
-
-            let Some(ft) = field_type else { continue };
+            let Some(ft) = field_types.get(col_idx).copied().flatten() else {
+                continue;
+            };
 
             let cell_end = cell.col_start + utf16_len(&cell.value);
             let cell_range = Range {
@@ -480,7 +492,7 @@ pub fn attach_display_context(doc: &DocumentData, diagnostics: &mut [Diagnostic]
         let Some((column_index, _)) = doc.cell_at(line, character) else {
             continue;
         };
-        let Some(row) = doc.rows.iter().find(|row| row.line == line) else {
+        let Some(row) = doc.row_at(line) else {
             continue;
         };
         let Some(column_name) = doc

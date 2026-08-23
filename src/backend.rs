@@ -3463,7 +3463,7 @@ impl LanguageServer for Backend {
             let symbols = ws.symbols_for_uri(uri);
             let cell_col_start = cell.col_start;
             let cell_len = utf16_len(&cell.value);
-            let current_row = doc.rows.iter().find(|row| row.line == pos.line);
+            let current_row = doc.row_at(pos.line);
             let reference_cell_is_consumed = current_row.is_none_or(|row| {
                 diagnostics::reference_cell_is_consumed(&file_stem, doc, row, &col_name)
             });

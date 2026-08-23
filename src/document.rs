@@ -123,13 +123,20 @@ impl DocumentData {
         Some((start, start + utf16_len(header)))
     }
 
+    /// Return the data row at the given 0-based document line. Parsed rows are
+    /// contiguous from line 1; verify the stored line to reject malformed data.
+    pub fn row_at(&self, line: u32) -> Option<&Row> {
+        let row = self.rows.get(line.checked_sub(1)? as usize)?;
+        (row.line == line).then_some(row)
+    }
+
     /// Return the (column_index, &Cell) for the given cursor position, or None if
     /// the position is not within any data row (e.g. cursor is on the header line).
     ///
     /// Finds the last cell whose `col_start` is ≤ `character`, so a cursor sitting
     /// on a trailing delimiter is attributed to the preceding cell.
     pub fn cell_at(&self, line: u32, character: u32) -> Option<(usize, &Cell)> {
-        let row = self.rows.iter().find(|r| r.line == line)?;
+        let row = self.row_at(line)?;
         let mut found = None;
         for (i, cell) in row.cells.iter().enumerate() {
             if cell.col_start <= character {
@@ -154,6 +161,9 @@ mod tests {
         assert_eq!(document.header_at(2), Some(0));
         assert_eq!(document.header_at(3), Some(1));
         assert_eq!(document.header_span(1), Some((3, 9)));
+        assert!(document.row_at(0).is_none());
+        assert_eq!(document.row_at(1).map(|row| row.line), Some(1));
+        assert!(document.row_at(2).is_none());
         assert_eq!(document.cell_at(1, 2).map(|(index, _)| index), Some(0));
         assert_eq!(document.cell_at(1, 3).map(|(index, _)| index), Some(1));
     }

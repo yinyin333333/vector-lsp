@@ -1163,7 +1163,7 @@ pub fn build_hover_context(
     row_line: u32,
     doc: &DocumentData,
 ) -> Value {
-    let row = doc.rows.iter().find(|r| r.line == row_line);
+    let row = doc.row_at(row_line);
     let row_obj: serde_json::Map<String, Value> = row
         .map(|r| {
             r.cells
