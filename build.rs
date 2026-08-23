@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process::Command;
 
+const REQUIRED_SCHEMA_VARIANTS: &[&str] = &["1.13", "2.4", "3.1", "3.2", "3.3"];
+
 fn main() {
     // V8 (via deno_core) uses ETW and registry APIs that live in advapi32.
     // When cargo builds with an explicit --target triple (as cargo-dist does),
@@ -28,7 +30,10 @@ fn main() {
             .status();
 
         match status {
-            Ok(s) if s.success() => {}
+            Ok(s) if s.success() && schemas_present() => {}
+            Ok(s) if s.success() => println!(
+                "cargo:warning=sync-schemas.ps1 completed but required schema files are still incomplete"
+            ),
             Ok(s) => println!(
                 "cargo:warning=sync-schemas.ps1 exited with {s}; \
                  schema files may be incomplete"
@@ -43,22 +48,24 @@ fn main() {
     copy_contrib_to_target();
 }
 
-/// Returns true if at least one contrib/d2rdoc/<version>/schema/ directory
-/// contains files, indicating schemas have been synced.
+/// Returns true only when every schema variant shipped by this checkout has at
+/// least one JavaScript schema file. A partial or placeholder-only sync must not
+/// suppress the existing schema recovery path.
 fn schemas_present() -> bool {
-    let contrib = Path::new("contrib/d2rdoc");
-    let Ok(entries) = std::fs::read_dir(contrib) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let schema_dir = entry.path().join("schema");
-        if schema_dir.is_dir()
-            && std::fs::read_dir(&schema_dir).is_ok_and(|mut inner| inner.next().is_some())
-        {
-            return true;
-        }
-    }
-    false
+    schemas_present_in(Path::new("contrib/d2rdoc"))
+}
+
+fn schemas_present_in(contrib: &Path) -> bool {
+    REQUIRED_SCHEMA_VARIANTS.iter().all(|variant| {
+        std::fs::read_dir(contrib.join(variant).join("schema")).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && entry.path().extension().is_some_and(|extension| {
+                        extension.to_string_lossy().eq_ignore_ascii_case("js")
+                    })
+            })
+        })
+    })
 }
 
 /// Copy the contrib/ tree into the profile output directory (e.g.
