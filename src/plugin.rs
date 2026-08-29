@@ -878,21 +878,61 @@ fn goto_definition_value(value: Value, health: &PluginHealth) -> Option<(String,
     }
 }
 
-fn plugin_execution_budget() -> Duration {
-    let milliseconds = std::env::var("VLSP_PLUGIN_TIMEOUT_MS")
-        .ok()
+const PLUGIN_TIMEOUT_ENVIRONMENT_VARIABLE: &str = "VLSP_PLUGIN_TIMEOUT_MS";
+const DEFAULT_PLUGIN_EXECUTION_TIMEOUT_MS: u64 = 750;
+const MIN_PLUGIN_EXECUTION_TIMEOUT_MS: u64 = 10;
+const MAX_PLUGIN_EXECUTION_TIMEOUT_MS: u64 = 60_000;
+const PLUGIN_STARTUP_BUDGET_OVERHEAD_STEPS: usize = 3;
+const MIN_PLUGIN_STARTUP_BUDGET: Duration = Duration::from_secs(5);
+
+fn plugin_execution_budget_from_value(value: Option<&str>) -> Duration {
+    let milliseconds = value
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(750)
-        .clamp(10, 60_000);
+        .unwrap_or(DEFAULT_PLUGIN_EXECUTION_TIMEOUT_MS)
+        .clamp(
+            MIN_PLUGIN_EXECUTION_TIMEOUT_MS,
+            MAX_PLUGIN_EXECUTION_TIMEOUT_MS,
+        );
     Duration::from_millis(milliseconds)
 }
 
+fn plugin_execution_budget() -> Duration {
+    let value = std::env::var(PLUGIN_TIMEOUT_ENVIRONMENT_VARIABLE).ok();
+    plugin_execution_budget_from_value(value.as_deref())
+}
+
 fn plugin_startup_budget(execution_budget: Duration, plugin_count: usize) -> Duration {
-    let budgeted_steps = plugin_count.saturating_add(3).min(u32::MAX as usize) as u32;
+    let budgeted_steps = plugin_count
+        .saturating_add(PLUGIN_STARTUP_BUDGET_OVERHEAD_STEPS)
+        .min(u32::MAX as usize) as u32;
     let aggregate_budget = execution_budget
         .checked_mul(budgeted_steps)
         .unwrap_or(Duration::MAX);
-    aggregate_budget.max(Duration::from_secs(5))
+    aggregate_budget.max(MIN_PLUGIN_STARTUP_BUDGET)
+}
+
+fn run_with_budget<T>(
+    runtime: &mut ScriptRuntime,
+    budget: Duration,
+    operation: impl FnOnce(&mut ScriptRuntime) -> anyhow::Result<T>,
+) -> (anyhow::Result<T>, bool) {
+    let isolate = runtime.execution_handle();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(budget).is_err() {
+            isolate.terminate_execution();
+            true
+        } else {
+            false
+        }
+    });
+    let result = operation(runtime);
+    let _ = done_tx.send(());
+    let timed_out = watchdog.join().unwrap_or(true);
+    if timed_out {
+        runtime.cancel_terminate_execution();
+    }
+    (result, timed_out)
 }
 
 fn exec_with_budget(
@@ -901,23 +941,7 @@ fn exec_with_budget(
     source: String,
     budget: Duration,
 ) -> (anyhow::Result<()>, bool) {
-    let isolate = runtime.execution_handle();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let watchdog = std::thread::spawn(move || {
-        if done_rx.recv_timeout(budget).is_err() {
-            isolate.terminate_execution();
-            true
-        } else {
-            false
-        }
-    });
-    let result = runtime.exec(name, source);
-    let _ = done_tx.send(());
-    let timed_out = watchdog.join().unwrap_or(true);
-    if timed_out {
-        runtime.cancel_terminate_execution();
-    }
-    (result, timed_out)
+    run_with_budget(runtime, budget, move |runtime| runtime.exec(name, source))
 }
 
 fn eval_json_with_budget(
@@ -925,23 +949,7 @@ fn eval_json_with_budget(
     expression: &str,
     budget: Duration,
 ) -> (anyhow::Result<Value>, bool) {
-    let isolate = runtime.execution_handle();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let watchdog = std::thread::spawn(move || {
-        if done_rx.recv_timeout(budget).is_err() {
-            isolate.terminate_execution();
-            true
-        } else {
-            false
-        }
-    });
-    let result = runtime.eval_json(expression);
-    let _ = done_tx.send(());
-    let timed_out = watchdog.join().unwrap_or(true);
-    if timed_out {
-        runtime.cancel_terminate_execution();
-    }
-    (result, timed_out)
+    run_with_budget(runtime, budget, |runtime| runtime.eval_json(expression))
 }
 
 fn report_plugin_timeout(runtime: &mut ScriptRuntime, health: &PluginHealth, operation: &str) {
@@ -1163,7 +1171,7 @@ pub fn build_hover_context(
     row_line: u32,
     doc: &DocumentData,
 ) -> Value {
-    let row = doc.rows.iter().find(|r| r.line == row_line);
+    let row = doc.row_at(row_line);
     let row_obj: serde_json::Map<String, Value> = row
         .map(|r| {
             r.cells
@@ -1815,19 +1823,44 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use serde_json::json;
     use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Url};
 
     use super::{
         OperationApplicability, PluginApplicability, PluginHost, RawDiag, RawPluginApplicability,
-        build_context, build_hover_context, build_workspace_snapshot, strip_ts_declarations,
-        strip_typescript,
+        build_context, build_hover_context, build_workspace_snapshot,
+        plugin_execution_budget_from_value, strip_ts_declarations, strip_typescript,
     };
     use crate::document::DocumentData;
     use crate::runtime::{WorkspaceFileSnapshot, WorkspaceSourceInfo, build_workspace_index};
 
     // --- Structural (pass 1) -------------------------------------------------
+
+    #[test]
+    fn plugin_execution_budget_defaults_and_clamps_configured_values() {
+        assert_eq!(
+            plugin_execution_budget_from_value(None),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            plugin_execution_budget_from_value(Some("invalid")),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            plugin_execution_budget_from_value(Some("0")),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            plugin_execution_budget_from_value(Some("125")),
+            Duration::from_millis(125)
+        );
+        assert_eq!(
+            plugin_execution_budget_from_value(Some("60001")),
+            Duration::from_millis(60_000)
+        );
+    }
 
     #[test]
     fn applicability_is_operation_specific_normalized_and_custom_safe() {

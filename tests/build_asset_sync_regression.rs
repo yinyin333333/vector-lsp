@@ -9,6 +9,10 @@ mod build_script_under_test {
     pub fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
         copy_dir_recursive(src, dst);
     }
+
+    pub fn schemas_available(contrib: &std::path::Path) -> bool {
+        schemas_present_in(contrib)
+    }
 }
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -60,6 +64,38 @@ fn contrib_copy_prunes_stale_destination_files() {
     assert!(
         !destination.join("plugins/old.ts").exists(),
         "a deleted source asset must not survive the next destination sync"
+    );
+}
+
+#[test]
+fn schema_sync_requires_javascript_assets_for_every_shipped_variant() {
+    let tree = TempTree::new();
+    let contrib = tree.0.join("d2rdoc");
+    let variants = ["1.13", "2.4", "3.1", "3.2", "3.3"];
+
+    for variant in variants {
+        write(
+            &contrib.join(variant).join("schema").join("placeholder.txt"),
+            "not a schema",
+        );
+    }
+    assert!(
+        !build_script_under_test::schemas_available(&contrib),
+        "placeholder files must not make an incomplete schema sync look usable"
+    );
+
+    for variant in variants {
+        write(
+            &contrib.join(variant).join("schema").join("schema.js"),
+            "var files = {};",
+        );
+    }
+    assert!(build_script_under_test::schemas_available(&contrib));
+
+    fs::remove_file(contrib.join("3.3/schema/schema.js")).unwrap();
+    assert!(
+        !build_script_under_test::schemas_available(&contrib),
+        "one populated variant must not mask another missing variant"
     );
 }
 

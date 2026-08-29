@@ -161,6 +161,7 @@ impl LspClient {
         Some(serde_json::from_slice(&body).unwrap())
     }
 
+    #[cfg(feature = "d2rdoc")]
     fn wait_for_method(&mut self, method: &str) -> Value {
         loop {
             let message = self.read_message();
@@ -170,6 +171,7 @@ impl LspClient {
         }
     }
 
+    #[cfg(feature = "d2rdoc")]
     fn initialize(&mut self, root: &Path, generation: u64) {
         self.request(
             "initialize",
@@ -185,6 +187,7 @@ impl LspClient {
         assert_eq!(ready["params"]["sessionGeneration"], generation);
     }
 
+    #[cfg(feature = "d2rdoc")]
     fn open(&mut self, path: &Path, version: i32) {
         self.notify(
             "textDocument/didOpen",
@@ -204,6 +207,7 @@ impl LspClient {
         }
     }
 
+    #[cfg(feature = "d2rdoc")]
     fn definition_uri(&mut self, path: &Path, character: u32) -> Option<String> {
         let result = self.request(
             "textDocument/definition",
@@ -221,6 +225,7 @@ impl LspClient {
         }
     }
 
+    #[cfg(feature = "d2rdoc")]
     fn shutdown(self) {}
 }
 
@@ -228,6 +233,7 @@ fn file_uri(path: &Path) -> String {
     Url::from_file_path(path).unwrap().to_string()
 }
 
+#[cfg(feature = "d2rdoc")]
 fn write_workspace(root: &Path, key: &str) {
     fs::create_dir_all(root).unwrap();
     fs::write(root.join("skilldesc.txt"), format!("skilldesc\n{key}\n")).unwrap();
@@ -238,10 +244,12 @@ fn write_workspace(root: &Path, key: &str) {
     .unwrap();
 }
 
+#[cfg(feature = "d2rdoc")]
 fn skilldesc_character(key: &str) -> u32 {
     format!("skill-{key}\t").encode_utf16().count() as u32 + 1
 }
 
+#[cfg(feature = "d2rdoc")]
 #[test]
 fn tcp_clients_and_reconnects_have_independent_workspace_state() {
     let tree = TempTree::new();

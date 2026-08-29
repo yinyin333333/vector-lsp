@@ -9,10 +9,9 @@ use crate::workspace::SymbolIndex;
 
 /// Validate a single document against the schema and symbol index.
 ///
-/// Three classes of diagnostic are produced:
-///   ERROR   — cross-reference target not found in the workspace symbol index
-///   WARNING — value cannot be parsed as the column's declared int/float type
-///   INFO    — column header is not declared in the schema and not in ignoreFields
+/// Diagnostics include duplicate unique keys, unresolved references (using the
+/// schema's severity policy), and invalid integer, float, or boolean values.
+/// Unknown headers do not currently produce a standalone diagnostic.
 #[cfg(test)]
 pub fn validate_document(
     file_stem: &str,
@@ -79,6 +78,20 @@ pub fn validate_document_for_locale(
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
+    let field_types: Vec<_> = doc
+        .headers
+        .iter()
+        .map(|header| {
+            if header.is_empty() {
+                None
+            } else {
+                schema
+                    .and_then(|schema| schema.find_field(file_stem, header))
+                    .and_then(|field| field.field_type.as_ref())
+            }
+        })
+        .collect();
+
     let target_columns = unique_target_columns(file_stem, schema);
     let mut seen_targets: HashMap<usize, HashMap<String, (String, u32, u32)>> = HashMap::new();
     for (idx, header) in doc.headers.iter().enumerate() {
@@ -142,11 +155,9 @@ pub fn validate_document_for_locale(
                 }
             }
 
-            let field_type = schema
-                .and_then(|s| s.find_field(file_stem, col_name))
-                .and_then(|f| f.field_type.as_ref());
-
-            let Some(ft) = field_type else { continue };
+            let Some(ft) = field_types.get(col_idx).copied().flatten() else {
+                continue;
+            };
 
             let cell_end = cell.col_start + utf16_len(&cell.value);
             let cell_range = Range {
@@ -480,7 +491,7 @@ pub fn attach_display_context(doc: &DocumentData, diagnostics: &mut [Diagnostic]
         let Some((column_index, _)) = doc.cell_at(line, character) else {
             continue;
         };
-        let Some(row) = doc.rows.iter().find(|row| row.line == line) else {
+        let Some(row) = doc.row_at(line) else {
             continue;
         };
         let Some(column_name) = doc
@@ -938,7 +949,9 @@ fn unique_target_columns(file_stem: &str, schema: Option<&Schema>) -> HashSet<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{FieldType, SchemaField, SchemaFile, find_loader};
+    #[cfg(feature = "d2rdoc")]
+    use crate::schema::find_loader;
+    use crate::schema::{FieldType, SchemaField, SchemaFile};
     use crate::source_selection::SourceKind;
 
     #[test]
@@ -1877,6 +1890,7 @@ mod tests {
         assert!(!is_monpet_consumestat_reference("items", "consumestat1"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_3_2_magicsuffix_etype_accepts_space_padded_fixed4_reference() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1912,6 +1926,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_1_13_monprop_ids_are_name_keys_referenced_by_monstats() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1944,6 +1959,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_1_13_monequip_byte_fields_accept_signed_decimals_without_boolean_warnings() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1977,6 +1993,7 @@ mod tests {
         assert!(diagnostics[0].message.contains("standard integer"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_2_4_schema_uses_text_keys_and_monprop_id_reference() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2047,6 +2064,7 @@ mod tests {
         assert!(diagnostics[0].message.contains("monstats"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn schema_2_4_text_key_declarations_do_not_change_other_d2r_schema_versions() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2083,6 +2101,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn monequip_oninit_patch_is_limited_to_1_13() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2119,6 +2138,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_rotw_skills_range_uses_scoped_space_padded_fixed4_codes() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2178,6 +2198,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn loaded_3_2_properties_schema_skips_unreachable_val7_but_not_other_ints() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

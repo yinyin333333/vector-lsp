@@ -10,7 +10,7 @@ The primary motivation is tooling for game data files such as Diablo II and Diab
 
 | Capability | Status |
 |---|---|
-| **Diagnostics** — schema type violations, broken cross-file references, unknown columns | Implemented |
+| **Diagnostics** — schema-declared value/reference/uniqueness rules, plugins, and opt-in localization JSON checks | Implemented |
 | **Hover** — schema field description on hover over any cell | Implemented |
 | **Go-to-definition** — jump from a reference value to its row in the target file | Implemented |
 | **Plugins** — custom diagnostic checks, hover content, and go-to-definition targets written in TypeScript/JavaScript | Implemented |
@@ -20,17 +20,23 @@ The primary motivation is tooling for game data files such as Diablo II and Diab
 
 ### Built-in diagnostics
 
-Three categories of diagnostics are produced without any schema:
+The core schema validator reports duplicate values in schema fields marked
+`unique`, invalid `int`/`float`/`boolean` values, unresolved cross-file
+references, and a small set of version-aware game semantics. An unresolved
+reference uses its schema policy (`warning` by default, or `error`/`ignore`).
+Plugins and the opt-in localization JSON rules can add their own diagnostics.
 
-- **Error** — a cell value in a `reference`-typed column does not match any row in the target file (broken cross-file reference)
-- **Warning** — a cell value cannot be parsed as the column's declared `int` or `float` type
-- **Information** — a column header is not defined in the schema and not listed in `ignoreFields`
+Unknown column headers do **not** currently produce a standalone diagnostic.
+`ignoreFields` is parsed for d2rdoc schema compatibility, but it does not alter
+that behavior. Without a loaded schema, the core schema validator has no field
+rules to apply; plugin and enabled JSON diagnostics can still run.
 
 ---
 
 ## Supported schemas
 
-The bundled `d2rdoc` schema loader ships schemas for the following game versions under `contrib/d2rdoc/`:
+The `d2rdoc` loader supports the following generated schema layouts under
+`contrib/d2rdoc/`:
 
 | `schema_variant` | Game version |
 |---|---|
@@ -40,7 +46,9 @@ The bundled `d2rdoc` schema loader ships schemas for the following game versions
 | `2.4` | Diablo II: Resurrected 2.4 |
 | `1.13` | Diablo II: Lord of Destruction 1.13 (classic) |
 
-Each variant includes schemas for 65–80+ data files (armor, weapons, skills, monsters, cube recipes, item types, etc.) and a shared set of base plugins for cross-file validation.
+Each generated variant includes schemas for dozens of data files (armor,
+weapons, skills, monsters, cube recipes, item types, etc.) and a shared set of
+base plugins for cross-file validation.
 
 To use a bundled schema, set `schema_variant` in your `config.json`:
 
@@ -54,15 +62,44 @@ You can also point at a custom schema directory with `schema_path` — see [Conf
 
 ## Building
 
-**Requirements:** Rust 1.85 or newer (edition 2024), Cargo.
+**Requirements:** Rust 1.85 or newer (edition 2024) and Cargo. Generating the
+d2rdoc schema assets also requires Git 2.25+ and PowerShell.
 
-```bash
+```powershell
 git clone https://github.com/eezstreet/vector-lsp
 cd vector-lsp
-cargo build --release
+powershell -ExecutionPolicy Bypass -File .\contrib\d2rdoc\sync-schemas.ps1 -Branch master
+cargo build --release --locked
 ```
 
-The binary is placed at `target/release/vector-lsp` (`vector-lsp.exe` on Windows). The `contrib/` directory next to the binary contains the bundled schema files and plugins and must be distributed alongside the binary.
+The schema directories are generated assets and are intentionally ignored by
+Git. `sync-schemas.ps1` clones `https://github.com/eezstreet/d2rdoc.git`, maps
+upstream `data/files` to variant `3.3`, and maps `data/old/<version>` to the
+older variants. The script defaults to the moving `master` branch; use a
+reviewed immutable upstream tag instead when producing a release.
+
+With the default `d2rdoc` feature enabled, `build.rs` checks that all five
+advertised variants contain JavaScript assets. If they do not, the current
+compatibility fallback invokes `sync-schemas.ps1` automatically, which can
+therefore access the network and follows `master`. Pre-populate the assets as
+an explicit release step when network access or moving inputs are unacceptable.
+`cargo build --no-default-features` skips d2rdoc support and schema syncing.
+If `powershell` is unavailable, synchronization fails, or a required variant
+remains incomplete, the fallback currently emits a warning and continues;
+release automation must verify the resulting asset set. The checked-in
+cargo-dist workflow does not yet provide a pinned pre-sync step.
+
+There is currently no tracked commit pin, schema checksum/provenance manifest,
+or upstream schema license/notice bundled with these ignored JavaScript assets.
+The tracked `reference-manifest.json` authenticates the separately bundled
+reference TXT datasets only; it does not attest the schema JavaScript. Release
+packagers must record the reviewed d2rdoc revision and confirm its redistribution
+requirements until a schema packaging policy is adopted.
+
+The binary is placed at `target/release/vector-lsp` (`vector-lsp.exe` on
+Windows). The generated `contrib/` directory next to the binary contains the
+runtime schemas, reference tables, and plugins and must be distributed alongside
+the binary.
 
 To run tests:
 
@@ -81,14 +118,16 @@ Configuration is loaded from a JSON file (default: `config.json` in the working 
 | `io_type` | `"stdio"` \| `{"type":"tcp","host":"…","port":…}` | `"stdio"` | Transport — `stdio` for editor integration, `tcp` for debugging |
 | `delimiter` | string | `"\t"` | Column delimiter character |
 | `extension` | string | `"txt"` | File extension to treat as workspace data files (without leading dot) |
-| `encoding` | `"utf8"` \| `"utf-16-le"` \| `"utf-16-be"` \| `"latin-1"` | `"utf8"` | File encoding |
+| `encoding` | `"auto"` \| `"utf8"` \| `"utf-16-le"` \| `"utf-16-be"` \| `"latin-1"` | `"utf8"` | File encoding. `auto` detects UTF BOMs, then valid UTF-8, then falls back to Windows-1252 |
 | `schema_loader` | string | `"d2rdoc"` | Schema driver to use (currently only `"d2rdoc"` is built in) |
 | `schema_variant` | string | `""` | Bundled schema set to use (e.g. `"3.3"`) |
 | `schema_path` | path | _(none)_ | Explicit path to a schema directory; overrides `schema_variant` auto-discovery |
 | `plugin_path` | path | _(none)_ | Directory of additional plugin files (`.ts`/`.js`); loaded on top of any bundled plugins |
+| `reference_variant` | string | `""` | Bundled reference TXT fallback (`1.13`/`1.13c`, `2.4`, `3.1`, `3.2`, or `3.3`); empty infers a supported `schema_variant`, otherwise disables fallback |
 | `workspace_path` | path | _(none)_ | Root directory of the data file workspace; required for single-shot mode |
 | `single_shot` | bool | `false` | Validate the workspace and exit instead of starting the LSP server |
 | `json_diagnostics` | bool | `false` | In LSP mode, enable d2rlint-compatible diagnostics for physical top-level `local/lng/strings/*.json` files beside the primary mod's `global/excel` directory; reference and bundled data are never substituted |
+| `locale` | string | `"enUS"` | Product-message locale for CLI/single-shot runs; an LSP session instead uses its initialize locale |
 | `json_duplicate_ids_action` | `"ignore"` \| `"warn"` | `"warn"` | Action for `Json/DuplicateIds` |
 | `json_string_format_action` | `"ignore"` \| `"warn"` | `"warn"` | Action for `Json/StringFormat` |
 | `json_key_usage_action` | `"ignore"` \| `"warn"` | `"ignore"` | Action for `Json/KeyUsage` |
@@ -97,8 +136,21 @@ Configuration is loaded from a JSON file (default: `config.json` in the working 
 **CLI flags** (override their config equivalents):
 
 ```
-vector-lsp [--config-file <path>] [--single-shot] [--schema-path <path>]
+vector-lsp [--config-file <path>] [--single-shot] [--schema-path <path>] [--editor-mode] [--locale <locale>]
 ```
+
+`--editor-mode` is the deterministic TXTeditor launch mode: it skips the JSON
+config file, forces stdio LSP, disables single-shot mode, and clears
+`workspace_path`. `VLSP_` environment settings are still loaded. `--schema-path`
+and `--locale` override their environment/config values. Supported locale IDs
+are `enUS`, `zhTW`, `deDE`, `esES`, `frFR`, `itIT`, `koKR`, `plPL`, `esMX`,
+`jaJP`, `ptBR`, `ruRU`, and `zhCN`; matching is case-insensitive and also accepts
+dash/underscore separators. Invalid or absent locale values fall back to
+`enUS`.
+
+Each LSP client negotiates its own locale through the top-level `locale` string
+in `initializationOptions`. That value, rather than `locale` from config or
+`VLSP_LOCALE`, controls diagnostics and messages after initialization.
 
 **Example `config.json` for D2R 3.3:**
 
@@ -106,8 +158,9 @@ vector-lsp [--config-file <path>] [--single-shot] [--schema-path <path>]
 {
   "delimiter": "\t",
   "extension": "txt",
-  "encoding": "utf-16-le",
+  "encoding": "auto",
   "schema_variant": "3.3",
+  "reference_variant": "3.3",
   "workspace_path": "/path/to/d2r/data/global/excel"
 }
 ```
@@ -127,6 +180,7 @@ vector-lsp [--config-file <path>] [--single-shot] [--schema-path <path>]
 
 ```bash
 VLSP_SCHEMA_PATH=/alt/schema vector-lsp
+VLSP_ENCODING=auto VLSP_REFERENCE_VARIANT=3.3 vector-lsp --editor-mode
 VLSP_JSON_DIAGNOSTICS=true vector-lsp --editor-mode
 VLSP_JSON_KEY_USAGE_ACTION=warn VLSP_JSON_KEY_USAGE_ID_START=50000 vector-lsp --editor-mode
 ```
@@ -157,22 +211,23 @@ Or set `"single_shot": true` in `config.json` and run normally.
 **Output format** — each diagnostic is printed to stdout as:
 
 ```
-/path/to/file.txt:42:7: error: 'hax' not found in weapons#code
+/path/to/file.txt:42:7: warning: Reference value 'hax' not found in weapons.code.
 ```
 
-A summary is written to stderr:
+A summary including every severity and the parsed-file count is written to
+stderr (localized when a non-English CLI locale is selected):
 
 ```
-3 error(s), 1 warning(s) across 2 file(s).
+3 error(s), 1 warning(s), 0 info, 0 hint diagnostic(s) across 2 file(s); 12 parsed file(s).
 ```
 
 **Exit codes:**
 
 | Code | Meaning |
 |---|---|
-| `0` | No errors or warnings found |
-| `1` | One or more errors found |
-| `2` | Configuration or I/O error (workspace unreadable, schema load failed, etc.) |
+| `0` | No error-severity diagnostics (warnings/info/hints do not fail the run) |
+| `1` | One or more error-severity diagnostics, or an error returned before the single-shot runner starts (for example invalid configuration) |
+| `2` | A runtime setup or I/O failure handled by the single-shot runner (workspace unreadable, schema/plugin load failed, etc.) |
 
 ---
 
@@ -276,7 +331,7 @@ files["armor"] = {
   title: "armor.txt",
   overview: "Defines all armour base types.",
   appendFiles: ["shareditems"],          // merge field list from another schema entry
-  ignoreFields: ["2handed", "wclass"],   // columns present in the file but intentionally undocumented
+  ignoreFields: ["2handed", "wclass"],   // compatibility metadata; see below
   fields: [
     {
       name: "name",
@@ -309,7 +364,7 @@ files["armor"] = {
 | `overview` | string | Human-readable summary of what this file does |
 | `fields` | array | Ordered column definitions (see below) |
 | `appendFiles` | string[] | Schema entries whose fields are prepended to this file's list |
-| `ignoreFields` | string[] | Columns that exist in the data but are intentionally not validated |
+| `ignoreFields` | string[] | Retained d2rdoc compatibility metadata; currently does not change diagnostics because unknown headers are not reported |
 | `guideOnly` | bool | If true, this entry is a reference table with no corresponding data file |
 | `referenceFiles` | string[] | Additional schema entries whose fields are merged for reference resolution |
 
@@ -331,9 +386,9 @@ files["armor"] = {
 | `int` | Warns if the cell value cannot be parsed as an integer |
 | `float` | Warns if the cell value cannot be parsed as a floating-point number |
 | `string` / `text` | No type validation |
-| `boolean` | No type validation |
-| `reference` | Errors if `field.value` is not found in `file`'s `field` column across the workspace |
-| `parse` | Calc-expression field — no type validation yet |
+| `boolean` | Warns unless a non-empty value is exactly `0` or `1` (a few known consumer fields use specialized rules) |
+| `reference` | Resolves against `file`/`field`; an unknown value follows `unknownPolicy` (`warning` by default) when the target table is available |
+| `parse` | Calc-expression field — no generic core type check; bundled plugins may add checks |
 | `comment` | Documentation-only; not a real column, not validated |
 
 For `reference` fields, set `file` (target file stem) and `field` (target column name):

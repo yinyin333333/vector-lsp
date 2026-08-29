@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, jsonrpc::Result as LspResult};
 
 use crate::diagnostics;
-use crate::document::{DocumentData, utf16_len, utf16_offset_to_byte_index};
+use crate::document::{DocumentData, apply_change, reconstruct_text, split_text_lines, utf16_len};
 use crate::i18n::{self, Locale};
 use crate::json_diagnostics::{
     JsonAnalysisTrigger, JsonDiagnosticBatch, JsonDiagnosticReport, JsonEvidenceProfile,
@@ -20,7 +20,7 @@ use crate::scan::{ScanFailure, ScanPolicy};
 use crate::schema::{FieldTypeName, ReferenceResolver, find_loader};
 use crate::schema_i18n::localized_field_description;
 use crate::settings::VectorLspSettings;
-#[cfg(test)]
+#[cfg(all(test, feature = "d2rdoc"))]
 use crate::source_selection::SourceKind;
 use crate::source_selection::normalized_file_stem_from_uri;
 use crate::workspace::{
@@ -2471,75 +2471,6 @@ fn workspace_identity_matches(expected: (u64, u64), current: (u64, u64)) -> bool
     expected == current
 }
 
-/// Rebuild TSV text from a parsed document. Used to seed incremental change application.
-fn reconstruct_text(doc: &DocumentData, delimiter: char) -> String {
-    let delim_str = delimiter.to_string();
-    let header = doc.headers.join(&delim_str);
-    let rows: Vec<String> = doc
-        .rows
-        .iter()
-        .map(|row| {
-            row.cells
-                .iter()
-                .map(|c| c.value.as_str())
-                .collect::<Vec<_>>()
-                .join(&delim_str)
-        })
-        .collect();
-    std::iter::once(header)
-        .chain(rows)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn split_text_lines(text: &str) -> Vec<String> {
-    text.replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .split('\n')
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Apply a single LSP incremental content change to a lines buffer.
-fn apply_change(lines: &mut Vec<String>, range: tower_lsp::lsp_types::Range, new_text: &str) {
-    let sl = range.start.line as usize;
-    let sc = range.start.character;
-    let el = range.end.line as usize;
-    let ec = range.end.character;
-
-    let prefix = lines
-        .get(sl)
-        .map(|line| &line[..utf16_offset_to_byte_index(line, sc)])
-        .unwrap_or_default();
-    let suffix = lines
-        .get(el)
-        .map(|line| &line[utf16_offset_to_byte_index(line, ec)..])
-        .unwrap_or_default();
-
-    let normalized_new_text = new_text.replace("\r\n", "\n").replace('\r', "\n");
-    let new_lines: Vec<&str> = normalized_new_text.split('\n').collect();
-    let replacement: Vec<String> = match new_lines.as_slice() {
-        [] | [""] => vec![format!("{prefix}{suffix}")],
-        [only] => vec![format!("{prefix}{}{suffix}", only.trim_end_matches('\r'))],
-        [first, rest @ ..] => {
-            let mut v = vec![format!("{prefix}{}", first.trim_end_matches('\r'))];
-            for mid in &rest[..rest.len() - 1] {
-                v.push(mid.trim_end_matches('\r').to_string());
-            }
-            v.push(format!(
-                "{}{suffix}",
-                rest.last().unwrap().trim_end_matches('\r')
-            ));
-            v
-        }
-    };
-
-    while lines.len() <= el {
-        lines.push(String::new());
-    }
-    lines.splice(sl..=el, replacement);
-}
-
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
@@ -3463,7 +3394,7 @@ impl LanguageServer for Backend {
             let symbols = ws.symbols_for_uri(uri);
             let cell_col_start = cell.col_start;
             let cell_len = utf16_len(&cell.value);
-            let current_row = doc.rows.iter().find(|row| row.line == pos.line);
+            let current_row = doc.row_at(pos.line);
             let reference_cell_is_consumed = current_row.is_none_or(|row| {
                 diagnostics::reference_cell_is_consumed(&file_stem, doc, row, &col_name)
             });
@@ -3750,16 +3681,6 @@ mod tests {
     use futures::StreamExt;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    fn range(start: u32, end: u32) -> Range {
-        Range::new(Position::new(0, start), Position::new(0, end))
-    }
-
-    fn apply(text: &str, start: u32, end: u32, replacement: &str) -> String {
-        let mut lines = vec![text.to_string()];
-        apply_change(&mut lines, range(start, end), replacement);
-        lines.join("\n")
-    }
 
     #[test]
     fn calculation_hover_details_count_unicode_characters_and_warn_without_truncating() {
@@ -4333,32 +4254,6 @@ mod tests {
 
         std::fs::remove_dir_all(base).unwrap();
         socket_task.abort();
-    }
-
-    #[test]
-    fn incremental_changes_use_utf16_offsets_around_supplementary_characters() {
-        assert_eq!(apply("A🙂B", 1, 1, "X"), "AX🙂B");
-        assert_eq!(apply("A🙂B", 3, 3, "X"), "A🙂XB");
-        assert_eq!(apply("A🙂B", 1, 3, ""), "AB");
-        assert_eq!(apply("A🙂B\told", 5, 8, "new"), "A🙂B\tnew");
-    }
-
-    #[test]
-    fn incremental_json_changes_keep_bare_carriage_return_lines() {
-        let existing = "[\r  {\"id\":1}\r]";
-        let mut lines = split_text_lines(existing);
-        apply_change(
-            &mut lines,
-            Range::new(Position::new(1, 2), Position::new(1, 2)),
-            "X",
-        );
-
-        assert_eq!(lines.join("\n"), "[\n  X{\"id\":1}\n]");
-    }
-
-    #[test]
-    fn invalid_half_surrogate_offsets_clamp_to_the_code_point_start() {
-        assert_eq!(apply("A🙂B", 2, 2, "X"), "AX🙂B");
     }
 
     #[tokio::test]
@@ -5154,6 +5049,7 @@ mod tests {
         assert!(!workspace_identity_matches((4, 9), (5, 9)));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn d2rdoc_binary_patches_reach_the_actual_header_hover_path() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5379,6 +5275,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn hit_summon_mode_hover_is_limited_to_server_parameter_two_in_3_2() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5458,6 +5355,7 @@ mod tests {
         assert!(!client_markup.value.contains("HitSummon monster mode"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn monpet_consumestat_miss_hover_uses_plain_slot_skip_explanation() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5525,6 +5423,7 @@ mod tests {
         assert!(!markup.value.contains("loader"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn properties_stat_hover_reports_only_reachable_active_slots() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5614,6 +5513,7 @@ mod tests {
         assert!(!generic_markup.value.contains("has no effect"));
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn skills_range_hover_marks_trailing_space_and_reports_effective_code() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5679,6 +5579,7 @@ mod tests {
         assert!(!markup.value.contains("Source:"), "{}", markup.value);
     }
 
+    #[cfg(feature = "d2rdoc")]
     #[tokio::test]
     async fn ordinary_reference_hover_hides_source_selection() {
         let contrib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

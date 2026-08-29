@@ -183,11 +183,20 @@ impl SymbolIndex {
     ) {
         let stem = file_stem.to_ascii_lowercase();
         self.files.insert(stem.clone());
+
+        let mut target_columns = Vec::with_capacity(doc.headers.len());
         for header in &doc.headers {
+            let column = header.to_lowercase();
+            let is_target = ref_targets.contains(&(stem.clone(), column.clone()));
             if !header.is_empty() {
-                self.columns.insert((stem.clone(), header.to_lowercase()));
+                self.columns.insert((stem.clone(), column.clone()));
             }
+            target_columns.push(is_target.then_some(column));
         }
+        if target_columns.iter().all(Option::is_none) {
+            return;
+        }
+
         for row in &doc.rows {
             if row
                 .cells
@@ -201,14 +210,9 @@ impl SymbolIndex {
                 if cell.value.trim().is_empty() {
                     continue;
                 }
-                let col_name = match doc.headers.get(col_idx) {
-                    Some(h) => h.as_str(),
-                    None => continue,
-                };
-                let col_lower = col_name.to_lowercase();
-                if !ref_targets.contains(&(stem.clone(), col_lower.clone())) {
+                let Some(col_lower) = target_columns.get(col_idx).and_then(Option::as_ref) else {
                     continue;
-                }
+                };
                 let end_char = cell.col_start + utf16_len(&cell.value);
                 let location = match source_kind {
                     SourceKind::Open | SourceKind::Workspace => uri.map(|uri| Location {
@@ -242,8 +246,10 @@ impl SymbolIndex {
                     ),
                     entry.clone(),
                 );
-                self.fixed4_entries
-                    .insert((stem.clone(), col_lower, fixed4_key(&cell.value)), entry);
+                self.fixed4_entries.insert(
+                    (stem.clone(), col_lower.clone(), fixed4_key(&cell.value)),
+                    entry,
+                );
             }
         }
     }

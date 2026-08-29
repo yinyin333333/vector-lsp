@@ -1,16 +1,27 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "d2rdoc")]
+use std::collections::HashSet;
+#[cfg(feature = "d2rdoc")]
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+#[cfg(feature = "d2rdoc")]
+use anyhow::{Context, anyhow, ensure};
+use anyhow::{Result, bail};
+#[cfg(feature = "d2rdoc")]
 use serde::Deserialize;
+#[cfg(feature = "d2rdoc")]
 use sha2::{Digest, Sha256};
 
 use crate::document::DocumentData;
-use crate::settings::{Encoding, VectorLspSettings};
+#[cfg(feature = "d2rdoc")]
+use crate::settings::Encoding;
+use crate::settings::VectorLspSettings;
 
+#[cfg(feature = "d2rdoc")]
 const EXPECTED_ROOT_SHA256: &str =
     "71f25ac353cb02053a3e7326b530fb599b77dde4ef2b24e03fc78304c60e69f4";
+#[cfg(feature = "d2rdoc")]
 const EXPECTED_DATASETS: &[(&str, &str, &str, usize, u64, &str)] = &[
     (
         "1.13",
@@ -54,6 +65,7 @@ const EXPECTED_DATASETS: &[(&str, &str, &str, usize, u64, &str)] = &[
     ),
 ];
 
+#[cfg(feature = "d2rdoc")]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReferenceManifest {
@@ -64,6 +76,7 @@ struct ReferenceManifest {
     datasets: Vec<DatasetManifest>,
 }
 
+#[cfg(feature = "d2rdoc")]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DatasetManifest {
@@ -77,12 +90,14 @@ struct DatasetManifest {
     files: Vec<FileManifest>,
 }
 
+#[cfg(feature = "d2rdoc")]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DatasetSource {
     dataset_id: String,
 }
 
+#[cfg(feature = "d2rdoc")]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FileManifest {
@@ -94,7 +109,7 @@ struct FileManifest {
 
 #[derive(Clone)]
 pub struct ReferenceDataset {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "d2rdoc"))]
     pub schema_variant: String,
     pub game_version: String,
     pub canonical_sha256: String,
@@ -123,6 +138,7 @@ pub fn selected_reference_variant(settings: &VectorLspSettings) -> Result<Option
     Ok(Some(normalized.to_string()))
 }
 
+#[cfg(feature = "d2rdoc")]
 pub fn load_selected_reference_dataset(
     settings: &VectorLspSettings,
 ) -> Result<Option<ReferenceDataset>> {
@@ -133,6 +149,14 @@ pub fn load_selected_reference_dataset(
     load_reference_dataset(&contrib_root, &schema_variant).map(Some)
 }
 
+#[cfg(not(feature = "d2rdoc"))]
+pub fn load_selected_reference_dataset(
+    _settings: &VectorLspSettings,
+) -> Result<Option<ReferenceDataset>> {
+    Ok(None)
+}
+
+#[cfg(feature = "d2rdoc")]
 pub(crate) fn load_reference_dataset(
     contrib_root: &Path,
     schema_variant: &str,
@@ -227,7 +251,7 @@ pub(crate) fn load_reference_dataset(
     );
 
     Ok(ReferenceDataset {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "d2rdoc"))]
         schema_variant: dataset.schema_variant.clone(),
         game_version: dataset.game_version.clone(),
         canonical_sha256: dataset.canonical_sha256.clone(),
@@ -235,6 +259,7 @@ pub(crate) fn load_reference_dataset(
     })
 }
 
+#[cfg(feature = "d2rdoc")]
 fn verify_manifest(manifest: &ReferenceManifest) -> Result<()> {
     ensure!(
         manifest.datasets.len() == EXPECTED_DATASETS.len(),
@@ -325,6 +350,7 @@ fn verify_manifest(manifest: &ReferenceManifest) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "d2rdoc")]
 fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
     let relative = Path::new(relative);
     ensure!(
@@ -338,6 +364,7 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(root.join(relative))
 }
 
+#[cfg(feature = "d2rdoc")]
 fn decode_reference_bytes(bytes: &[u8]) -> Result<(String, String)> {
     match std::str::from_utf8(bytes) {
         Ok(text) => Ok((text.to_string(), "utf-8".to_string())),
@@ -345,6 +372,7 @@ fn decode_reference_bytes(bytes: &[u8]) -> Result<(String, String)> {
     }
 }
 
+#[cfg(feature = "d2rdoc")]
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -386,6 +414,22 @@ mod tests {
         assert_eq!(selected_reference_variant(&settings).unwrap(), None);
     }
 
+    #[cfg(not(feature = "d2rdoc"))]
+    #[test]
+    fn selected_dataset_is_disabled_without_the_d2rdoc_feature() {
+        let settings = VectorLspSettings {
+            reference_variant: "3.2".to_string(),
+            ..VectorLspSettings::default()
+        };
+
+        assert!(
+            load_selected_reference_dataset(&settings)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "d2rdoc")]
     #[test]
     fn every_packaged_dataset_matches_its_pinned_version_inventory() {
         let contrib_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
