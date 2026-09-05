@@ -28,6 +28,17 @@ $D2rdocRepo = "https://github.com/eezstreet/d2rdoc.git"
 # Update this when a new game version ships and data/files is bumped.
 $CurrentVersion = "3.3"
 
+# Versions upstream never archived under data/old, pinned to the last commit
+# where data/files still held them.
+#
+# 3.2 was current at f8ba7b23 and was overwritten by 3.3 without being copied
+# to data/old, so a normal sync produces no 3.2 at all. The build-time
+# completeness gate lists 3.2, so without this it can never be satisfied.
+# Drop an entry once upstream publishes the matching data/old/<ver>.
+$PinnedVersions = @{
+    "3.2" = "f8ba7b23"
+}
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
 $ContribD2rdoc = $PSScriptRoot                          # contrib/d2rdoc/
@@ -54,8 +65,10 @@ try {
     New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
     $CloneDir = Join-Path $TempDir "d2rdoc"
 
-    Write-Host "Cloning d2rdoc @ $Branch (sparse, depth 1)..."
-    git clone --depth 1 --branch $Branch --filter=blob:none --sparse $D2rdocRepo $CloneDir
+    # Full history, but blobless: pinned versions need commits a shallow clone
+    # cannot reach, and --filter=blob:none keeps the download small anyway.
+    Write-Host "Cloning d2rdoc @ $Branch (sparse, blobless)..."
+    git clone --branch $Branch --filter=blob:none --sparse $D2rdocRepo $CloneDir
     if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
 
     git -C $CloneDir sparse-checkout set data/files data/old
@@ -74,6 +87,22 @@ try {
             Write-Host "Syncing data/old/$($verDir.Name) -> contrib/d2rdoc/$($verDir.Name)/schema/"
             Sync-JsFiles $verDir.FullName (Join-Path $ContribD2rdoc "$($verDir.Name)\schema")
         }
+    }
+
+    # ── Sync pinned versions ───────────────────────────────────────────────────
+
+    # Runs last: it overwrites the checked-out data/files, which the current
+    # version has already been copied from.
+    $DataFiles = Join-Path $CloneDir "data\files"
+    foreach ($ver in $PinnedVersions.Keys) {
+        $sha = $PinnedVersions[$ver]
+        Write-Host "Syncing data/files@$sha -> contrib/d2rdoc/$ver/schema/"
+        # Emptied first: `checkout <sha> -- <path>` overlays rather than
+        # replaces, so files renamed since $sha would survive as extras.
+        Remove-Item -Recurse -Force $DataFiles
+        git -C $CloneDir checkout --quiet $sha -- data/files
+        if ($LASTEXITCODE -ne 0) { throw "git checkout $sha failed" }
+        Sync-JsFiles $DataFiles (Join-Path $ContribD2rdoc "$ver\schema")
     }
 
     Write-Host "Done."
