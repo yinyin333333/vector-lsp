@@ -458,6 +458,9 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Must precede any thread that builds an isolate.
+    runtime::init_platform();
+
     let args = CliArgs::parse();
 
     let mut config_builder = Config::builder();
