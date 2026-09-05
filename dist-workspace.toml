@@ -10,4 +10,10 @@ ci = "github"
 # The installers to generate for each app
 installers = []
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["x86_64-pc-windows-msvc"]
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+# dist defaults Unix archives to .tar.xz; .tar.gz is the wider-compatible choice.
+unix-archive = ".tar.gz"
+# Steps injected into build-local-artifacts before `dist build`.
+# Path is relative to .github/workflows/, so this lives at .github/build-setup.yml
+# (inside workflows/ GitHub would try to run it as a workflow).
+github-build-setup = "../build-setup.yml"

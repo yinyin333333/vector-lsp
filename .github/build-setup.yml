@@ -1,0 +1,9 @@
+# Injected by dist into build-local-artifacts, after checkout and before
+# `dist build`. See `github-build-setup` in dist-workspace.toml.
+#
+# build.rs only syncs schemas when they are absent, and on Linux its
+# `powershell` invocation cannot resolve. Syncing here keeps contrib/
+# populated on every runner before the crate is built and packaged.
+- name: Sync d2rdoc schemas
+  shell: pwsh
+  run: ./contrib/d2rdoc/sync-schemas.ps1
