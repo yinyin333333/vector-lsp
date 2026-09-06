@@ -13,7 +13,12 @@ installers = []
 targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 # dist defaults Unix archives to .tar.xz; .tar.gz is the wider-compatible choice.
 unix-archive = ".tar.gz"
+# GitHub already attaches "Source code (zip/tar.gz)" to every release, so dist's
+# own source.tar.gz and its checksum are duplicates.
+source-tarball = false
 # Steps injected into build-local-artifacts before `dist build`.
 # Path is relative to .github/workflows/, so this lives at .github/build-setup.yml
 # (inside workflows/ GitHub would try to run it as a workflow).
 github-build-setup = "../build-setup.yml"
+# Runs after the release exists; prepends a Full Changelog compare link.
+post-announce-jobs = ["./release-notes"]

@@ -65,10 +65,12 @@ try {
     New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
     $CloneDir = Join-Path $TempDir "d2rdoc"
 
-    # Full history, but blobless: pinned versions need commits a shallow clone
-    # cannot reach, and --filter=blob:none keeps the download small anyway.
-    Write-Host "Cloning d2rdoc @ $Branch (sparse, blobless)..."
-    git clone --branch $Branch --filter=blob:none --sparse $D2rdocRepo $CloneDir
+    # Full history and full blobs. Pinned versions need commits a shallow clone
+    # cannot reach, and a blobless clone has to lazily fetch the blobs that
+    # differ at that commit - which fails outright on some runners
+    # ("unable to read sha1 file"). The repo is small; correctness wins.
+    Write-Host "Cloning d2rdoc @ $Branch (sparse)..."
+    git clone --branch $Branch --sparse $D2rdocRepo $CloneDir
     if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
 
     git -C $CloneDir sparse-checkout set data/files data/old
