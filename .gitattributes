@@ -1,0 +1,9 @@
+# Bundled D2R reference tables are hashed byte-for-byte against the manifest in
+# contrib/d2rdoc, and that manifest records them with CRLF endings - the form
+# the game itself reads. The blobs are stored LF, so a Windows clone matched
+# only because core.autocrlf converted them on checkout while a Linux clone
+# produced LF and failed every hash.
+#
+# Pinning the checkout ending makes every platform materialize the bytes the
+# manifest describes. File content and the manifest are both untouched.
+contrib/d2rdoc/*/reference/*.txt text eol=crlf

@@ -245,6 +245,19 @@ mod tests {
         Arc::new(DocumentData::parse(&format!("Code\n{value}\n"), '\t'))
     }
 
+    fn table_uri(dir: &str, name: &str) -> Url {
+        Url::parse(&format!("file:///E:/{dir}/{name}")).expect("table uri")
+    }
+
+    /// The same file as `table_uri`, as a native path.
+    ///
+    /// Derived from the URI, not written as a `\`-separated literal: off
+    /// Windows a backslash is an ordinary filename character, so the stem
+    /// would be `E:\mod\itemtypes` and never match the open document.
+    fn table_path(dir: &str, name: &str) -> PathBuf {
+        table_uri(dir, name).to_file_path().expect("table path")
+    }
+
     fn selected_value(sources: &[EffectiveSource], stem: &str) -> String {
         sources
             .iter()
@@ -257,8 +270,8 @@ mod tests {
 
     #[test]
     fn open_then_workspace_then_bundled_precedence_and_close_restore_are_stable() {
-        let uri = Url::parse("file:///E:/workspace/itemtypes.txt").unwrap();
-        let path = PathBuf::from(r"E:\workspace\itemtypes.txt");
+        let uri = table_uri("workspace", "itemtypes.txt");
+        let path = table_path("workspace", "itemtypes.txt");
         let mut open = HashMap::new();
         let mut disk = HashMap::new();
         let fallback = HashMap::from([("itemtypes".to_string(), document("bundled"))]);
@@ -331,8 +344,8 @@ mod tests {
 
     #[test]
     fn sibling_mode_preserves_open_sibling_bundled_precedence_and_source_tiers() {
-        let uri = Url::parse("file:///E:/mod/itemtypes.txt").unwrap();
-        let path = PathBuf::from(r"E:\mod\itemtypes.txt");
+        let uri = table_uri("mod", "itemtypes.txt");
+        let path = table_path("mod", "itemtypes.txt");
         let fallback = HashMap::from([("itemtypes".to_string(), document("bundled"))]);
         let mut open = HashMap::new();
         let mut siblings = HashMap::from([(path, document("sibling"))]);
@@ -380,8 +393,8 @@ mod tests {
 
     #[test]
     fn sibling_then_explicit_reference_root_then_bundled_precedence_is_stable() {
-        let sibling_path = PathBuf::from(r"E:\mod\itemtypes.txt");
-        let reference_path = PathBuf::from(r"E:\workspace\itemtypes.txt");
+        let sibling_path = table_path("mod", "itemtypes.txt");
+        let reference_path = table_path("workspace", "itemtypes.txt");
         let sibling = HashMap::from([(sibling_path, document("sibling"))]);
         let reference = HashMap::from([(reference_path, document("reference-root"))]);
         let fallback = HashMap::from([("itemtypes".to_string(), document("bundled"))]);

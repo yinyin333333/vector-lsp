@@ -540,6 +540,17 @@ pub struct ScriptRuntime {
     inner: JsRuntime,
 }
 
+/// Initialize the V8 platform. Call from `main` before any thread builds a
+/// `ScriptRuntime`.
+///
+/// Otherwise deno_core initializes V8 on whichever thread builds the first
+/// isolate. Where the CPU has protection keys (`pku`/`ospke`) only that thread
+/// gets V8's key in its PKRU, and a second thread building an isolate faults
+/// with `SEGV_PKUERR` on its first JIT code. Idempotent.
+pub fn init_platform() {
+    JsRuntime::init_platform(None, false);
+}
+
 impl ScriptRuntime {
     pub fn new() -> Result<Self> {
         let inner = JsRuntime::new(RuntimeOptions {
@@ -609,5 +620,38 @@ impl ScriptRuntime {
         let local = deno_core::v8::Local::new(scope, global);
         let json_str = local.to_rust_string_lossy(scope);
         Ok(serde_json::from_str(&json_str)?)
+    }
+}
+
+/// libtest gives each test its own thread and offers no pre-run hook, so the
+/// platform is initialized at load time instead.
+#[cfg(test)]
+#[ctor::ctor]
+fn init_platform_for_tests() {
+    init_platform();
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    /// The plugin-host/schema-loader shape. Without `init_platform` this
+    /// aborts the test process rather than failing an assertion.
+    #[test]
+    fn isolates_can_be_built_on_more_than_one_thread() {
+        init_platform();
+
+        for tag in ["first", "second"] {
+            std::thread::spawn(move || {
+                let mut rt = ScriptRuntime::new().expect("runtime");
+                rt.exec(
+                    tag,
+                    "var a = [1, 2, 3]; a.forEach(function (x) { return x; });",
+                )
+                .expect("exec");
+            })
+            .join()
+            .expect("thread");
+        }
     }
 }

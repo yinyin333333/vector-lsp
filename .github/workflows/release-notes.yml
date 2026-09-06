@@ -1,0 +1,54 @@
+# Fixes up the release notes dist just generated:
+#   * repoints download/checksum links at the repo actually publishing
+#   * prepends a "Full Changelog" compare link
+#
+# Wired in as a post-announce job (see post-announce-jobs in
+# dist-workspace.toml), so it runs only once the release and its artifacts
+# exist. dist's own download table is preserved, only its hrefs change.
+#
+# dist builds those links from `package.repository` in Cargo.toml, which on a
+# fork still points at the original upstream and 404s. Rewriting to
+# github.repository keeps them correct for whoever publishes, with no repo
+# name hardcoded here.
+name: Release notes
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  fix-release-notes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Repoint links and prepend full changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ fromJson(inputs.plan).announcement_tag }}
+        run: |
+          set -euo pipefail
+
+          # Newest release that is not this one. Empty on a first release.
+          prev=$(gh release list --repo "$REPO" --limit 100 \
+            --json tagName --jq "[.[] | select(.tagName != \"$TAG\")] | .[0].tagName // empty")
+
+          if [ -n "$prev" ]; then
+            link="**Full Changelog**: https://github.com/$REPO/compare/$prev...$TAG"
+          else
+            link="**Full Changelog**: https://github.com/$REPO/commits/$TAG"
+          fi
+
+          body=$(gh release view "$TAG" --repo "$REPO" --json body --jq .body)
+          fixed=$(printf '%s' "$body" | sed -E \
+            "s#https://github\.com/[^/]+/[^/]+/releases/download/#https://github.com/${REPO}/releases/download/#g")
+
+          printf '%s\n\n%s\n' "$link" "$fixed" > "$RUNNER_TEMP/notes.md"
+          gh release edit "$TAG" --repo "$REPO" --notes-file "$RUNNER_TEMP/notes.md"
+
+          echo "--- resulting notes ---"
+          cat "$RUNNER_TEMP/notes.md"
