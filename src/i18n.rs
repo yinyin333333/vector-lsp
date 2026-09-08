@@ -206,7 +206,6 @@ pub const BUNDLED_PLUGIN_KEYS: &[&str] = &[
     "plugin.unknownSkillIdentifier",
     "plugin.unknownMissileIdentifier",
     "plugin.unknownScopeIdentifier",
-    "plugin.calc.skilldesc-decimal-prefix",
     "plugin.calc.decimal-policy",
     "plugin.calc.prefix-stop",
     "plugin.cube-input.no-inputs",
@@ -1117,9 +1116,6 @@ fn plugin_detail_pl(key: &str) -> Option<&'static str> {
         "plugin.unknownScopeIdentifier" => {
             "Identyfikator `{identifier}` jest nieznany w bieżącym zakresie obliczenia."
         }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "W wyrażeniu SkillDesc `{actual}` gra używa tylko prefiksu całkowitego `{consumedPrefix}` i ignoruje `{ignoredSuffix}`."
-        }
         "plugin.calc.decimal-policy" => {
             "To pole obliczenia wymaga postaci całkowitej. Gra może inaczej oceniać wyrażenia dziesiętne. {values}"
         }
@@ -1317,9 +1313,6 @@ fn plugin_detail_it(key: &str) -> Option<&'static str> {
         }
         "plugin.unknownScopeIdentifier" => {
             "L'identificatore `{identifier}` e sconosciuto nell'ambito di calcolo corrente."
-        }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "Nell'espressione SkillDesc `{actual}`, il gioco usa solo il prefisso intero `{consumedPrefix}` e ignora `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Questo campo di calcolo richiede una forma intera. Il gioco puo valutare diversamente le espressioni decimali. {values}"
@@ -1520,9 +1513,6 @@ fn plugin_detail_fr(key: &str) -> Option<&'static str> {
         "plugin.unknownScopeIdentifier" => {
             "L'identifiant `{identifier}` est inconnu dans la portée de calcul actuelle."
         }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "Dans l'expression SkillDesc `{actual}`, le jeu utilise uniquement le préfixe entier `{consumedPrefix}` et ignore `{ignoredSuffix}`."
-        }
         "plugin.calc.decimal-policy" => {
             "Ce champ de calcul exige une écriture entière. Le jeu peut évaluer différemment les expressions de calcul décimales. {values}"
         }
@@ -1721,9 +1711,6 @@ fn plugin_detail_es(key: &str) -> Option<&'static str> {
         }
         "plugin.unknownScopeIdentifier" => {
             "El identificador `{identifier}` es desconocido en el ámbito de cálculo actual."
-        }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "En la expresión SkillDesc `{actual}`, el juego solo utiliza el prefijo entero `{consumedPrefix}` e ignora `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Este campo de cálculo requiere una expresión entera. El juego puede evaluar de otra manera las expresiones decimales. {values}"
@@ -1925,9 +1912,6 @@ fn plugin_detail_pt_br(key: &str) -> Option<&'static str> {
         "plugin.unknownScopeIdentifier" => {
             "O identificador `{identifier}` e desconhecido no escopo atual do calculo."
         }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "Na expressao SkillDesc `{actual}`, o jogo usa apenas o prefixo inteiro `{consumedPrefix}` e ignora `{ignoredSuffix}`."
-        }
         "plugin.calc.decimal-policy" => {
             "Este campo de calculo exige uma expressao inteira. O jogo pode avaliar expressoes decimais de modo diferente. {values}"
         }
@@ -2127,9 +2111,6 @@ fn plugin_detail_es_mx(key: &str) -> Option<&'static str> {
         }
         "plugin.unknownScopeIdentifier" => {
             "El identificador `{identifier}` no existe en el ambito actual del calculo."
-        }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "En la expresion SkillDesc `{actual}`, el juego solo usa el prefijo entero `{consumedPrefix}` e ignora `{ignoredSuffix}`."
         }
         "plugin.calc.decimal-policy" => {
             "Este campo de calculo requiere una expresion entera. El juego puede evaluar distinto las expresiones decimales. {values}"
@@ -2332,9 +2313,6 @@ fn plugin_detail_de(key: &str) -> Option<&'static str> {
         "plugin.unknownScopeIdentifier" => {
             "Der Bezeichner `{identifier}` ist im aktuellen Berechnungsbereich nicht bekannt."
         }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "Im SkillDesc-Ausdruck `{actual}` verwendet das Spiel nur das ganzzahlige Präfix `{consumedPrefix}` und ignoriert `{ignoredSuffix}`."
-        }
         "plugin.calc.decimal-policy" => {
             "Dieses Berechnungsfeld verlangt eine ganzzahlige Schreibweise. Dezimale Berechnungsausdrücke können vom Spiel anders ausgewertet werden. {values}"
         }
@@ -2516,9 +2494,6 @@ fn plugin_detail_ko(key: &str) -> Option<&'static str> {
         "plugin.unknownScopeIdentifier" => {
             "현재 계산 범위에서 찾을 수 없는 식별자: `{identifier}`."
         }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "SkillDesc 계산식에 소수가 포함되어 있습니다 (`{actual}`). 게임은 정수 부분만 사용하고 소수 부분은 무시합니다 (사용: `{consumedPrefix}`, 무시: `{ignoredSuffix}`)."
-        }
         "plugin.calc.decimal-policy" => {
             "이 계산 필드는 정수 표현을 기대합니다. 소수 계산식은 게임에서 다르게 해석될 수 있습니다. {values}"
         }
@@ -2690,9 +2665,6 @@ fn plugin_detail_ja(key: &str) -> Option<&'static str> {
         "plugin.unknownMissileIdentifier" => "missile 計算の識別子 `{identifier}` は不明です。",
         "plugin.unknownScopeIdentifier" => {
             "現在の計算スコープに識別子 `{identifier}` はありません。"
-        }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "SkillDesc 計算式 `{actual}` では、ゲームは整数部分 `{consumedPrefix}` だけを使用し、`{ignoredSuffix}` を無視します。"
         }
         "plugin.calc.decimal-policy" => {
             "この計算フィールドには整数形式が必要です。ゲームでは小数を含む計算式を異なる方法で評価する場合があります。{values}"
@@ -2876,9 +2848,6 @@ fn plugin_detail_ru(key: &str) -> Option<&'static str> {
         "plugin.unknownScopeIdentifier" => {
             "Идентификатор `{identifier}` неизвестен в текущей области видимости формулы."
         }
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "В выражении SkillDesc `{actual}` игра использует только целую часть `{consumedPrefix}` и игнорирует `{ignoredSuffix}`."
-        }
         "plugin.calc.decimal-policy" => {
             "Это поле формулы требует целочисленного значения. Игра может иначе вычислять десятичные выражения. {values}"
         }
@@ -3043,9 +3012,6 @@ fn plugin_detail_zh_cn(key: &str) -> Option<&'static str> {
         "plugin.unknownSkillIdentifier" => "找不到 skill 计算标识符 `{identifier}`。",
         "plugin.unknownMissileIdentifier" => "找不到 missile 计算标识符 `{identifier}`。",
         "plugin.unknownScopeIdentifier" => "当前计算 scope 中找不到标识符 `{identifier}`。",
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "在 SkillDesc 计算公式 `{actual}` 中，游戏只使用整数部分 `{consumedPrefix}`，并忽略 `{ignoredSuffix}`。"
-        }
         "plugin.calc.decimal-policy" => {
             "此计算字段应使用整数写法；小数公式可能被游戏以不同方式解释。{values}"
         }
@@ -3204,9 +3170,6 @@ fn plugin_detail_zh_tw(key: &str) -> Option<&'static str> {
         "plugin.unknownSkillIdentifier" => "找不到 skill 計算識別符號 `{identifier}`。",
         "plugin.unknownMissileIdentifier" => "找不到 missile 計算識別符號 `{identifier}`。",
         "plugin.unknownScopeIdentifier" => "當前計算 scope 中找不到識別符號 `{identifier}`。",
-        "plugin.calc.skilldesc-decimal-prefix" => {
-            "在 SkillDesc 計算公式 `{actual}` 中，遊戲只使用整數部分 `{consumedPrefix}`，並忽略 `{ignoredSuffix}`。"
-        }
         "plugin.calc.decimal-policy" => {
             "此計算欄位應使用整數寫法；小數公式可能被遊戲以不同方式解釋。{values}"
         }
@@ -3552,7 +3515,6 @@ fn localized_plugin_guidance(locale: Locale, key: &str, data: &Value) -> Option<
         "plugin.calc.wrong-arity" => "argument-count",
         "plugin.calc.expected-quoted-argument" => "quote-argument",
         "plugin.calc.expected-dot-identifier" => "dot-identifier",
-        "plugin.calc.skilldesc-decimal-prefix" => "integer-expression",
         "plugin.calc.decimal-policy" => "integer-policy",
         "plugin.calc.prefix-stop" => "rewrite-expression",
         key if key.starts_with("plugin.calc.expected-") && key.ends_with(".eof") => "insert-at-end",
@@ -5374,42 +5336,6 @@ mod tests {
     }
 
     #[test]
-    fn english_calc_message_and_guidance_are_rendered_as_separate_sections() {
-        let diagnostic = localized_plugin_diagnostic(
-            Locale::EnUs,
-            "plugin.calc.skilldesc-decimal-prefix",
-            args([
-                ("actual", json!("-6.25")),
-                ("consumedPrefix", json!("-6")),
-                ("ignoredSuffix", json!(".25")),
-            ]),
-            Some(
-                "Decimal values are not supported here. The game reads '-6.25' as '-6' and ignores '.25'. Use an integer expression that matches your intent."
-                    .to_string(),
-            ),
-            Diagnostic {
-                data: Some(json!({
-                    "kind": "decimal-policy",
-                    "hint": "Use an integer expression that matches your intent."
-                })),
-                ..Diagnostic::default()
-            },
-        );
-        assert_eq!(
-            diagnostic.message,
-            "Decimal values are not supported here. The game reads '-6.25' as '-6' and ignores '.25'."
-        );
-        assert_eq!(
-            diagnostic.data.as_ref().unwrap()["localizedGuidanceHeading"],
-            "What to do"
-        );
-        assert_eq!(
-            diagnostic.data.as_ref().unwrap()["localizedGuidance"],
-            "Use an integer expression that matches your intent."
-        );
-    }
-
-    #[test]
     fn bundled_plugin_catalog_has_no_non_english_compatibility_fallbacks() {
         for key in BUNDLED_PLUGIN_KEYS {
             let english = catalog_template(Locale::EnUs, key);
@@ -5507,7 +5433,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(BUNDLED_PLUGIN_KEYS.len(), 67);
+        assert_eq!(BUNDLED_PLUGIN_KEYS.len(), 66);
     }
 
     #[test]
@@ -5644,56 +5570,6 @@ mod tests {
     }
 
     #[test]
-    fn skilldesc_decimal_policy_localizes_values_and_correction_without_internal_metadata() {
-        let message_args = args([
-            ("code", json!("calc.skilldesc-decimal-prefix")),
-            ("identifier", json!("")),
-            ("expected", json!("")),
-            ("actual", json!("-6.25")),
-            ("insertText", json!("")),
-            (
-                "hint",
-                json!("Use an integer expression that matches your intent."),
-            ),
-            ("consumedPrefix", json!("-6")),
-            ("ignoredSuffix", json!(".25")),
-            ("alias", json!("")),
-            ("policyWarning", json!(true)),
-        ]);
-        for locale in Locale::ALL
-            .into_iter()
-            .filter(|locale| *locale != Locale::EnUs)
-        {
-            let diagnostic = localized_plugin_diagnostic(
-                locale,
-                "plugin.calc.skilldesc-decimal-prefix",
-                message_args.clone(),
-                None,
-                Diagnostic::default(),
-            );
-            assert!(diagnostic.message.contains("-6.25"), "{locale:?}");
-            assert!(diagnostic.message.contains("-6"), "{locale:?}");
-            assert!(diagnostic.message.contains(".25"), "{locale:?}");
-            assert!(!diagnostic.message.contains("calc.skilldesc"), "{locale:?}");
-            assert!(!diagnostic.message.contains("Use an integer"), "{locale:?}");
-            assert!(!diagnostic.message.contains("true"), "{locale:?}");
-            assert_eq!(diagnostic.data.as_ref().unwrap()["localizedMessage"], true);
-            assert!(
-                diagnostic.data.as_ref().unwrap()["localizedGuidanceHeading"]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty()),
-                "{locale:?}"
-            );
-            assert!(
-                diagnostic.data.as_ref().unwrap()["localizedGuidance"]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty()),
-                "{locale:?}"
-            );
-        }
-    }
-
-    #[test]
     fn every_structured_calc_guidance_is_localized_without_raw_hint_leakage() {
         let keys = [
             "plugin.calc.skill-param-alias",
@@ -5712,7 +5588,6 @@ mod tests {
             "plugin.calc.expected-colon.eof",
             "plugin.calc.expected-comma",
             "plugin.calc.expected-comma.eof",
-            "plugin.calc.skilldesc-decimal-prefix",
             "plugin.calc.decimal-policy",
             "plugin.calc.prefix-stop",
         ];
