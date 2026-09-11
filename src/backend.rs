@@ -1656,20 +1656,17 @@ impl Backend {
         session_generation: u64,
     ) -> Option<(u64, u64)> {
         loop {
-            let before = {
-                let ws = self.workspace.read().await;
-                if ws.phase != WorkspacePhase::Ready || ws.session_generation != session_generation
-                {
-                    return None;
-                }
-                (ws.scan_generation, ws.workspace_revision)
-            };
+            let before = self
+                .workspace
+                .write()
+                .await
+                .workspace_revalidation_revision_for_worker(session_generation)?;
             tokio::time::sleep(WORKSPACE_REVALIDATION_QUIET_WINDOW).await;
-            let ws = self.workspace.read().await;
-            if ws.phase != WorkspacePhase::Ready || ws.session_generation != session_generation {
-                return None;
-            }
-            let after = (ws.scan_generation, ws.workspace_revision);
+            let after = self
+                .workspace
+                .write()
+                .await
+                .workspace_revalidation_revision_for_worker(session_generation)?;
             if after == before {
                 return Some(after);
             }
@@ -3709,6 +3706,130 @@ mod tests {
         })
         .await
         .expect("watched-files worker did not become idle");
+    }
+
+    async fn assert_revalidation_worker_restarts_after_scan(during_quiet_window: bool) {
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        let backend_workspace = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::new(VectorLspSettings::default()),
+            workspace: Arc::clone(&backend_workspace),
+            plugin_host: None,
+            publish_gates: Arc::new(Mutex::new(HashMap::new())),
+        });
+        {
+            let mut ws = workspace.write().await;
+            ws.begin_initialization(31);
+            ws.phase = WorkspacePhase::Ready;
+            assert_eq!(ws.start_workspace_revalidation_worker(), Some(31));
+        }
+
+        let worker = service
+            .inner()
+            .clone()
+            .run_workspace_revalidation_worker(31);
+        futures::pin_mut!(worker);
+        if during_quiet_window {
+            // Poll to the quiet-window sleep before starting the scan. This
+            // controls the interleaving without relying on scheduler timing.
+            assert!(futures::poll!(worker.as_mut()).is_pending());
+        }
+        let scan_generation = workspace.write().await.begin_scan();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("interrupted revalidation worker must exit");
+
+        let mut ws = workspace.write().await;
+        assert!(ws.begin_reconciliation(scan_generation));
+        assert!(ws.mark_ready_if_reconciled(scan_generation));
+        assert_eq!(
+            ws.start_workspace_revalidation_worker(),
+            Some(31),
+            "an exited worker must not suppress all later edit/dependency validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidation_worker_releases_reservation_when_scan_precedes_quiet_window() {
+        assert_revalidation_worker_restarts_after_scan(false).await;
+    }
+
+    #[tokio::test]
+    async fn revalidation_worker_releases_reservation_when_scan_interrupts_quiet_window() {
+        assert_revalidation_worker_restarts_after_scan(true).await;
+    }
+
+    #[tokio::test]
+    async fn stale_revalidation_worker_does_not_release_new_session_reservation() {
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        let backend_workspace = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::new(VectorLspSettings::default()),
+            workspace: Arc::clone(&backend_workspace),
+            plugin_host: None,
+            publish_gates: Arc::new(Mutex::new(HashMap::new())),
+        });
+        {
+            let mut ws = workspace.write().await;
+            ws.begin_initialization(31);
+            ws.phase = WorkspacePhase::Ready;
+            assert_eq!(ws.start_workspace_revalidation_worker(), Some(31));
+        }
+        let worker = service
+            .inner()
+            .clone()
+            .run_workspace_revalidation_worker(31);
+        futures::pin_mut!(worker);
+        assert!(futures::poll!(worker.as_mut()).is_pending());
+        {
+            let mut ws = workspace.write().await;
+            ws.begin_initialization(32);
+            ws.phase = WorkspacePhase::Ready;
+            assert_eq!(ws.start_workspace_revalidation_worker(), Some(32));
+        }
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("stale worker must exit");
+        let mut ws = workspace.write().await;
+        assert_eq!(ws.start_workspace_revalidation_worker(), None);
+    }
+
+    #[tokio::test]
+    async fn revalidation_worker_releases_reservation_after_normal_completion() {
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        let backend_workspace = Arc::clone(&workspace);
+        let (service, _socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::new(VectorLspSettings::default()),
+            workspace: Arc::clone(&backend_workspace),
+            plugin_host: None,
+            publish_gates: Arc::new(Mutex::new(HashMap::new())),
+        });
+        {
+            let mut ws = workspace.write().await;
+            ws.begin_initialization(31);
+            ws.phase = WorkspacePhase::Ready;
+            assert_eq!(ws.start_workspace_revalidation_worker(), Some(31));
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            service
+                .inner()
+                .clone()
+                .run_workspace_revalidation_worker(31),
+        )
+        .await
+        .expect("normal revalidation worker must finish");
+        assert_eq!(
+            workspace
+                .write()
+                .await
+                .start_workspace_revalidation_worker(),
+            Some(31)
+        );
     }
 
     async fn wait_for_json_analysis_worker(workspace: &Arc<RwLock<Workspace>>) {
