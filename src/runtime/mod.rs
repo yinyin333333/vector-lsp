@@ -70,20 +70,6 @@ impl WorkspaceIndex {
         }
     }
 
-    fn insert(&mut self, file: &str, col: &str, value: String) {
-        let key = (file.to_ascii_lowercase(), col.to_ascii_lowercase());
-        self.data
-            .entry(key.clone())
-            .or_default()
-            .insert(value.to_ascii_lowercase());
-        if col.eq_ignore_ascii_case("code") {
-            self.fixed4_data
-                .entry(key)
-                .or_default()
-                .insert(fixed4_key(&value));
-        }
-    }
-
     pub fn lookup(&self, file: &str, col: &str, value: &str) -> bool {
         self.data
             .get(&(file.to_ascii_lowercase(), col.to_ascii_lowercase()))
@@ -162,21 +148,48 @@ fn index_doc(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
     idx.columns
         .insert(stem.to_ascii_lowercase(), doc.headers.clone());
 
-    for row in &doc.rows {
-        if row
-            .cells
-            .first()
-            .map(|cell| cell.value.trim_start().starts_with('*'))
-            .unwrap_or(false)
-        {
+    // Filter comments once, then retain each column's destination sets while
+    // inserting values. Keys and hash-map probes are per column, not per cell.
+    let rows: Vec<_> = doc
+        .rows
+        .iter()
+        .filter(|row| {
+            !row.cells
+                .first()
+                .is_some_and(|cell| cell.value.trim_start().starts_with('*'))
+        })
+        .collect();
+    for (col_i, header) in doc
+        .headers
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| !h.is_empty())
+    {
+        let mut values = rows
+            .iter()
+            .filter_map(|row| row.cells.get(col_i))
+            .map(|cell| cell.value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .peekable();
+        // Preserve absence of entries for columns without any indexed values.
+        if values.peek().is_none() {
             continue;
         }
-        for (col_i, cell) in row.cells.iter().enumerate() {
-            if cell.value.trim().is_empty() {
-                continue;
+        let key = (stem.to_ascii_lowercase(), header.to_ascii_lowercase());
+        let fixed4 = if header.eq_ignore_ascii_case("code") {
+            Some(idx.fixed4_data.entry(key.clone()).or_default())
+        } else {
+            None
+        };
+        let destination = idx.data.entry(key).or_default();
+        if let Some(fixed4) = fixed4 {
+            for value in values {
+                destination.insert(value.to_ascii_lowercase());
+                fixed4.insert(fixed4_key(value));
             }
-            if let Some(h) = doc.headers.get(col_i).filter(|h| !h.is_empty()) {
-                idx.insert(stem, h, cell.value.clone());
+        } else {
+            for value in values {
+                destination.insert(value.to_ascii_lowercase());
             }
         }
     }
@@ -653,5 +666,162 @@ mod platform_tests {
             .join()
             .expect("thread");
         }
+    }
+}
+
+#[cfg(test)]
+mod index_equivalence_tests {
+    use super::*;
+
+    fn legacy(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
+        idx.columns
+            .insert(stem.to_ascii_lowercase(), doc.headers.clone());
+        for row in &doc.rows {
+            if row
+                .cells
+                .first()
+                .map(|cell| cell.value.trim_start().starts_with('*'))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            for (col_i, cell) in row.cells.iter().enumerate() {
+                if cell.value.trim().is_empty() {
+                    continue;
+                }
+                if let Some(col) = doc.headers.get(col_i).filter(|h| !h.is_empty()) {
+                    let value = cell.value.clone();
+                    let key = (stem.to_ascii_lowercase(), col.to_ascii_lowercase());
+                    idx.data
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(value.to_ascii_lowercase());
+                    if col.eq_ignore_ascii_case("code") {
+                        idx.fixed4_data
+                            .entry(key)
+                            .or_default()
+                            .insert(fixed4_key(&value));
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_same(old: &WorkspaceIndex, new: &WorkspaceIndex) {
+        assert_eq!(old.data, new.data);
+        assert_eq!(old.fixed4_data, new.fixed4_data);
+        assert_eq!(old.columns, new.columns);
+        for file in ["ITEMS", "items", "Other", "missing"] {
+            for column in ["code", "CODE", "id", "Id", "", " ", "Ä", "ä", "missing"] {
+                assert_eq!(
+                    old.column_index(file, column),
+                    new.column_index(file, column)
+                );
+                assert_eq!(
+                    old.has_lookup_target(file, column),
+                    new.has_lookup_target(file, column)
+                );
+                for value in [
+                    "", " ", "abcd", "abcde", " AB ", "🙂xyz", "Ä", "ä", "missing",
+                ] {
+                    assert_eq!(
+                        old.lookup(file, column, value),
+                        new.lookup(file, column, value)
+                    );
+                    assert_eq!(
+                        old.lookup_fixed4(file, column, value),
+                        new.lookup_fixed4(file, column, value)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_matches_legacy_for_special_columns_rows_and_merged_sources() {
+        let mut old = WorkspaceIndex::new();
+        let mut new = WorkspaceIndex::new();
+        for stem in ["ITEMS", "items", "Other"] {
+            for headers in [
+                "",
+                "code",
+                "CODE\tcode\tId\tid\t\t \tÄ\tä",
+                "id\tid\tID\tcode\tCoDe",
+                "\t\t",
+            ] {
+                for ending in ["\n", "\r\n", "\r"] {
+                    let text = [
+                        headers,
+                        "",
+                        "  *comment\tx\tabcde",
+                        "\u{2003}*comment\tabcd",
+                        "abcd\tabcde\t AB \t🙂xyz\tignored\tspace\tÄ\tä\textra",
+                        " \t\t\u{2003}\t ",
+                        "abcde",
+                        "\tABCD\tÄ\tä",
+                        "abcd\tabcde",
+                        "",
+                    ]
+                    .join(ending);
+                    let doc = DocumentData::parse(&text, '\t');
+                    legacy(&mut old, stem, &doc);
+                    index_doc(&mut new, stem, &doc);
+                    assert_same(&old, &new);
+                    let mut old_single = WorkspaceIndex::new();
+                    let mut new_single = WorkspaceIndex::new();
+                    legacy(&mut old_single, stem, &doc);
+                    index_doc(&mut new_single, stem, &doc);
+                    assert_same(&old_single, &new_single);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; set VECTOR_LSP_BENCH_FIXTURE"]
+    fn benchmark_index_doc() {
+        use std::{hint::black_box, time::Instant};
+        let text =
+            std::fs::read_to_string(std::env::var("VECTOR_LSP_BENCH_FIXTURE").unwrap()).unwrap();
+        let doc = DocumentData::parse(&text, '\t');
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for iteration in 0..8 {
+            for optimized in if iteration % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let mut idx = WorkspaceIndex::new();
+                let start = Instant::now();
+                if optimized {
+                    index_doc(black_box(&mut idx), "ITEMS", black_box(&doc));
+                } else {
+                    legacy(black_box(&mut idx), "ITEMS", black_box(&doc));
+                }
+                black_box(&idx);
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                if iteration > 0 {
+                    if optimized {
+                        new.push(elapsed);
+                    } else {
+                        old.push(elapsed);
+                    }
+                }
+            }
+        }
+        let mut before = WorkspaceIndex::new();
+        let mut after = WorkspaceIndex::new();
+        legacy(&mut before, "ITEMS", &doc);
+        index_doc(&mut after, "ITEMS", &doc);
+        assert_same(&before, &after);
+        old.sort_by(f64::total_cmp);
+        new.sort_by(f64::total_cmp);
+        eprintln!(
+            "index: bytes={} legacy_ms={:.3} optimized_ms={:.3}",
+            text.len(),
+            old[3],
+            new[3]
+        );
     }
 }
