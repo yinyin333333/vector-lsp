@@ -143,6 +143,12 @@ pub fn build_workspace_index_from_sources(sources: &[EffectiveSource]) -> Arc<Wo
     Arc::new(index)
 }
 
+// Bound column traversal to twice the number of actual cells. A single wide
+// row must not make every short row pay for the full header width.
+fn use_column_traversal(headers: usize, rows: usize, cells: usize) -> bool {
+    headers.saturating_mul(rows) <= cells.saturating_mul(2)
+}
+
 fn index_doc(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
     // Record ordered header list (last write wins, so open docs beat cache).
     idx.columns
@@ -159,6 +165,50 @@ fn index_doc(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
                 .is_some_and(|cell| cell.value.trim_start().starts_with('*'))
         })
         .collect();
+    let actual_cells = rows
+        .iter()
+        .map(|row| row.cells.len().min(doc.headers.len()))
+        .sum();
+    let active_headers = doc
+        .headers
+        .iter()
+        .filter(|header| !header.is_empty())
+        .count();
+    if !use_column_traversal(active_headers, rows.len(), actual_cells) {
+        // Sparse/ragged documents retain row traversal, but still prepare keys
+        // once per header and borrow cell values. Clone keys only on first use.
+        let keys: Vec<_> = doc
+            .headers
+            .iter()
+            .map(|header| {
+                (!header.is_empty())
+                    .then(|| (stem.to_ascii_lowercase(), header.to_ascii_lowercase()))
+            })
+            .collect();
+        for row in rows {
+            for (cell, key) in row.cells.iter().zip(&keys) {
+                if cell.value.trim().is_empty() {
+                    continue;
+                }
+                let Some(key) = key else {
+                    continue;
+                };
+                let values = match idx.data.get_mut(key) {
+                    Some(values) => values,
+                    None => idx.data.entry(key.clone()).or_default(),
+                };
+                values.insert(cell.value.to_ascii_lowercase());
+                if key.1 == "code" {
+                    let values = match idx.fixed4_data.get_mut(key) {
+                        Some(values) => values,
+                        None => idx.fixed4_data.entry(key.clone()).or_default(),
+                    };
+                    values.insert(fixed4_key(&cell.value));
+                }
+            }
+        }
+        return;
+    }
     for (col_i, header) in doc
         .headers
         .iter()
@@ -672,6 +722,59 @@ mod platform_tests {
 #[cfg(test)]
 mod index_equivalence_tests {
     use super::*;
+
+    #[test]
+    fn sparse_traversal_is_bounded_by_actual_cells_and_matches_legacy() {
+        let headers = (0..4096)
+            .map(|i| match i {
+                0 => "id".to_string(),
+                1 => "code".to_string(),
+                2 => "CODE".to_string(),
+                3 => String::new(),
+                4 => "Id".to_string(),
+                _ => format!("field{i}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\t");
+        let wide = (0..4096)
+            .map(|i| format!("V{i}"))
+            .collect::<Vec<_>>()
+            .join("\t");
+        for short_row in ["key\tabcde\n", "\n", " \t\n"] {
+            for tail in ["", wide.as_str()] {
+                let text = format!("{headers}\n{}{tail}", short_row.repeat(2000));
+                let doc = DocumentData::parse(&text, '\t');
+                let cells = doc
+                    .rows
+                    .iter()
+                    .map(|row| row.cells.len().min(doc.headers.len()))
+                    .sum();
+                assert!(!use_column_traversal(4095, doc.rows.len(), cells));
+                let mut old = WorkspaceIndex::new();
+                let mut new = WorkspaceIndex::new();
+                // Include existing entries so fallback must preserve set merging.
+                let seed = DocumentData::parse("id\tcode\nseed\tABCD", '\t');
+                legacy(&mut old, "ITEMS", &seed);
+                index_doc(&mut new, "ITEMS", &seed);
+                legacy(&mut old, "ITEMS", &doc);
+                index_doc(&mut new, "ITEMS", &doc);
+                assert_same(&old, &new);
+            }
+        }
+        for headers in [0usize, 1, 2, 512, 4096] {
+            for rows in [0usize, 1, 2000] {
+                for cells in [0usize, rows, rows * 2, rows * headers] {
+                    let visits = if use_column_traversal(headers, rows, cells) {
+                        headers * rows
+                    } else {
+                        cells
+                    };
+                    assert!(visits <= cells * 2);
+                }
+            }
+        }
+        assert!(use_column_traversal(512, 2000, 512 * 2000));
+    }
 
     fn legacy(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
         idx.columns
