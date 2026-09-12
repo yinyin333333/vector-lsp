@@ -70,20 +70,6 @@ impl WorkspaceIndex {
         }
     }
 
-    fn insert(&mut self, file: &str, col: &str, value: String) {
-        let key = (file.to_ascii_lowercase(), col.to_ascii_lowercase());
-        self.data
-            .entry(key.clone())
-            .or_default()
-            .insert(value.to_ascii_lowercase());
-        if col.eq_ignore_ascii_case("code") {
-            self.fixed4_data
-                .entry(key)
-                .or_default()
-                .insert(fixed4_key(&value));
-        }
-    }
-
     pub fn lookup(&self, file: &str, col: &str, value: &str) -> bool {
         self.data
             .get(&(file.to_ascii_lowercase(), col.to_ascii_lowercase()))
@@ -157,26 +143,103 @@ pub fn build_workspace_index_from_sources(sources: &[EffectiveSource]) -> Arc<Wo
     Arc::new(index)
 }
 
+// Bound column traversal to twice the number of actual cells. A single wide
+// row must not make every short row pay for the full header width.
+fn use_column_traversal(headers: usize, rows: usize, cells: usize) -> bool {
+    headers.saturating_mul(rows) <= cells.saturating_mul(2)
+}
+
 fn index_doc(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
     // Record ordered header list (last write wins, so open docs beat cache).
     idx.columns
         .insert(stem.to_ascii_lowercase(), doc.headers.clone());
 
-    for row in &doc.rows {
-        if row
-            .cells
-            .first()
-            .map(|cell| cell.value.trim_start().starts_with('*'))
-            .unwrap_or(false)
-        {
+    // Filter comments once, then retain each column's destination sets while
+    // inserting values. Keys and hash-map probes are per column, not per cell.
+    let rows: Vec<_> = doc
+        .rows
+        .iter()
+        .filter(|row| {
+            !row.cells
+                .first()
+                .is_some_and(|cell| cell.value.trim_start().starts_with('*'))
+        })
+        .collect();
+    let actual_cells = rows
+        .iter()
+        .map(|row| row.cells.len().min(doc.headers.len()))
+        .sum();
+    let active_headers = doc
+        .headers
+        .iter()
+        .filter(|header| !header.is_empty())
+        .count();
+    if !use_column_traversal(active_headers, rows.len(), actual_cells) {
+        // Sparse/ragged documents retain row traversal, but still prepare keys
+        // once per header and borrow cell values. Clone keys only on first use.
+        let keys: Vec<_> = doc
+            .headers
+            .iter()
+            .map(|header| {
+                (!header.is_empty())
+                    .then(|| (stem.to_ascii_lowercase(), header.to_ascii_lowercase()))
+            })
+            .collect();
+        for row in rows {
+            for (cell, key) in row.cells.iter().zip(&keys) {
+                if cell.value.trim().is_empty() {
+                    continue;
+                }
+                let Some(key) = key else {
+                    continue;
+                };
+                let values = match idx.data.get_mut(key) {
+                    Some(values) => values,
+                    None => idx.data.entry(key.clone()).or_default(),
+                };
+                values.insert(cell.value.to_ascii_lowercase());
+                if key.1 == "code" {
+                    let values = match idx.fixed4_data.get_mut(key) {
+                        Some(values) => values,
+                        None => idx.fixed4_data.entry(key.clone()).or_default(),
+                    };
+                    values.insert(fixed4_key(&cell.value));
+                }
+            }
+        }
+        return;
+    }
+    for (col_i, header) in doc
+        .headers
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| !h.is_empty())
+    {
+        let mut values = rows
+            .iter()
+            .filter_map(|row| row.cells.get(col_i))
+            .map(|cell| cell.value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .peekable();
+        // Preserve absence of entries for columns without any indexed values.
+        if values.peek().is_none() {
             continue;
         }
-        for (col_i, cell) in row.cells.iter().enumerate() {
-            if cell.value.trim().is_empty() {
-                continue;
+        let key = (stem.to_ascii_lowercase(), header.to_ascii_lowercase());
+        let fixed4 = if header.eq_ignore_ascii_case("code") {
+            Some(idx.fixed4_data.entry(key.clone()).or_default())
+        } else {
+            None
+        };
+        let destination = idx.data.entry(key).or_default();
+        if let Some(fixed4) = fixed4 {
+            for value in values {
+                destination.insert(value.to_ascii_lowercase());
+                fixed4.insert(fixed4_key(value));
             }
-            if let Some(h) = doc.headers.get(col_i).filter(|h| !h.is_empty()) {
-                idx.insert(stem, h, cell.value.clone());
+        } else {
+            for value in values {
+                destination.insert(value.to_ascii_lowercase());
             }
         }
     }
@@ -653,5 +716,215 @@ mod platform_tests {
             .join()
             .expect("thread");
         }
+    }
+}
+
+#[cfg(test)]
+mod index_equivalence_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_traversal_is_bounded_by_actual_cells_and_matches_legacy() {
+        let headers = (0..4096)
+            .map(|i| match i {
+                0 => "id".to_string(),
+                1 => "code".to_string(),
+                2 => "CODE".to_string(),
+                3 => String::new(),
+                4 => "Id".to_string(),
+                _ => format!("field{i}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\t");
+        let wide = (0..4096)
+            .map(|i| format!("V{i}"))
+            .collect::<Vec<_>>()
+            .join("\t");
+        for short_row in ["key\tabcde\n", "\n", " \t\n"] {
+            for tail in ["", wide.as_str()] {
+                let text = format!("{headers}\n{}{tail}", short_row.repeat(2000));
+                let doc = DocumentData::parse(&text, '\t');
+                let cells = doc
+                    .rows
+                    .iter()
+                    .map(|row| row.cells.len().min(doc.headers.len()))
+                    .sum();
+                assert!(!use_column_traversal(4095, doc.rows.len(), cells));
+                let mut old = WorkspaceIndex::new();
+                let mut new = WorkspaceIndex::new();
+                // Include existing entries so fallback must preserve set merging.
+                let seed = DocumentData::parse("id\tcode\nseed\tABCD", '\t');
+                legacy(&mut old, "ITEMS", &seed);
+                index_doc(&mut new, "ITEMS", &seed);
+                legacy(&mut old, "ITEMS", &doc);
+                index_doc(&mut new, "ITEMS", &doc);
+                assert_same(&old, &new);
+            }
+        }
+        for headers in [0usize, 1, 2, 512, 4096] {
+            for rows in [0usize, 1, 2000] {
+                for cells in [0usize, rows, rows * 2, rows * headers] {
+                    let visits = if use_column_traversal(headers, rows, cells) {
+                        headers * rows
+                    } else {
+                        cells
+                    };
+                    assert!(visits <= cells * 2);
+                }
+            }
+        }
+        assert!(use_column_traversal(512, 2000, 512 * 2000));
+    }
+
+    fn legacy(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
+        idx.columns
+            .insert(stem.to_ascii_lowercase(), doc.headers.clone());
+        for row in &doc.rows {
+            if row
+                .cells
+                .first()
+                .map(|cell| cell.value.trim_start().starts_with('*'))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            for (col_i, cell) in row.cells.iter().enumerate() {
+                if cell.value.trim().is_empty() {
+                    continue;
+                }
+                if let Some(col) = doc.headers.get(col_i).filter(|h| !h.is_empty()) {
+                    let value = cell.value.clone();
+                    let key = (stem.to_ascii_lowercase(), col.to_ascii_lowercase());
+                    idx.data
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(value.to_ascii_lowercase());
+                    if col.eq_ignore_ascii_case("code") {
+                        idx.fixed4_data
+                            .entry(key)
+                            .or_default()
+                            .insert(fixed4_key(&value));
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_same(old: &WorkspaceIndex, new: &WorkspaceIndex) {
+        assert_eq!(old.data, new.data);
+        assert_eq!(old.fixed4_data, new.fixed4_data);
+        assert_eq!(old.columns, new.columns);
+        for file in ["ITEMS", "items", "Other", "missing"] {
+            for column in ["code", "CODE", "id", "Id", "", " ", "Ä", "ä", "missing"] {
+                assert_eq!(
+                    old.column_index(file, column),
+                    new.column_index(file, column)
+                );
+                assert_eq!(
+                    old.has_lookup_target(file, column),
+                    new.has_lookup_target(file, column)
+                );
+                for value in [
+                    "", " ", "abcd", "abcde", " AB ", "🙂xyz", "Ä", "ä", "missing",
+                ] {
+                    assert_eq!(
+                        old.lookup(file, column, value),
+                        new.lookup(file, column, value)
+                    );
+                    assert_eq!(
+                        old.lookup_fixed4(file, column, value),
+                        new.lookup_fixed4(file, column, value)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_matches_legacy_for_special_columns_rows_and_merged_sources() {
+        let mut old = WorkspaceIndex::new();
+        let mut new = WorkspaceIndex::new();
+        for stem in ["ITEMS", "items", "Other"] {
+            for headers in [
+                "",
+                "code",
+                "CODE\tcode\tId\tid\t\t \tÄ\tä",
+                "id\tid\tID\tcode\tCoDe",
+                "\t\t",
+            ] {
+                for ending in ["\n", "\r\n", "\r"] {
+                    let text = [
+                        headers,
+                        "",
+                        "  *comment\tx\tabcde",
+                        "\u{2003}*comment\tabcd",
+                        "abcd\tabcde\t AB \t🙂xyz\tignored\tspace\tÄ\tä\textra",
+                        " \t\t\u{2003}\t ",
+                        "abcde",
+                        "\tABCD\tÄ\tä",
+                        "abcd\tabcde",
+                        "",
+                    ]
+                    .join(ending);
+                    let doc = DocumentData::parse(&text, '\t');
+                    legacy(&mut old, stem, &doc);
+                    index_doc(&mut new, stem, &doc);
+                    assert_same(&old, &new);
+                    let mut old_single = WorkspaceIndex::new();
+                    let mut new_single = WorkspaceIndex::new();
+                    legacy(&mut old_single, stem, &doc);
+                    index_doc(&mut new_single, stem, &doc);
+                    assert_same(&old_single, &new_single);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; set VECTOR_LSP_BENCH_FIXTURE"]
+    fn benchmark_index_doc() {
+        use std::{hint::black_box, time::Instant};
+        let text =
+            std::fs::read_to_string(std::env::var("VECTOR_LSP_BENCH_FIXTURE").unwrap()).unwrap();
+        let doc = DocumentData::parse(&text, '\t');
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for iteration in 0..8 {
+            for optimized in if iteration % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let mut idx = WorkspaceIndex::new();
+                let start = Instant::now();
+                if optimized {
+                    index_doc(black_box(&mut idx), "ITEMS", black_box(&doc));
+                } else {
+                    legacy(black_box(&mut idx), "ITEMS", black_box(&doc));
+                }
+                black_box(&idx);
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                if iteration > 0 {
+                    if optimized {
+                        new.push(elapsed);
+                    } else {
+                        old.push(elapsed);
+                    }
+                }
+            }
+        }
+        let mut before = WorkspaceIndex::new();
+        let mut after = WorkspaceIndex::new();
+        legacy(&mut before, "ITEMS", &doc);
+        index_doc(&mut after, "ITEMS", &doc);
+        assert_same(&before, &after);
+        old.sort_by(f64::total_cmp);
+        new.sort_by(f64::total_cmp);
+        eprintln!(
+            "index: bytes={} legacy_ms={:.3} optimized_ms={:.3}",
+            text.len(),
+            old[3],
+            new[3]
+        );
     }
 }

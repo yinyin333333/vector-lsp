@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, jsonrpc::Result as LspResult};
 
 use crate::diagnostics;
-use crate::document::{DocumentData, apply_change, reconstruct_text, split_text_lines, utf16_len};
+use crate::document::{DocumentData, apply_change, changed_text, split_text_lines, utf16_len};
 use crate::i18n::{self, Locale};
 use crate::json_diagnostics::{
     JsonAnalysisTrigger, JsonDiagnosticBatch, JsonDiagnosticReport, JsonEvidenceProfile,
@@ -2913,21 +2913,11 @@ impl LanguageServer for Backend {
         let update_result: Result<(bool, bool, ValidationTicket), DocumentChangeError> = {
             let mut ws = self.workspace.write().await;
 
-            let existing_text = ws
-                .open_documents
-                .get(&uri)
-                .map(|d| reconstruct_text(d, delimiter))
-                .unwrap_or_default();
-
-            let mut lines = split_text_lines(&existing_text);
-            for change in &params.content_changes {
-                match change.range {
-                    Some(range) => apply_change(&mut lines, range, &change.text),
-                    None => lines = split_text_lines(&change.text),
-                }
-            }
-
-            let full_text = lines.join("\n");
+            let full_text = changed_text(
+                ws.open_documents.get(&uri).map(Arc::as_ref),
+                delimiter,
+                &params.content_changes,
+            );
             let doc = Arc::new(DocumentData::parse(&full_text, delimiter));
             match ws.accept_change(&uri, params.text_document.version, Arc::clone(&doc)) {
                 Ok(ticket) => {
@@ -3678,6 +3668,54 @@ mod tests {
     use futures::StreamExt;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn full_change_keeps_open_and_version_guards() {
+        let workspace = Arc::new(RwLock::new(Workspace::new()));
+        let backend_workspace = Arc::clone(&workspace);
+        let (service, mut socket) = tower_lsp::LspService::new(move |client| Backend {
+            client,
+            settings: Arc::new(VectorLspSettings::default()),
+            workspace: Arc::clone(&backend_workspace),
+            plugin_host: None,
+            publish_gates: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let drain = tokio::spawn(async move { while socket.next().await.is_some() {} });
+        let uri = Url::parse("file:///change-guards.txt").unwrap();
+        for (version, expected) in [
+            (1, None),
+            (2, Some("old")),
+            (1, Some("old")),
+            (3, Some("new")),
+        ] {
+            if version == 2 {
+                workspace.write().await.accept_open(
+                    uri.clone(),
+                    2,
+                    Arc::new(DocumentData::parse("id\nold", '\t')),
+                );
+            }
+            service
+                .inner()
+                .did_change(DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier::new(uri.clone(), version),
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: "id\nnew".into(),
+                    }],
+                })
+                .await;
+            let ws = workspace.read().await;
+            assert_eq!(
+                ws.open_documents
+                    .get(&uri)
+                    .map(|doc| doc.rows[0].cells[0].value.as_str()),
+                expected
+            );
+        }
+        drain.abort();
+    }
 
     #[test]
     fn calculation_hover_details_count_unicode_characters_and_warn_without_truncating() {
