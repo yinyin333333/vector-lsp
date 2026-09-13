@@ -666,6 +666,23 @@ impl Workspace {
         Some(self.session_generation)
     }
 
+    pub fn workspace_revalidation_revision_for_worker(
+        &mut self,
+        session_generation: u64,
+    ) -> Option<(u64, u64)> {
+        if self.workspace_revalidation_worker_session != Some(session_generation) {
+            return None;
+        }
+        if self.session_generation != session_generation || self.phase != WorkspacePhase::Ready {
+            // Observe the interruption and release its reservation under one
+            // workspace lock. Otherwise a later Ready/edit can see a worker
+            // that has already exited and never schedule validation again.
+            self.workspace_revalidation_worker_session = None;
+            return None;
+        }
+        Some((self.scan_generation, self.workspace_revision))
+    }
+
     pub fn workspace_revalidation_worker_should_continue(
         &mut self,
         session_generation: u64,
@@ -2678,6 +2695,37 @@ mod tests {
         workspace.phase = WorkspacePhase::Ready;
         assert_eq!(workspace.reserve_schema_preview_worker(&uri), Some(22));
         assert_eq!(workspace.start_workspace_revalidation_worker(), Some(22));
+    }
+
+    #[test]
+    fn workspace_revalidation_worker_follows_changes_during_validation() {
+        let mut workspace = Workspace::new();
+        workspace.begin_initialization(21);
+        workspace.phase = WorkspacePhase::Ready;
+        let uri = uri();
+        let first = workspace.accept_open(uri.clone(), 1, doc("V1"));
+        assert_eq!(workspace.start_workspace_revalidation_worker(), Some(21));
+        let (scan, revision) = workspace
+            .workspace_revalidation_revision_for_worker(21)
+            .unwrap();
+        assert!(workspace.mark_published(&first));
+
+        // An edit arrives while validation of the captured revision is running.
+        let second = workspace.accept_change(&uri, 2, doc("V2")).unwrap();
+        assert!(workspace.workspace_revalidation_worker_should_continue(21, scan, revision));
+        assert_eq!(workspace.start_workspace_revalidation_worker(), None);
+        assert!(
+            workspace
+                .pending_open_tickets()
+                .iter()
+                .any(|ticket| ticket.document_revision == second.document_revision)
+        );
+        let (scan, revision) = workspace
+            .workspace_revalidation_revision_for_worker(21)
+            .unwrap();
+        assert!(workspace.mark_published(&second));
+        assert!(!workspace.workspace_revalidation_worker_should_continue(21, scan, revision));
+        assert_eq!(workspace.start_workspace_revalidation_worker(), Some(21));
     }
 
     #[test]

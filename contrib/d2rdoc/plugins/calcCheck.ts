@@ -893,33 +893,12 @@ function findRevalidatedPrefixStop(src: string): number {
 }
 
 function decimalPolicyError(
-    source: string,
     tokens: Token[],
-    confirmedSkillDescDisplay: boolean,
+    suppressSkillDescDecimalWarning: boolean,
 ): CalcParseError | null {
+    if (suppressSkillDescDecimalWarning) return null;
     const decimal = tokens.find((token) => token.type === "NUM" && token.value.indexOf(".") !== -1);
     if (!decimal) return null;
-    const decimalOffset = decimal.value.indexOf(".");
-    if (confirmedSkillDescDisplay) {
-        const suffixStart = decimal.pos + decimalOffset;
-        const consumedPrefix = source.slice(0, suffixStart);
-        const ignoredSuffix = source.slice(suffixStart);
-        return calcError(
-            "calc.skilldesc-decimal-prefix",
-            `Decimal values are not supported here. The game reads '${source}' as '${consumedPrefix}' and ignores '${ignoredSuffix}'. Use an integer expression that matches your intent.`,
-            decimal.pos,
-            decimal.value.length,
-            "decimal-policy",
-            {
-                actual: decimal.value,
-                tokenStart: decimal.pos,
-                tokenEnd: decimal.pos + decimal.value.length,
-                hint: "Use an integer expression that matches your intent.",
-                consumedPrefix,
-                ignoredSuffix,
-            },
-        );
-    }
     return calcError(
         "calc.decimal-policy",
         `Decimal value '${decimal.value}' may not work as written here. Use an integer expression unless this field is known to support decimals.`,
@@ -944,7 +923,7 @@ function parseBBE(
     missIds: Set<string>,
     enforceRevalidatedFunctions: boolean,
     missileBareIdentifiers: boolean,
-    confirmedSkillDescDisplay: boolean,
+    suppressSkillDescDecimalWarning: boolean,
 ): CalcParseError | null {
     // Strip outer double-quotes that some editors wrap around cell formulas.
     const normalized = normalizeFormula(raw);
@@ -1017,7 +996,7 @@ function parseBBE(
     }
     if (prefixStop !== -1) return prefixStopWarning();
     if (enforceRevalidatedFunctions) {
-        const decimalWarning = decimalPolicyError(parseSrc, result, confirmedSkillDescDisplay);
+        const decimalWarning = decimalPolicyError(result, suppressSkillDescDecimalWarning);
         if (decimalWarning) return mapParseError(decimalWarning, normalized);
     }
     return null;
@@ -1192,7 +1171,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                 if (!val || !val.trim()) continue;
 
                 const revalidatedScope = scope !== "Monster scope BBE";
-                const confirmedSkillDescDisplay = ctx.file === "skilldesc"
+                const suppressSkillDescDecimalWarning = ctx.file === "skilldesc"
                     && (selectedVersion === "3.2" || selectedVersion === "3.3")
                     && /^dsc3calc[ab][1-4]$/i.test(col);
                 const err = parseBBE(
@@ -1202,7 +1181,7 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                     missIds,
                     revalidatedScope,
                     missileBareIdentifiers,
-                    confirmedSkillDescDisplay,
+                    suppressSkillDescDecimalWarning,
                 );
                 if (err) {
                     const c = row.__colstarts[col] ?? 0;
@@ -1219,17 +1198,14 @@ function validate(ctx: PluginContext): PluginDiagnostic[] {
                         err.code === "calc.expected-rparen.eof"
                         || err.code === "calc.prefix-stop"
                         || err.code === "calc.decimal-policy"
-                        || err.code === "calc.skilldesc-decimal-prefix"
                     );
                     const legacyMessage = paramAlias
                         ? skillParamAliasMessage(paramAlias)
                         : (missileUnknown
                             ? `Unknown missile value '${unknownIdentifier}'. The game treats it as 0, so this part of the calculation has no effect.`
-                            : (err.code === "calc.skilldesc-decimal-prefix"
-                                ? err.message
-                                : (policyWarning && err.code === "calc.expected-rparen.eof"
+                            : (policyWarning && err.code === "calc.expected-rparen.eof"
                                     ? `${err.message}. The game may still use the valid part before this point. Add the missing ')'.`
-                                    : (policyWarning ? err.message : `Invalid calculation: ${err.message}`))));
+                                    : (policyWarning ? err.message : `Invalid calculation: ${err.message}`)));
                     diags.push({
                         line:     row.__line,
                         col:      c + err.pos,

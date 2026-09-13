@@ -3858,7 +3858,7 @@ function validate(ctx: PluginContext): string[] {
         let skilldesc_3_3 =
             versioned_fixture("skilldesc", "skilldesc\tdsc3calca1\nrow\t6.25\n", "3.3");
         let skilldesc_3_3_diags = run_plugin("calcCheck.ts", "skilldesc", &skilldesc_3_3).await;
-        assert_code(&skilldesc_3_3_diags[0], "calc.skilldesc-decimal-prefix");
+        assert!(skilldesc_3_3_diags.is_empty(), "{skilldesc_3_3_diags:#?}");
 
         let older = versioned_fixture("skills", "skill\tcalc1\nrow\tpar10\n", "2.4");
         let older_diags = run_plugin("calcCheck.ts", "skills", &older).await;
@@ -3961,7 +3961,7 @@ function validate(ctx: PluginContext): string[] {
     }
 
     #[tokio::test]
-    async fn skilldesc_3_2_decimal_warning_reports_used_prefix_and_ignored_suffix() {
+    async fn decimal_literals_do_not_emit_policy_diagnostics() {
         async fn run(formula: &str) -> Vec<Diagnostic> {
             let text = format!("skilldesc\tdsc3calca1\tdsc3calca2\nrow\t\t{formula}\n");
             let mut fx = fixture(&[("skilldesc", text.as_str())]);
@@ -3974,40 +3974,19 @@ function validate(ctx: PluginContext): string[] {
             run_plugin("calcCheck.ts", "skilldesc", &fx).await
         }
 
-        assert!(run("-6").await.is_empty());
-        for (formula, consumed, ignored) in [
-            ("6.25", "6", ".25"),
-            ("-6.25", "-6", ".25"),
-            ("6.", "6", "."),
-            ("6.25+1", "6", ".25+1"),
-            ("-6.25+1", "-6", ".25+1"),
-        ] {
+        for formula in ["-6", "6.25", "-6.25", "6.", "6.25+1", "-6.25+1"] {
             let diagnostics = run(formula).await;
-            assert_eq!(diagnostics.len(), 1, "{formula}: {diagnostics:#?}");
-            let diagnostic = &diagnostics[0];
-            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
-            assert_code(diagnostic, "calc.skilldesc-decimal-prefix");
-            assert_eq!(
-                diagnostic.message,
-                format!(
-                    "Decimal values are not supported here. The game reads '{formula}' as '{consumed}' and ignores '{ignored}'."
-                )
-            );
-            assert_eq!(data_str(diagnostic, "consumedPrefix"), consumed);
-            assert_eq!(data_str(diagnostic, "ignoredSuffix"), ignored);
-            assert!(!diagnostic.message.contains("compiler"));
-            assert!(!diagnostic.message.contains("bytecode"));
+            assert!(diagnostics.is_empty(), "{formula}: {diagnostics:#?}");
         }
 
         let invalid_start = run(".25").await;
         assert_eq!(invalid_start.len(), 1, "{invalid_start:#?}");
         assert_eq!(invalid_start[0].severity, Some(DiagnosticSeverity::ERROR));
-        assert_ne!(
-            invalid_start[0].code,
-            Some(NumberOrString::String(
-                "calc.skilldesc-decimal-prefix".into()
-            ))
-        );
+
+        let misc = fixture(&[("misc", "code\tlen\nrow\t1.5+2\n")]);
+        let misc_diagnostics = run_plugin("calcCheck.ts", "misc", &misc).await;
+        assert_eq!(misc_diagnostics.len(), 1, "{misc_diagnostics:#?}");
+        assert_code(&misc_diagnostics[0], "calc.decimal-policy");
 
         let mut older = fixture(&[(
             "skilldesc",
@@ -4020,12 +3999,8 @@ function validate(ctx: PluginContext): string[] {
             .expect("skilldesc source")
             .version = Some("3.1".into());
         let older_diagnostics = run_plugin("calcCheck.ts", "skilldesc", &older).await;
+        assert_eq!(older_diagnostics.len(), 1, "{older_diagnostics:#?}");
         assert_code(&older_diagnostics[0], "calc.decimal-policy");
-        assert!(
-            !older_diagnostics[0]
-                .message
-                .contains("game reads '-6.25' as '-6'")
-        );
     }
 
     #[tokio::test]

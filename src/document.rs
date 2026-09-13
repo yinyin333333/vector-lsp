@@ -1,4 +1,4 @@
-use tower_lsp::lsp_types::Range;
+use tower_lsp::lsp_types::{Range, TextDocumentContentChangeEvent};
 
 /// Return the length of `text` in LSP's default UTF-16 code units.
 pub fn utf16_len(text: &str) -> u32 {
@@ -179,6 +179,31 @@ pub(crate) fn split_text_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Apply ordered TXT changes, avoiding reconstruction only when the first
+/// change replaces the entire buffer. Empty batches retain the old behavior.
+pub(crate) fn changed_text(
+    document: Option<&DocumentData>,
+    delimiter: char,
+    changes: &[TextDocumentContentChangeEvent],
+) -> String {
+    let mut lines = if changes.first().is_some_and(|change| change.range.is_none()) {
+        Vec::new()
+    } else {
+        split_text_lines(
+            &document
+                .map(|doc| reconstruct_text(doc, delimiter))
+                .unwrap_or_default(),
+        )
+    };
+    for change in changes {
+        match change.range {
+            Some(range) => apply_change(&mut lines, range, &change.text),
+            None => lines = split_text_lines(&change.text),
+        }
+    }
+    lines.join("\n")
+}
+
 /// Apply one LSP incremental content change using UTF-16 positions.
 pub(crate) fn apply_change(lines: &mut Vec<String>, range: Range, new_text: &str) {
     let start_line = range.start.line as usize;
@@ -294,5 +319,130 @@ mod tests {
     #[test]
     fn invalid_half_surrogate_offsets_clamp_to_the_code_point_start() {
         assert_eq!(apply("A🙂B", 2, 2, "X"), "AX🙂B");
+    }
+}
+
+#[cfg(test)]
+mod change_equivalence_tests {
+    use super::*;
+    use tower_lsp::lsp_types::Position;
+
+    fn legacy(
+        doc: Option<&DocumentData>,
+        delimiter: char,
+        changes: &[TextDocumentContentChangeEvent],
+    ) -> String {
+        let text = doc
+            .map(|doc| reconstruct_text(doc, delimiter))
+            .unwrap_or_default();
+        let mut lines = split_text_lines(&text);
+        for change in changes {
+            match change.range {
+                Some(range) => apply_change(&mut lines, range, &change.text),
+                None => lines = split_text_lines(&change.text),
+            }
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn ordered_change_batches_match_legacy_text_and_every_parsed_field() {
+        for delimiter in ['\t', '|', '🙂'] {
+            let initial = DocumentData::parse("old\tcolumns\r\nA🙂B\tx\r\n", delimiter);
+            let replacements = [
+                "",
+                "\n",
+                "one",
+                "id\tvalue\nA🙂B\tx\n",
+                "id\r\na\r\n",
+                "id\ra\r",
+                "a\tb\tc\n1\t2\t3",
+            ];
+            let mut events = Vec::new();
+            for text in replacements {
+                events.push(TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.into(),
+                });
+            }
+            for (start, end) in [(0, 0), (1, 3), (2, 2), (3, 99)] {
+                events.push(TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(1, start), Position::new(1, end))),
+                    range_length: None,
+                    text: "🙂\tnew\r\nend".into(),
+                });
+            }
+            events.push(TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(2, 0))),
+                range_length: None,
+                text: "h\rv".into(),
+            });
+            for doc in [None, Some(&initial)] {
+                for length in 0..=3 {
+                    for mut sequence in 0..events.len().pow(length) {
+                        let mut changes = Vec::new();
+                        for _ in 0..length {
+                            changes.push(events[sequence % events.len()].clone());
+                            sequence /= events.len();
+                        }
+                        let before = legacy(doc, delimiter, &changes);
+                        let after = changed_text(doc, delimiter, &changes);
+                        assert_eq!(before, after);
+                        assert!(
+                            DocumentData::parse(&before, delimiter)
+                                == DocumentData::parse(&after, delimiter)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; set VECTOR_LSP_BENCH_FIXTURE"]
+    fn benchmark_full_change() {
+        use std::{hint::black_box, time::Instant};
+        let text =
+            std::fs::read_to_string(std::env::var("VECTOR_LSP_BENCH_FIXTURE").unwrap()).unwrap();
+        let doc = DocumentData::parse(&text, '\t');
+        let changes = [TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: text.clone(),
+        }];
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for iteration in 0..8 {
+            for optimized in if iteration % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let start = Instant::now();
+                let result = if optimized {
+                    changed_text(black_box(Some(&doc)), '\t', black_box(&changes))
+                } else {
+                    legacy(black_box(Some(&doc)), '\t', black_box(&changes))
+                };
+                black_box(DocumentData::parse(black_box(&result), '\t'));
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                if iteration > 0 {
+                    if optimized {
+                        new.push(elapsed);
+                    } else {
+                        old.push(elapsed);
+                    }
+                }
+            }
+        }
+        old.sort_by(f64::total_cmp);
+        new.sort_by(f64::total_cmp);
+        eprintln!(
+            "full change incl parse: bytes={} legacy_ms={:.3} optimized_ms={:.3}",
+            text.len(),
+            old[3],
+            new[3]
+        );
     }
 }
